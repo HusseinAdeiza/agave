@@ -864,8 +864,9 @@ type KnownSnapshotHashes = HashMap<(Slot, Hash), HashSet<(Slot, Hash)>>;
 /// queried for their individual snapshot hashes, their results will be checked against this
 /// map to verify correctness.
 ///
-/// NOTE: Only a single snapshot hash is allowed per slot.  If somehow two known validators have
-/// a snapshot hash with the same slot and _different_ hashes, the second will be skipped.
+/// NOTE: Only a single snapshot hash is allowed per slot.  If two known validators have a
+/// snapshot hash with the same slot and _different_ hashes, the known validators disagree and
+/// nothing can be trusted, so an empty map is returned and the caller will sleep and retry.
 /// This applies to both full and incremental snapshot hashes.
 fn get_snapshot_hashes_from_known_validators(
     cluster_info: &ClusterInfo,
@@ -950,20 +951,20 @@ fn build_known_snapshot_hashes<'a>(
             continue 'to_next_node;
         };
 
-        // Do not add this snapshot hash if there's already a full snapshot hash with the
-        // same slot but with a _different_ hash.
-        // NOTE: Nodes should not produce snapshots at the same slot with _different_
-        // hashes.  So if it happens, keep the first and ignore the rest.
+        // If there's already a full snapshot hash with the same slot but with a _different_
+        // hash, the known validators disagree about what the snapshot at this slot is.
+        // Since `nodes` is iterated in an arbitrary order, keeping the first one and dropping
+        // the rest would make the outcome depend on hash iteration order, so a node can pick a
+        // different snapshot for the same slot on each restart.  Trust none of them instead.
         if is_any_same_slot_and_different_hash(&full_snapshot_hash, known_snapshot_hashes.keys()) {
             warn!(
-                "Ignoring all snapshot hashes from node {node} since we've seen a different full \
-                 snapshot hash with this slot. full snapshot hash: {full_snapshot_hash:?}"
-            );
-            debug!(
-                "known full snapshot hashes: {:#?}",
+                "Known validators disagree on the full snapshot hash for slot {}: ignoring all \
+                 known snapshot hashes. full snapshot hash: {full_snapshot_hash:?}, known full \
+                 snapshot hashes: {:#?}",
+                full_snapshot_hash.0,
                 known_snapshot_hashes.keys(),
             );
-            continue 'to_next_node;
+            return KnownSnapshotHashes::default();
         }
 
         // Insert a new full snapshot hash into the known snapshot hashes IFF an entry
@@ -973,25 +974,23 @@ fn build_known_snapshot_hashes<'a>(
             known_snapshot_hashes.entry(full_snapshot_hash).or_default();
 
         if let Some(incremental_snapshot_hash) = incremental_snapshot_hash {
-            // Do not add this snapshot hash if there's already an incremental snapshot
-            // hash with the same slot, but with a _different_ hash.
-            // NOTE: Nodes should not produce snapshots at the same slot with _different_
-            // hashes.  So if it happens, keep the first and ignore the rest.
+            // As above, a conflicting incremental snapshot hash for the same slot means the
+            // known validators disagree, and keeping the first would make the result depend on
+            // the order `nodes` is iterated in.
             if is_any_same_slot_and_different_hash(
                 &incremental_snapshot_hash,
                 known_incremental_snapshot_hashes.iter(),
             ) {
                 warn!(
-                    "Ignoring incremental snapshot hash from node {node} since we've seen a \
-                     different incremental snapshot hash with this slot. full snapshot hash: \
+                    "Known validators disagree on the incremental snapshot hash for slot {}: \
+                     ignoring all known snapshot hashes. full snapshot hash: \
                      {full_snapshot_hash:?}, incremental snapshot hash: \
-                     {incremental_snapshot_hash:?}"
-                );
-                debug!(
-                    "known incremental snapshot hashes based on this slot: {:#?}",
+                     {incremental_snapshot_hash:?}, known incremental snapshot hashes based on \
+                     this slot: {:#?}",
+                    incremental_snapshot_hash.0,
                     known_incremental_snapshot_hashes.iter(),
                 );
-                continue 'to_next_node;
+                return KnownSnapshotHashes::default();
             }
 
             known_incremental_snapshot_hashes.insert(incremental_snapshot_hash);
@@ -1368,11 +1367,8 @@ mod tests {
     #[test]
     fn test_build_known_snapshot_hashes() {
         agave_logger::setup();
-        let full_snapshot_hash1 = (400_000, Hash::new_unique());
-        let full_snapshot_hash2 = (400_000, Hash::new_unique());
-
-        let incremental_snapshot_hash1 = (400_800, Hash::new_unique());
-        let incremental_snapshot_hash2 = (400_800, Hash::new_unique());
+        let full_snapshot_hash = (400_000, Hash::new_unique());
+        let incremental_snapshot_hash = (400_800, Hash::new_unique());
 
         // simulate a set of known validators with various snapshot hashes
         let oracle = {
@@ -1380,15 +1376,9 @@ mod tests {
 
             for (full, incr) in [
                 // only a full snapshot
-                (full_snapshot_hash1, None),
+                (full_snapshot_hash, None),
                 // full and incremental snapshots
-                (full_snapshot_hash1, Some(incremental_snapshot_hash1)),
-                // full and incremental snapshots, with different incremental hash
-                (full_snapshot_hash1, Some(incremental_snapshot_hash2)),
-                // ...and now with different full hashes
-                (full_snapshot_hash2, None),
-                (full_snapshot_hash2, Some(incremental_snapshot_hash1)),
-                (full_snapshot_hash2, Some(incremental_snapshot_hash2)),
+                (full_snapshot_hash, Some(incremental_snapshot_hash)),
             ] {
                 // also simulate multiple known validators having the same snapshot hashes
                 oracle.insert(Pubkey::new_unique(), Some(SnapshotHash { full, incr }));
@@ -1409,33 +1399,64 @@ mod tests {
         let known_snapshot_hashes =
             build_known_snapshot_hashes(oracle.keys(), node_to_snapshot_hashes);
 
-        // ensure there's only one full snapshot hash, since they all used the same slot and there
-        // can be only one snapshot hash per slot
-        let known_full_snapshot_hashes = known_snapshot_hashes.keys();
-        assert_eq!(known_full_snapshot_hashes.len(), 1);
-        let known_full_snapshot_hash = known_full_snapshot_hashes.into_iter().next().unwrap();
-
-        // and for the same reasons, ensure there is only one incremental snapshot hash
-        let known_incremental_snapshot_hashes =
-            known_snapshot_hashes.get(known_full_snapshot_hash).unwrap();
-        assert_eq!(known_incremental_snapshot_hashes.len(), 1);
-        let known_incremental_snapshot_hash =
-            known_incremental_snapshot_hashes.iter().next().unwrap();
-
-        // The resulting `known_snapshot_hashes` can be different from run-to-run due to how
-        // `oracle.keys()` returns nodes during iteration.  Because of that, we cannot just assert
-        // the full and incremental snapshot hashes are `full_snapshot_hash1` and
-        // `incremental_snapshot_hash1`.  Instead, we assert that the full and incremental
-        // snapshot hashes are exactly one or the other, since it depends on which nodes are seen
-        // "first" when building the known snapshot hashes.
-        assert!(
-            known_full_snapshot_hash == &full_snapshot_hash1
-                || known_full_snapshot_hash == &full_snapshot_hash2
+        // the known validators all agree, so their snapshot hashes are used as-is
+        assert_eq!(known_snapshot_hashes.len(), 1);
+        assert_eq!(
+            known_snapshot_hashes.get(&full_snapshot_hash).unwrap(),
+            &HashSet::from([incremental_snapshot_hash]),
         );
-        assert!(
-            known_incremental_snapshot_hash == &incremental_snapshot_hash1
-                || known_incremental_snapshot_hash == &incremental_snapshot_hash2
-        );
+    }
+
+    #[test]
+    fn test_build_known_snapshot_hashes_conflicting_full_snapshot_hashes() {
+        agave_logger::setup();
+        let full_snapshot_hash1 = (400_000, Hash::new_unique());
+        let full_snapshot_hash2 = (400_000, Hash::new_unique());
+
+        // simulate two known validators that disagree on the snapshot hash for the same slot
+        let oracle = [
+            (Pubkey::new_unique(), full_snapshot_hash1),
+            (Pubkey::new_unique(), full_snapshot_hash2),
+        ]
+        .into_iter()
+        .map(|(node, full)| (node, Some(SnapshotHash { full, incr: None })))
+        .collect::<HashMap<_, _>>();
+
+        let node_to_snapshot_hashes = |node| *oracle.get(node).unwrap();
+
+        // since the known validators disagree, no snapshot hash can be trusted
+        assert!(build_known_snapshot_hashes(oracle.keys(), node_to_snapshot_hashes).is_empty());
+    }
+
+    #[test]
+    fn test_build_known_snapshot_hashes_conflicting_incremental_snapshot_hashes() {
+        agave_logger::setup();
+        let full_snapshot_hash = (400_000, Hash::new_unique());
+        let incremental_snapshot_hash1 = (400_800, Hash::new_unique());
+        let incremental_snapshot_hash2 = (400_800, Hash::new_unique());
+
+        // simulate two known validators that agree on the full snapshot hash, but disagree on
+        // the incremental snapshot hash for the same slot
+        let oracle = [
+            (Pubkey::new_unique(), incremental_snapshot_hash1),
+            (Pubkey::new_unique(), incremental_snapshot_hash2),
+        ]
+        .into_iter()
+        .map(|(node, incr)| {
+            (
+                node,
+                Some(SnapshotHash {
+                    full: full_snapshot_hash,
+                    incr: Some(incr),
+                }),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+        let node_to_snapshot_hashes = |node| *oracle.get(node).unwrap();
+
+        // since the known validators disagree, no snapshot hash can be trusted
+        assert!(build_known_snapshot_hashes(oracle.keys(), node_to_snapshot_hashes).is_empty());
     }
 
     #[test]
