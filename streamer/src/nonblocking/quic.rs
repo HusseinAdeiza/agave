@@ -1343,7 +1343,7 @@ pub mod test {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_quic_server_exit_on_cancel() {
         let SpawnTestServerResult {
             join_handle,
@@ -2451,7 +2451,7 @@ pub mod test {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_client_connection_close_invalid_stream() {
         let SpawnTestServerResult {
             join_handle,
