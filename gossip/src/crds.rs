@@ -125,6 +125,9 @@ pub(crate) struct CrdsStats {
     /// and that message was later received via a PushMessage
     pub(crate) num_redundant_pull_responses: u64,
     pub(crate) num_duplicate_push_messages: u64,
+    /// times a ContactInfo event was dropped because the contact-info
+    /// channel was full
+    pub(crate) contact_info_dropped: u64,
 }
 
 /// This structure stores some local metadata associated with the CrdsValue
@@ -287,13 +290,17 @@ fn overrides(value: &CrdsValue, other: &VersionedCrdsValue) -> bool {
 /// Free function rather than `&self` method so it composes with the
 /// `&mut self.table` borrow held during `Crds::insert()` /
 /// `Crds::remove()`.
-fn emit_contact_info_event(sender: Option<&ContactInfoSender>, event: ContactInfoEvent) {
+fn emit_contact_info_event(
+    sender: Option<&ContactInfoSender>,
+    event: ContactInfoEvent,
+    stats: &mut CrdsStats,
+) {
     let Some(sender) = sender else { return };
     if sender.try_send(event).is_err() {
         // "this should never happen" in steady state, but flag it
         // immediately if it does — sustained drops indicate a slow
         // consumer or a misconfigured channel capacity.
-        solana_metrics::inc_new_counter_warn!("gossip_contact_info_dropped", 1);
+        stats.contact_info_dropped = stats.contact_info_dropped.saturating_add(1);
     }
 }
 
@@ -340,6 +347,7 @@ impl Crds {
                         emit_contact_info_event(
                             self.contact_info_sender.as_ref(),
                             ContactInfoEvent::Updated(ContactInfoSnapshot::from(node)),
+                            &mut stats,
                         );
                     }
                     CrdsData::Vote(_, _) => {
@@ -372,6 +380,7 @@ impl Crds {
                         emit_contact_info_event(
                             self.contact_info_sender.as_ref(),
                             ContactInfoEvent::Updated(ContactInfoSnapshot::from(node)),
+                            &mut stats,
                         );
                     }
                     CrdsData::Vote(_, _) => {
@@ -679,6 +688,7 @@ impl Crds {
                 emit_contact_info_event(
                     self.contact_info_sender.as_ref(),
                     ContactInfoEvent::Removed(*node.pubkey()),
+                    &mut self.stats.lock().unwrap(),
                 );
             }
             CrdsData::Vote(_, _) => {
@@ -1040,6 +1050,33 @@ mod tests {
         assert_matches!(crds.insert(val, 0, GossipRoute::LocalMessage), Ok(()));
         assert!(crds.contact_info_sender.is_none());
     }
+
+    #[test]
+    fn test_contact_info_sender_counts_drops_when_channel_full() {
+        // A bounded channel that nobody drains: once it is full, every
+        // subsequent emit is a drop. `contact_info_dropped` must count
+        // those drops so the value reaches the regular datapoint instead of
+        // the legacy counter registry.
+        let mut crds = Crds::default();
+        let (sender, _receiver) = crossbeam_channel::bounded(1);
+        crds.set_contact_info_sender(sender);
+
+        let mut inserted = 0u64;
+        for _ in 0..8 {
+            let val = CrdsValue::new_unsigned(CrdsData::from(ContactInfo::new_localhost(
+                &Pubkey::new_unique(),
+                0,
+            )));
+            if crds.insert(val, 0, GossipRoute::LocalMessage).is_ok() {
+                inserted += 1;
+            }
+        }
+        assert_eq!(inserted, 8);
+
+        // Capacity is 1, so exactly one send succeeded and 7 were dropped.
+        assert_eq!(crds.take_stats().contact_info_dropped, 7);
+    }
+
     #[test]
     fn test_update_old() {
         let mut crds = Crds::default();

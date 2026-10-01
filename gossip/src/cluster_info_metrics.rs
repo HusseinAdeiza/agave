@@ -462,6 +462,11 @@ pub(crate) fn submit_gossip_stats(
             i64
         ),
         (
+            "gossip_contact_info_dropped",
+            crds_stats.contact_info_dropped,
+            i64
+        ),
+        (
             "push_fanout_num_entries",
             stats.push_fanout_num_entries.clear(),
             i64
