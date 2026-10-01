@@ -256,7 +256,8 @@ impl TransactionStatusSender {
             .as_ref()
             .map(|dependency_tracker| dependency_tracker.declare_work());
 
-        if let Err(e) = self.sender.send(TransactionStatusMessage::Batch((
+        let work_id = work_sequence.as_ref().map(|id| **id);
+        let send_result = self.sender.send(TransactionStatusMessage::Batch((
             TransactionStatusBatch {
                 slot,
                 bank_id,
@@ -267,9 +268,20 @@ impl TransactionStatusSender {
                 costs,
                 transaction_indexes,
             },
-            work_sequence,
-        ))) {
+            work_id,
+        )));
+        // Drop the send-order guard only now that the batch is on the channel.
+        drop(work_sequence);
+
+        if let Err(e) = send_result {
             trace!("Slot {slot} transaction_status send batch failed: {e:?}");
+            // The batch will never be marked processed by the status service, so
+            // release the id here rather than leave a gap in the ordering.
+            if let (Some(dependency_tracker), Some(work_id)) =
+                (self.dependency_tracker.as_ref(), work_id)
+            {
+                dependency_tracker.mark_this_and_all_previous_work_processed(work_id);
+            }
         }
     }
 
