@@ -335,7 +335,14 @@ impl VoteStorage {
     }
 
     fn weighted_random_order_by_stake(&self) -> impl Iterator<Item = Pubkey> + use<> {
-        // Efraimidis and Spirakis algo for weighted random sample without replacement
+        // Efraimidis and Spirakis algo for weighted random sample without replacement.
+        //
+        // The key is `-ln(u) * w` with `w` the stake, sorted ascending. This is the
+        // same distribution as the paper's `u^(1/w)` sorted descending, but it does
+        // not collapse: with stake denominated in lamports, `1/w` is on the order of
+        // 1e-15, so `u^(1/w)` rounds to within a few ULPs of 1.0 for every account
+        // and only a handful of distinct keys survive, leaving the order driven by
+        // hash iteration rather than by stake.
         let mut pubkey_with_weight: Vec<(f64, Pubkey)> = self
             .latest_vote_per_vote_pubkey
             .keys()
@@ -344,12 +351,22 @@ impl VoteStorage {
                 if stake == 0 {
                     None // Ignore votes from unstaked validators
                 } else {
-                    Some((rng().random::<f64>().powf(1.0 / (stake as f64)), pubkey))
+                    Some((Self::weighted_order_key(stake), pubkey))
                 }
             })
             .collect::<Vec<_>>();
-        pubkey_with_weight.sort_by(|(w1, _), (w2, _)| w2.partial_cmp(w1).unwrap());
+        pubkey_with_weight.sort_by(|(w1, _), (w2, _)| w1.partial_cmp(w2).unwrap());
         pubkey_with_weight.into_iter().map(|(_, pubkey)| pubkey)
+    }
+
+    /// Efraimidis-Spirakis sort key for a `stake`-weighted account.
+    ///
+    /// `-ln(u) * stake` for uniform `u` in `(0, 1)`, smaller key sorts first. This
+    /// is the transform of the paper's `u^(1/stake)` but it stays spread out at
+    /// lamport-denominated stakes, where the exponent form collapses.
+    fn weighted_order_key(stake: u64) -> f64 {
+        // `MIN_POSITIVE` keeps `u` inside the open interval, so `ln` stays finite.
+        -rng().random::<f64>().max(f64::MIN_POSITIVE).ln() * stake as f64
     }
 
     /// Check if `vote` can land in our fork based on `slot_hashes`
@@ -1164,5 +1181,51 @@ pub(crate) mod tests {
         );
         assert_eq!(2, vote_storage.len());
         assert_eq!(Some(4), vote_storage.get_latest_vote_slot(vote_pubkey_a));
+    }
+
+    // A stake-weighted key must actually depend on the draw. If it collapses to a
+    // handful of representable values, equal-stake accounts tie and the sort order
+    // falls back to hash iteration, so stake stops mattering.
+    #[test]
+    fn test_weighted_order_key_is_not_collapsed_at_lamport_stakes() {
+        let one_sol_in_lamports = 1_000_000_000u64;
+        let draws = 2_000;
+
+        for sol in [1_000u64, 100_000, 1_000_000] {
+            let stake = sol * one_sol_in_lamports;
+            let keys = (0..draws)
+                .map(|_| VoteStorage::weighted_order_key(stake))
+                .collect::<Vec<_>>();
+
+            // Every draw is finite, so the sort is a total order.
+            assert!(keys.iter().all(|key| key.is_finite()));
+
+            // Far more than the handful of f64 values in [1 - 1e-13, 1.0], which is
+            // all the `u^(1/stake)` form can express at this magnitude.
+            let mut sorted = keys.clone();
+            sorted.sort_by(f64::total_cmp);
+            let distinct = sorted.windows(2).filter(|w| w[0] != w[1]).count() + 1;
+            assert!(distinct > 450, "{sol} SOL: only {distinct} distinct keys");
+        }
+    }
+
+    // Higher stake must win more often, i.e. the key must be ordered so that the
+    // staked account is selected first at the rate its stake share implies.
+    #[test]
+    fn test_weighted_order_key_prefers_higher_stake() {
+        let lamports = 1_000_000_000u64;
+        let small = 100_000 * lamports;
+        let large = 1_000_000 * lamports;
+
+        let large_first = (0..20_000)
+            .filter(|_| {
+                VoteStorage::weighted_order_key(small) > VoteStorage::weighted_order_key(large)
+            })
+            .count();
+
+        // Large stake should be selected first ~10x more often. Assert a loose band
+        // so the test is not flaky while still failing if the key ignores stake.
+        let ratio = large_first as f64 / 20_000.0;
+        assert!((0.05..0.30).contains(&ratio), "ratio was {ratio}");
     }
 }
