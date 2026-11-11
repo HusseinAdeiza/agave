@@ -169,6 +169,7 @@ impl BroadcastStageType {
         shred_version: u16,
         xdp_sender: Option<XdpSender>,
         votor_event_sender: VotorEventSender,
+        shred_receiver_addresses: &[SocketAddr],
     ) -> BroadcastStage {
         let migration_status = bank_forks.read().unwrap().migration_status();
         match self {
@@ -184,6 +185,7 @@ impl BroadcastStageType {
                     migration_status,
                     votor_event_sender,
                     leader_schedule_cache,
+                    shred_receiver_addresses,
                 ),
                 xdp_sender,
             ),
@@ -719,6 +721,7 @@ pub mod test {
                 Arc::new(MigrationStatus::default()),
                 votor_event_sender,
                 leader_schedule_cache,
+                &[],
             ),
             None,
         );

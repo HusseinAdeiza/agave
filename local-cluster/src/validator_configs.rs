@@ -66,6 +66,7 @@ pub fn safe_clone_config(config: &ValidatorConfig) -> ValidatorConfig {
         use_snapshot_archives_at_startup: config.use_snapshot_archives_at_startup,
         unified_scheduler_handler_threads: config.unified_scheduler_handler_threads,
         execution_arenas: config.execution_arenas,
+        shred_receiver_addresses: config.shred_receiver_addresses.clone(),
         ip_echo_server_threads: config.ip_echo_server_threads,
         rayon_global_threads: config.rayon_global_threads,
         replay_forks_threads: config.replay_forks_threads,

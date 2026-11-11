@@ -1,6 +1,7 @@
 //! The `validator` module hosts all the validator microservices.
 
 pub use solana_perf::report_target_features;
+use std::net::SocketAddr;
 use {
     crate::{
         admin_rpc_post_init::{AdminRpcRequestMetadataPostInit, KeyUpdaterType, KeyUpdaters},
@@ -151,7 +152,7 @@ use {
         borrow::Cow,
         cmp,
         collections::{HashMap, HashSet},
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        net::{Ipv4Addr, SocketAddrV4},
         num::{NonZeroU64, NonZeroUsize},
         path::{Path, PathBuf},
         str::FromStr,
@@ -355,6 +356,7 @@ pub struct ValidatorConfig {
     pub vote_history_storage: Arc<dyn VoteHistoryStorage>,
     pub debug_keys: Option<Arc<HashSet<Pubkey>>>,
     pub filter_keys: Arc<HashSet<Pubkey>>,
+    pub shred_receiver_addresses: Vec<SocketAddr>,
     pub contact_debug_interval: u64,
     pub contact_save_interval: u64,
     pub send_transaction_service_config: SendTransactionServiceConfig,
@@ -427,6 +429,7 @@ impl ValidatorConfig {
             vote_history_storage: Arc::new(NullVoteHistoryStorage::default()),
             debug_keys: None,
             filter_keys: Arc::default(),
+            shred_receiver_addresses: Vec::new(),
             contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
             contact_save_interval: DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS,
             send_transaction_service_config: SendTransactionServiceConfig::default(),
@@ -1701,6 +1704,7 @@ impl Validator {
             config.block_production_num_workers,
             config.block_production_scheduler_config.clone(),
             execution_arenas,
+            config.shred_receiver_addresses.clone(),
             config.filter_keys.clone(),
             config.enable_block_production_forwarding,
             config.generator_config.clone(),

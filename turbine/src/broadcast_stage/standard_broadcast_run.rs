@@ -22,9 +22,10 @@ use {
         shred::{ProcessShredsStats, Shred, ShredType, Shredder, merkle_tree::MerkleTree},
     },
     solana_runtime::bank::Bank,
+    solana_net_utils::bind_to_unspecified,
     solana_sha256_hasher::hashv,
     solana_time_utils::AtomicInterval,
-    std::{collections::VecDeque, sync::RwLock},
+    std::{collections::VecDeque, net::SocketAddr, net::UdpSocket, sync::{Arc, RwLock}},
 };
 
 // Expect blacklist events to be extremely rare, so we can tightly bound the
@@ -64,6 +65,8 @@ pub struct StandardBroadcastRun {
     max_data_shreds_per_slot: u32,
     max_code_shreds_per_slot: u32,
     broadcast_blacklist: VecDeque<Slot>,
+    shred_receiver_addresses: Vec<SocketAddr>,
+    mirror_socket: Option<Arc<UdpSocket>>,
 }
 
 #[derive(Debug)]
@@ -77,11 +80,17 @@ impl StandardBroadcastRun {
         migration_status: Arc<MigrationStatus>,
         votor_event_sender: VotorEventSender,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
+        shred_receiver_addresses: &[SocketAddr],
     ) -> Self {
         let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
             CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
             CLUSTER_NODES_CACHE_TTL,
         ));
+        let mirror_socket = if shred_receiver_addresses.is_empty() {
+            None
+        } else {
+            bind_to_unspecified().ok().map(Arc::new)
+        };
         Self {
             slot: Slot::MAX,
             parent: Slot::MAX,
@@ -110,6 +119,8 @@ impl StandardBroadcastRun {
             max_data_shreds_per_slot: DEFAULT_MAX_DATA_SHREDS_PER_SLOT,
             max_code_shreds_per_slot: DEFAULT_MAX_CODE_SHREDS_PER_SLOT,
             broadcast_blacklist: VecDeque::new(),
+            shred_receiver_addresses: shred_receiver_addresses.to_vec(),
+            mirror_socket,
         }
     }
 
@@ -602,6 +613,26 @@ impl StandardBroadcastRun {
             &self.leader_schedule_cache,
             cluster_info.socket_addr_space(),
         )?;
+
+        // Mirror shreds to extra configured receivers
+        if let Some(ref mirror_sock) = self.mirror_socket {
+            if !self.shred_receiver_addresses.is_empty() {
+                let mut mirrored = 0usize;
+                let mut dropped = 0usize;
+                for shred in shreds.iter() {
+                    let payload = shred.payload();
+                    for addr in &self.shred_receiver_addresses {
+                        match mirror_sock.send_to(&payload.bytes, addr) {
+                            Ok(_) => mirrored += 1,
+                            Err(_) => dropped += 1,
+                        }
+                    }
+                }
+                transmit_stats.mirrored_packets += mirrored;
+                transmit_stats.dropped_packets_mirrored += dropped;
+            }
+        }
+
         transmit_time.stop();
 
         transmit_stats.transmit_elapsed = transmit_time.as_us();
@@ -811,6 +842,7 @@ mod test {
             Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&parent_bank),
+            &[],
         );
         let (blockstore_sender, blockstore_receiver) = bounded(1024);
         let (socket_sender, socket_receiver) = bounded(1024);
@@ -949,6 +981,7 @@ mod test {
             Arc::new(MigrationStatus::default()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
+            &[],
         );
 
         standard_broadcast_run
@@ -980,6 +1013,7 @@ mod test {
             Arc::new(MigrationStatus::default()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
+            &[],
         );
         assert!(run.completed);
 
@@ -1036,6 +1070,7 @@ mod test {
             Arc::new(migration_status),
             votor_event_sender,
             test_leader_schedule_cache(&bank0),
+            &[],
         );
         standard_broadcast_run
             .test_process_receive_results(
@@ -1189,6 +1224,7 @@ mod test {
             Arc::new(MigrationStatus::default()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
+            &[],
         );
         let mut process_ticks = |num_ticks| {
             let ticks = create_ticks(num_ticks, 0, genesis_config.hash());
@@ -1264,6 +1300,7 @@ mod test {
             Arc::new(MigrationStatus::default()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
+            &[],
         );
         standard_broadcast_run
             .test_process_receive_results(
@@ -1310,6 +1347,7 @@ mod test {
             Arc::new(MigrationStatus::default()),
             votor_event_sender,
             test_leader_schedule_cache(&bank1),
+            &[],
         );
         let (bsend, brecv) = bounded(1024);
         let (ssend, srecv) = bounded(1024);
@@ -1430,6 +1468,7 @@ mod test {
             Arc::new(MigrationStatus::default()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
+            &[],
         );
         bs.slot = 1;
         bs.parent = 0;
@@ -1467,6 +1506,7 @@ mod test {
             Arc::new(MigrationStatus::post_migration_status()),
             votor_event_sender,
             test_leader_schedule_cache(&bank),
+            &[],
         );
         bs.slot = 12;
         bs.parent = 10;

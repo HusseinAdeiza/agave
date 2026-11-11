@@ -2,6 +2,7 @@
 //! multi-stage transaction processing pipeline in software.
 
 use {
+    std::net::SocketAddr,
     crate::{
         admin_rpc_post_init::{KeyUpdaterType, KeyUpdaters},
         banking_channels::Channels,
@@ -127,6 +128,7 @@ impl Tpu {
         block_production_num_workers: NonZeroUsize,
         block_production_scheduler_config: SchedulerConfig,
         worker_thread_arenas: Option<Arc<ArenaGroup>>,
+        shred_receiver_addresses: Vec<SocketAddr>,
         filter_keys: Arc<HashSet<Pubkey>>,
         enable_block_production_forwarding: bool,
         _generator_config: Option<GeneratorConfig>, /* vestigial code for replay invalidator */
@@ -297,6 +299,7 @@ impl Tpu {
             shred_version,
             turbine_xdp_sender,
             votor_event_sender,
+            &shred_receiver_addresses,
         );
 
         let mut key_notifiers = key_notifiers.write().unwrap();

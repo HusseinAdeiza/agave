@@ -23,6 +23,8 @@ pub struct TransmitShredsStats {
     pub total_packets: usize,
     pub(crate) dropped_packets_udp: usize,
     pub(crate) dropped_packets_xdp: usize,
+    pub(crate) mirrored_packets: usize,
+    pub(crate) dropped_packets_mirrored: usize,
     pub(crate) is_xdp: bool,
 }
 
@@ -35,6 +37,8 @@ impl BroadcastStats for TransmitShredsStats {
         self.total_packets += new_stats.total_packets;
         self.dropped_packets_udp += new_stats.dropped_packets_udp;
         self.dropped_packets_xdp += new_stats.dropped_packets_xdp;
+        self.mirrored_packets += new_stats.mirrored_packets;
+        self.dropped_packets_mirrored += new_stats.dropped_packets_mirrored;
     }
     fn report_stats(&mut self, slot: Slot, slot_start: Instant, was_interrupted: bool) {
         if was_interrupted {
@@ -48,6 +52,8 @@ impl BroadcastStats for TransmitShredsStats {
                 ("total_packets", self.total_packets as i64, i64),
                 ("dropped_packets_udp", self.dropped_packets_udp as i64, i64),
                 ("dropped_packets_xdp", self.dropped_packets_xdp as i64, i64),
+                ("mirrored_packets", self.mirrored_packets as i64, i64),
+                ("dropped_packets_mirrored", self.dropped_packets_mirrored as i64, i64),
             );
         } else {
             datapoint_info!(
@@ -67,6 +73,8 @@ impl BroadcastStats for TransmitShredsStats {
                 ("total_packets", self.total_packets as i64, i64),
                 ("dropped_packets_udp", self.dropped_packets_udp as i64, i64),
                 ("dropped_packets_xdp", self.dropped_packets_xdp as i64, i64),
+                ("mirrored_packets", self.mirrored_packets as i64, i64),
+                ("dropped_packets_mirrored", self.dropped_packets_mirrored as i64, i64),
             );
         }
     }

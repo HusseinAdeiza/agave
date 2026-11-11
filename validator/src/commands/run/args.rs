@@ -17,7 +17,7 @@ use {
     solana_core::validator::{BlockProductionMethod, BlockVerificationMethod},
     solana_keypair::Keypair,
     solana_ledger::{blockstore_options::BlockstoreOptions, use_snapshot_archives_at_startup},
-    solana_net_utils::SocketAddrSpace,
+    solana_net_utils::{is_host_port, SocketAddrSpace},
     solana_pubkey::Pubkey,
     solana_rpc::{rpc::JsonRpcConfig, rpc_pubsub_service::PubSubConfig},
     solana_send_transaction_service::send_transaction_service::Config as SendTransactionServiceConfig,
@@ -55,6 +55,7 @@ pub struct RunArgs {
     pub pub_sub_config: PubSubConfig,
     pub send_transaction_service_config: SendTransactionServiceConfig,
     pub filter_keys: HashSet<Pubkey>,
+    pub shred_receiver_addresses: Vec<SocketAddr>,
 }
 
 impl FromClapArgMatches for RunArgs {
@@ -126,6 +127,20 @@ impl FromClapArgMatches for RunArgs {
                     .collect()
             } else {
                 HashSet::new()
+            },
+            shred_receiver_addresses: if matches.is_present("shred_receiver_address") {
+                values_t!(matches, "shred_receiver_address", String)?
+                    .into_iter()
+                    .map(|addr| {
+                        solana_net_utils::parse_host_port(&addr).map_err(|err| {
+                            crate::commands::Error::Dynamic(Box::<dyn std::error::Error>::from(format!(
+                                "failed to parse shred-receiver-address: {err}"
+                            )))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
             },
         })
     }
@@ -758,6 +773,19 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
                 "Drop internally processed leader-side transactions that touch any listed account \
                  pubkey. Values are space-separated. Using too many keys will negatively impact \
                  performance. External schedulers must implement this filtering themselves",
+            ),
+    )
+    .arg(
+        Arg::with_name("shred_receiver_address")
+            .long("shred-receiver-address")
+            .value_name("HOST:PORT")
+            .takes_value(true)
+            .multiple(true)
+            .validator(is_host_port)
+            .help(
+                "Send an extra copy of each broadcast shred to this address. May be specified \
+                 multiple times. Hostname is resolved once at startup to every IPv4 address. \
+                 IPv6 and port 0 are rejected. Duplicates are dropped. At most 32 addresses.",
             ),
     )
     .arg(
