@@ -8,9 +8,12 @@ repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
+rust-version = { workspace = true }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
 
 [lib]
 crate-type = ["lib"]
@@ -21,7 +24,6 @@ agave-unstable-api = []
 
 [dependencies]
 agave-fs = { workspace = true }
-bincode = { workspace = true }
 bzip2 = { workspace = true }
 crossbeam-channel = { workspace = true }
 log = { workspace = true }
@@ -37,7 +39,6 @@ solana-lattice-hash = { workspace = true }
 solana-measure = { workspace = true }
 solana-metrics = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
-symlink = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -46,7 +47,7 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 agave-logger = { path = "../logger", features = ["agave-unstable-api"] }
-assert_matches = { workspace = true }
+agave-snapshots = { path = ".", features = ["agave-unstable-api"] }
 solana-hash = { workspace = true, features = ["atomic"] }
 
 [lints]

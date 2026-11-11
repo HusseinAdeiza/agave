@@ -3,17 +3,21 @@
 //!
 //! It has two states:
 //! 1. Statically Loaded: after receiving `packet` from sigverify and deserializing
-//!    it into `solana_transaction::versioned::VersionedTransaction`, then sanitizing into
-//!    `solana_transaction::versioned::sanitized::SanitizedVersionedTransaction`, which can be wrapped into
-//!    `RuntimeTransaction` with static transaction metadata extracted.
+//!    it into `solana_transaction::versioned::VersionedTransaction`, the runtime constructor
+//!    sanitizes it into `solana_transaction::versioned::sanitized::SanitizedVersionedTransaction`,
+//!    validates protocol limits, and extracts static transaction metadata.
 //! 2. Dynamically Loaded: after successfully loaded account addresses from onchain
 //!    ALT, RuntimeTransaction<SanitizedMessage> transits into Dynamically Loaded state,
 //!    with its dynamic metadata loaded.
 use {
-    crate::transaction_meta::{CachedTransactionMeta, TransactionConfiguration, TransactionMeta},
+    crate::{
+        transaction_meta::{CachedTransactionMeta, TransactionConfiguration, TransactionMeta},
+        transaction_with_meta::implicit_read_locks,
+    },
     agave_feature_set::FeatureSet,
+    agave_transaction_view::resolved_transaction_view::ResolvedTransactionView,
+    bytes::Bytes,
     core::ops::Deref,
-    solana_compute_budget_instruction::compute_budget_instruction_details::*,
     solana_hash::Hash,
     solana_message::{AccountKeys, TransactionSignatureDetails},
     solana_pubkey::Pubkey,
@@ -22,13 +26,15 @@ use {
         instruction::SVMInstruction,
         message_address_table_lookup::SVMMessageAddressTableLookup,
         svm_message::{SVMMessage, SVMStaticMessage},
-        svm_transaction::SVMTransaction,
+        svm_transaction::SVMStaticTransaction,
     },
     solana_transaction::{TransactionError, versioned::TransactionVersion},
 };
 
 mod sdk_transactions;
 mod transaction_view;
+
+pub type ReplayTransaction = RuntimeTransaction<ResolvedTransactionView<Bytes>>;
 
 #[cfg_attr(feature = "dev-context-only-utils", derive(Clone))]
 #[derive(Debug)]
@@ -37,6 +43,7 @@ pub struct RuntimeTransaction<T> {
     // transaction meta is a collection of fields, it is updated
     // during message state transition
     meta: CachedTransactionMeta,
+    implicit_read_locks: Vec<Pubkey>,
 }
 
 impl<T> RuntimeTransaction<T> {
@@ -45,7 +52,18 @@ impl<T> RuntimeTransaction<T> {
     }
 }
 
+impl<T: SVMMessage> RuntimeTransaction<T> {
+    /// Add ProgramData read locks after resolving all transaction account keys.
+    pub fn load_implicit_read_locks(&mut self) {
+        self.implicit_read_locks = implicit_read_locks(self.transaction.account_keys()).collect();
+    }
+}
+
 impl<T> TransactionMeta for RuntimeTransaction<T> {
+    fn implicit_read_locks(&self) -> &[Pubkey] {
+        &self.implicit_read_locks
+    }
+
     fn message_hash(&self) -> &Hash {
         &self.meta.message_hash
     }
@@ -106,6 +124,14 @@ impl<T: SVMStaticMessage> SVMStaticMessage for RuntimeTransaction<T> {
         self.transaction.num_write_locks()
     }
 
+    fn num_readonly_signed_static_accounts(&self) -> u8 {
+        self.transaction.num_readonly_signed_static_accounts()
+    }
+
+    fn num_readonly_unsigned_static_accounts(&self) -> u8 {
+        self.transaction.num_readonly_unsigned_static_accounts()
+    }
+
     fn recent_blockhash(&self) -> &Hash {
         self.transaction.recent_blockhash()
     }
@@ -141,16 +167,6 @@ impl<T: SVMStaticMessage> SVMStaticMessage for RuntimeTransaction<T> {
     ) -> impl Iterator<Item = SVMMessageAddressTableLookup<'_>> {
         self.transaction.message_address_table_lookups()
     }
-}
-
-impl<T: SVMMessage> SVMMessage for RuntimeTransaction<T> {
-    fn account_keys(&self) -> AccountKeys<'_> {
-        self.transaction.account_keys()
-    }
-
-    fn is_writable(&self, index: usize) -> bool {
-        self.transaction.is_writable(index)
-    }
 
     fn is_signer(&self, index: usize) -> bool {
         self.transaction.is_signer(index)
@@ -161,7 +177,17 @@ impl<T: SVMMessage> SVMMessage for RuntimeTransaction<T> {
     }
 }
 
-impl<T: SVMTransaction> SVMTransaction for RuntimeTransaction<T> {
+impl<T: SVMMessage> SVMMessage for RuntimeTransaction<T> {
+    fn account_keys(&self) -> AccountKeys<'_> {
+        self.transaction.account_keys()
+    }
+
+    fn is_writable(&self, index: usize) -> bool {
+        self.transaction.is_writable(index)
+    }
+}
+
+impl<T: SVMStaticTransaction> SVMStaticTransaction for RuntimeTransaction<T> {
     fn signature(&self) -> &Signature {
         self.transaction.signature()
     }
@@ -170,3 +196,6 @@ impl<T: SVMTransaction> SVMTransaction for RuntimeTransaction<T> {
         self.transaction.signatures()
     }
 }
+
+#[cfg(test)]
+mod implicit_lock_tests;

@@ -1,10 +1,8 @@
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
-#[cfg(feature = "frozen-abi")]
-use solana_frozen_abi::abi_example::AbiExample;
 use {
-    solana_account::{AccountSharedData, ReadableAccount, state_traits::StateMut},
-    solana_instruction::error::InstructionError,
+    solana_account::{AccountSharedData, ReadableAccount, state_traits::StateMutWincode as _},
+    solana_instruction_error::InstructionError,
     solana_pubkey::Pubkey,
     solana_stake_interface::{
         program as stake_program,
@@ -37,6 +35,7 @@ pub enum Error {
 
 impl<T> StakeAccount<T> {
     #[inline]
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn lamports(&self) -> u64 {
         self.account.lamports()
     }
@@ -47,6 +46,7 @@ impl<T> StakeAccount<T> {
     }
 
     #[inline]
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn data_len(&self) -> usize {
         self.account.data().len()
     }
@@ -62,6 +62,7 @@ impl StakeAccount<Delegation> {
     }
 
     #[inline]
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn stake(&self) -> &Stake {
         // Safe to unwrap here because StakeAccount<Delegation> will always
         // only wrap a stake-state.
@@ -102,25 +103,5 @@ impl<S, T> PartialEq<StakeAccount<S>> for StakeAccount<T> {
             _phantom,
         } = other;
         account == &self.account && stake_state == &self.stake_state
-    }
-}
-
-#[cfg(feature = "frozen-abi")]
-impl AbiExample for StakeAccount<Delegation> {
-    fn example() -> Self {
-        use {
-            solana_account::Account,
-            solana_stake_interface::{
-                stake_flags::StakeFlags,
-                state::{Meta, Stake},
-            },
-        };
-        let stake_state =
-            StakeStateV2::Stake(Meta::example(), Stake::example(), StakeFlags::example());
-        let mut account = Account::example();
-        account.data.resize(200, 0u8);
-        account.owner = stake_program::id();
-        account.set_state(&stake_state).unwrap();
-        Self::try_from(AccountSharedData::from(account)).unwrap()
     }
 }

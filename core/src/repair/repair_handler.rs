@@ -1,27 +1,22 @@
+#[cfg(feature = "dev-context-only-utils")]
+use super::malicious_repair_handler::{MaliciousRepairConfig, MaliciousRepairHandler};
 use {
     super::{
-        malicious_repair_handler::{MaliciousRepairConfig, MaliciousRepairHandler},
         repair_response::repair_response_packet_from_bytes,
-        serve_repair::ServeRepair,
+        serve_repair::{FecSetRoot, ServeRepair},
         standard_repair_handler::StandardRepairHandler,
     },
-    crate::repair::{
-        repair_response,
-        serve_repair::{AncestorHashesResponse, BlockIdRepairResponse, MAX_ANCESTOR_RESPONSES},
-    },
-    agave_votor_messages::migration::MigrationStatus,
-    bincode::serialize,
+    crate::repair::{repair_response, serve_repair::BlockIdRepairResponse},
+    agave_shred_wire_format::constants::Nonce,
     solana_clock::Slot,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_ledger::{
-        ancestor_iterator::{AncestorIterator, AncestorIteratorWithHash},
-        blockstore::Blockstore,
-        leader_schedule_cache::LeaderScheduleCache,
-        shred::{DATA_SHREDS_PER_FEC_BLOCK, ErasureSetId, Nonce},
+        blockstore::Blockstore, leader_schedule_cache::LeaderScheduleCache,
+        shred::DATA_SHREDS_PER_FEC_BLOCK,
     },
-    solana_perf::packet::{Packet, PacketBatch, PacketBatchRecycler, RecycledPacketBatch},
+    solana_perf::packet::{BytesPacket, PacketBatch},
     solana_poh::poh_recorder::SharedLeaderState,
     solana_pubkey::Pubkey,
     solana_runtime::bank_forks::SharableBanks,
@@ -30,20 +25,22 @@ use {
         net::SocketAddr,
         sync::{Arc, RwLock},
     },
+    wincode::{SchemaWrite, serialize},
 };
 
 /// Helper function to create a PacketBatch from a serializable response
-fn create_response_packet_batch<T: serde::Serialize>(
-    recycler: &PacketBatchRecycler,
+fn create_response_packet_batch<T>(
     response: &T,
     from_addr: &SocketAddr,
     nonce: Nonce,
-    debug_label: &'static str,
-) -> Option<PacketBatch> {
+) -> Option<PacketBatch>
+where
+    T: SchemaWrite<wincode::config::DefaultConfig, Src = T>,
+{
     let serialized_response = serialize(response).ok()?;
     let packet =
         repair_response::repair_response_packet_from_bytes(serialized_response, from_addr, nonce)?;
-    Some(RecycledPacketBatch::new_with_recycler_data(recycler, debug_label, vec![packet]).into())
+    Some(PacketBatch::Single(packet))
 }
 
 pub trait RepairHandler {
@@ -55,11 +52,10 @@ pub trait RepairHandler {
         shred_index: u64,
         dest: &SocketAddr,
         nonce: Nonce,
-    ) -> Option<Packet>;
+    ) -> Option<BytesPacket>;
 
     fn run_window_request(
         &self,
-        recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
         slot: Slot,
         shred_index: u64,
@@ -67,47 +63,27 @@ pub trait RepairHandler {
     ) -> Option<PacketBatch> {
         // Try to find the requested index in one of the slots
         let packet = self.repair_response_packet(slot, shred_index, from_addr, nonce)?;
-        Some(
-            RecycledPacketBatch::new_with_recycler_data(
-                recycler,
-                "run_window_request",
-                vec![packet],
-            )
-            .into(),
-        )
+        Some(PacketBatch::Single(packet))
     }
 
     fn run_window_request_for_block_id(
         &self,
-        recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
         slot: Slot,
         shred_index: u64,
         block_id: Hash,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        let location = self
-            .blockstore()
-            .get_block_location(slot, block_id)
-            .ok()??;
         let shred = self
             .blockstore()
-            .get_data_shred_from_location(slot, shred_index, location)
+            .get_data_shred_for_block_id(slot, shred_index, block_id)
             .ok()??;
         let packet = repair_response_packet_from_bytes(shred, from_addr, nonce)?;
-        Some(
-            RecycledPacketBatch::new_with_recycler_data(
-                recycler,
-                "run_window_request_for_block_id",
-                vec![packet],
-            )
-            .into(),
-        )
+        Some(PacketBatch::Single(packet))
     }
 
     fn run_highest_window_request(
         &self,
-        recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
         slot: Slot,
         highest_index: u64,
@@ -115,66 +91,32 @@ pub trait RepairHandler {
     ) -> Option<PacketBatch> {
         // Try to find the requested index in one of the slots
         let meta = self.blockstore().meta(slot).ok()??;
-        if meta.received > highest_index {
-            // meta.received must be at least 1 by this point
-            let packet = self.repair_response_packet(slot, meta.received - 1, from_addr, nonce)?;
-            return Some(
-                RecycledPacketBatch::new_with_recycler_data(
-                    recycler,
-                    "run_highest_window_request",
-                    vec![packet],
-                )
-                .into(),
-            );
+        let shred_index = meta.received.checked_sub(1)?;
+        if shred_index >= highest_index || meta.last_index == Some(shred_index) {
+            let packet = self.repair_response_packet(slot, shred_index, from_addr, nonce)?;
+            return Some(PacketBatch::Single(packet));
         }
         None
     }
 
     fn run_orphan(
         &self,
-        recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
         slot: Slot,
         max_responses: usize,
         nonce: Nonce,
     ) -> Option<PacketBatch>;
 
-    fn run_ancestor_hashes(
-        &self,
-        recycler: &PacketBatchRecycler,
-        from_addr: &SocketAddr,
-        slot: Slot,
-        nonce: Nonce,
-    ) -> Option<PacketBatch> {
-        let ancestor_slot_hashes = if self.blockstore().is_duplicate_confirmed(slot) {
-            let ancestor_iterator = AncestorIteratorWithHash::from(
-                AncestorIterator::new_inclusive(slot, self.blockstore()),
-            );
-            ancestor_iterator.take(MAX_ANCESTOR_RESPONSES).collect()
-        } else {
-            // If this slot is not duplicate confirmed, return nothing
-            vec![]
-        };
-        let response = AncestorHashesResponse::Hashes(ancestor_slot_hashes);
-        create_response_packet_batch(recycler, &response, from_addr, nonce, "run_ancestor_hashes")
-    }
-
     fn run_parent_fec_set_count(
         &self,
-        recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
         slot: Slot,
         block_id: Hash,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        let (double_merkle_meta, location) = self
+        let (double_merkle_meta, slot_meta) = self
             .blockstore()
-            .get_double_merkle_meta_maybe_populate_proofs_for_block_id(slot, block_id)
-            .ok()??;
-
-        let slot_meta = self
-            .blockstore()
-            .meta_from_location(slot, location)
+            .get_parent_repair_metadata(slot, block_id)
             .ok()??;
 
         let parent_slot = slot_meta.parent_slot?;
@@ -186,42 +128,31 @@ pub trait RepairHandler {
             parent_info: (parent_slot, parent_block_id),
             parent_proof,
         };
-        create_response_packet_batch(
-            recycler,
-            &response,
-            from_addr,
-            nonce,
-            "run_parent_fec_set_count",
-        )
+        create_response_packet_batch(&response, from_addr, nonce)
     }
 
     fn run_fec_set_root(
         &self,
-        recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
         slot: Slot,
         block_id: Hash,
         fec_set_index: u32,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
-        let (double_merkle_meta, location) = self
+        let (double_merkle_meta, merkle_root_meta) = self
             .blockstore()
-            .get_double_merkle_meta_maybe_populate_proofs_for_block_id(slot, block_id)
+            .get_fec_set_root_repair_metadata(slot, block_id, fec_set_index)
             .ok()??;
 
-        let fec_set_root = self
-            .blockstore()
-            .merkle_root_meta_from_location(ErasureSetId::new(slot, fec_set_index), location)
-            .ok()??
-            .merkle_root()?;
+        let fec_set_root = merkle_root_meta.merkle_root()?;
         let proof_index = fec_set_index.checked_div(DATA_SHREDS_PER_FEC_BLOCK as u32)?;
         let fec_set_proof = double_merkle_meta.get_fec_set_proof(proof_index)?.to_vec();
 
         let response = BlockIdRepairResponse::FecSetRoot {
-            fec_set_root,
+            fec_set_root: FecSetRoot::from(fec_set_root),
             fec_set_proof,
         };
-        create_response_packet_batch(recycler, &response, from_addr, nonce, "run_fec_set_root")
+        create_response_packet_batch(&response, from_addr, nonce)
     }
 }
 
@@ -229,10 +160,12 @@ pub trait RepairHandler {
 pub enum RepairHandlerType {
     #[default]
     Standard,
+    #[cfg(feature = "dev-context-only-utils")]
     Malicious(MaliciousRepairConfig),
 }
 
 impl RepairHandlerType {
+    #[cfg_attr(not(feature = "dev-context-only-utils"), allow(unused_variables))]
     pub fn to_handler(
         &self,
         blockstore: Arc<Blockstore>,
@@ -241,6 +174,7 @@ impl RepairHandlerType {
     ) -> Box<dyn RepairHandler + Send + Sync> {
         match self {
             RepairHandlerType::Standard => Box::new(StandardRepairHandler::new(blockstore)),
+            #[cfg(feature = "dev-context-only-utils")]
             RepairHandlerType::Malicious(config) => Box::new(MaliciousRepairHandler::new(
                 blockstore,
                 identity,
@@ -258,7 +192,6 @@ impl RepairHandlerType {
         serve_repair_whitelist: Arc<RwLock<HashSet<Pubkey>>>,
         leader_state: SharedLeaderState,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
-        migration_status: Arc<MigrationStatus>,
     ) -> ServeRepair {
         let identity_keypair = cluster_info.keypair();
         ServeRepair::new_with_leader_state(
@@ -267,7 +200,6 @@ impl RepairHandlerType {
             serve_repair_whitelist,
             self.to_handler(blockstore, identity_keypair, leader_schedule_cache),
             leader_state,
-            migration_status,
         )
     }
 }
@@ -283,9 +215,8 @@ mod tests {
         solana_ledger::{
             blockstore_meta::BlockLocation,
             get_tmp_ledger_path_auto_delete,
-            shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
+            shred::{ProcessShredsStats, Shred, Shredder},
         },
-        solana_perf::packet::PacketBatchRecycler,
         std::net::{IpAddr, Ipv4Addr, SocketAddr},
     };
 
@@ -307,7 +238,6 @@ mod tests {
             chained_merkle_root,
             0, // next_shred_index
             0, // next_code_index
-            &ReedSolomonCache::default(),
             &mut ProcessShredsStats::default(),
         );
 
@@ -333,7 +263,6 @@ mod tests {
                     .into_iter()
                     .chain(parent_coding_shreds)
                     .collect::<Vec<_>>(),
-                None,
                 true,
             )
             .unwrap();
@@ -356,7 +285,6 @@ mod tests {
                     .into_iter()
                     .chain(coding_shreds)
                     .collect::<Vec<_>>(),
-                None,
                 true, // is_trusted
             )
             .unwrap();
@@ -388,7 +316,6 @@ mod tests {
             setup_blockstore_with_complete_slot(slot, parent_slot, num_entries);
 
         let handler = StandardRepairHandler::new(blockstore.clone());
-        let recycler = PacketBatchRecycler::default();
         let from_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let nonce = 12345;
 
@@ -403,14 +330,7 @@ mod tests {
         for (i, expected_root) in fec_set_roots.iter().enumerate() {
             let fec_set_index = (i * DATA_SHREDS_PER_FEC_BLOCK) as u32;
 
-            let result = handler.run_fec_set_root(
-                &recycler,
-                &from_addr,
-                slot,
-                block_id,
-                fec_set_index,
-                nonce,
-            );
+            let result = handler.run_fec_set_root(&from_addr, slot, block_id, fec_set_index, nonce);
 
             assert!(
                 result.is_some(),
@@ -423,7 +343,7 @@ mod tests {
 
             let packet = packet_batch.iter().next().unwrap();
             let (response, response_nonce): (BlockIdRepairResponse, Nonce) =
-                bincode::deserialize(packet.data(..packet.meta().size).unwrap()).unwrap();
+                wincode::deserialize(packet.data(..packet.meta().size).unwrap()).unwrap();
 
             assert_eq!(response_nonce, nonce);
             match response {
@@ -432,7 +352,8 @@ mod tests {
                     fec_set_proof,
                 } => {
                     assert_eq!(
-                        fec_set_root, *expected_root,
+                        fec_set_root,
+                        FecSetRoot::from(*expected_root),
                         "FEC set root should match for index {fec_set_index}"
                     );
                     assert!(
@@ -446,20 +367,13 @@ mod tests {
 
         // Test with invalid block_id returns None
         let invalid_block_id = Hash::new_unique();
-        let result =
-            handler.run_fec_set_root(&recycler, &from_addr, slot, invalid_block_id, 0, nonce);
+        let result = handler.run_fec_set_root(&from_addr, slot, invalid_block_id, 0, nonce);
         assert!(result.is_none(), "Should return None for invalid block_id");
 
         // Test with out-of-bounds fec_set_index returns None
         let invalid_fec_set_index = (fec_set_roots.len() * DATA_SHREDS_PER_FEC_BLOCK) as u32;
-        let result = handler.run_fec_set_root(
-            &recycler,
-            &from_addr,
-            slot,
-            block_id,
-            invalid_fec_set_index,
-            nonce,
-        );
+        let result =
+            handler.run_fec_set_root(&from_addr, slot, block_id, invalid_fec_set_index, nonce);
         assert!(
             result.is_none(),
             "Should return None for out-of-bounds fec_set_index"
@@ -476,11 +390,10 @@ mod tests {
             setup_blockstore_with_complete_slot(slot, parent_slot, num_entries);
 
         let handler = StandardRepairHandler::new(blockstore.clone());
-        let recycler = PacketBatchRecycler::default();
         let from_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let nonce = 12345;
 
-        let result = handler.run_parent_fec_set_count(&recycler, &from_addr, slot, block_id, nonce);
+        let result = handler.run_parent_fec_set_count(&from_addr, slot, block_id, nonce);
 
         assert!(result.is_some(), "run_parent_fec_set_count should succeed");
 
@@ -490,7 +403,7 @@ mod tests {
 
         let packet = packet_batch.iter().next().unwrap();
         let (response, response_nonce): (BlockIdRepairResponse, Nonce) =
-            bincode::deserialize(packet.data(..packet.meta().size).unwrap()).unwrap();
+            wincode::deserialize(packet.data(..packet.meta().size).unwrap()).unwrap();
 
         assert_eq!(response_nonce, nonce);
         match response {
@@ -518,12 +431,11 @@ mod tests {
 
         // Test with invalid block_id returns None
         let invalid_block_id = Hash::new_unique();
-        let result =
-            handler.run_parent_fec_set_count(&recycler, &from_addr, slot, invalid_block_id, nonce);
+        let result = handler.run_parent_fec_set_count(&from_addr, slot, invalid_block_id, nonce);
         assert!(result.is_none(), "Should return None for invalid block_id");
 
         // Test with non-existent slot returns None
-        let result = handler.run_parent_fec_set_count(&recycler, &from_addr, 9999, block_id, nonce);
+        let result = handler.run_parent_fec_set_count(&from_addr, 9999, block_id, nonce);
         assert!(result.is_none(), "Should return None for non-existent slot");
     }
 }

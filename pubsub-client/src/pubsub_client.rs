@@ -29,22 +29,19 @@
 //! reliably. For a non-blocking, cancelable API, use the asynchronous client
 //! in [`crate::nonblocking::pubsub_client`].
 //!
-//! By default the [`block_subscribe`] and [`vote_subscribe`] events are
-//! disabled on RPC nodes. They can be enabled by passing
-//! `--rpc-pubsub-enable-block-subscription` and
-//! `--rpc-pubsub-enable-vote-subscription` to `agave-validator`. When these
-//! methods are disabled, the RPC server will return a "Method not found" error
-//! message.
+//! By default the [`block_subscribe`] event is disabled on RPC nodes. It can be
+//! enabled by passing `--rpc-pubsub-enable-block-subscription` to
+//! `agave-validator`. When this method is disabled, the RPC server will return
+//! a "Method not found" error message.
 //!
 //! [`block_subscribe`]: https://docs.rs/solana-rpc/latest/solana_rpc/rpc_pubsub/trait.RpcSolPubSub.html#tymethod.block_subscribe
-//! [`vote_subscribe`]: https://docs.rs/solana-rpc/latest/solana_rpc/rpc_pubsub/trait.RpcSolPubSub.html#tymethod.vote_subscribe
 //!
 //! # Examples
 //!
 //! This example subscribes to account events and then loops forever receiving
 //! them.
 //!
-//! ```
+//! ```no_run
 //! use anyhow::Result;
 //! use solana_commitment_config::CommitmentConfig;
 //! use solana_pubkey::Pubkey;
@@ -106,7 +103,7 @@ use {
         },
         response::{
             Response as RpcResponse, RpcBlockUpdate, RpcKeyedAccount, RpcLogsResponse,
-            RpcSignatureResult, RpcVote, SlotInfo, SlotUpdate,
+            RpcSignatureResult, SlotInfo, SlotUpdate,
         },
     },
     solana_signature::Signature,
@@ -181,12 +178,11 @@ where
     fn extract_subscription_id(message: Message) -> Result<u64, PubsubClientError> {
         let message_text = &message.into_text().map_err(Box::new)?;
 
-        if let Ok(json_msg) = serde_json::from_str::<Map<String, Value>>(message_text) {
-            if let Some(Number(x)) = json_msg.get("result") {
-                if let Some(x) = x.as_u64() {
-                    return Ok(x);
-                }
-            }
+        if let Ok(json_msg) = serde_json::from_str::<Map<String, Value>>(message_text)
+            && let Some(Number(x)) = json_msg.get("result")
+            && let Some(x) = x.as_u64()
+        {
+            return Ok(x);
         }
 
         Err(PubsubClientError::UnexpectedSubscriptionResponse(format!(
@@ -226,14 +222,12 @@ where
             return Ok(None);
         }
         let message_text = &message.into_text().map_err(Box::new)?;
-        if let Ok(json_msg) = serde_json::from_str::<Map<String, Value>>(message_text) {
-            if let Some(Object(params)) = json_msg.get("params") {
-                if let Some(result) = params.get("result") {
-                    if let Ok(x) = T::deserialize(result) {
-                        return Ok(Some(x));
-                    }
-                }
-            }
+        if let Ok(json_msg) = serde_json::from_str::<Map<String, Value>>(message_text)
+            && let Some(Object(params)) = json_msg.get("params")
+            && let Some(result) = params.get("result")
+            && let Ok(x) = T::deserialize(result)
+        {
+            return Ok(Some(x));
         }
 
         Err(PubsubClientError::UnexpectedMessageError(format!(
@@ -297,9 +291,6 @@ pub type AccountSubscription = (
     Receiver<RpcResponse<UiAccount>>,
 );
 
-pub type PubsubVoteClientSubscription = PubsubClientSubscription<RpcVote>;
-pub type VoteSubscription = (PubsubVoteClientSubscription, Receiver<RpcVote>);
-
 pub type PubsubRootClientSubscription = PubsubClientSubscription<Slot>;
 pub type RootSubscription = (PubsubRootClientSubscription, Receiver<Slot>);
 
@@ -315,28 +306,27 @@ fn connect_with_retry<R: IntoClientRequest>(
     let client_request = request.into_client_request().map_err(Box::new)?;
     loop {
         let result = connect(client_request.clone()).map(|(socket, _)| socket);
-        if let Err(tungstenite::Error::Http(response)) = &result {
-            if response.status() == StatusCode::TOO_MANY_REQUESTS && connection_retries > 0 {
-                let mut duration = Duration::from_millis(500);
-                if let Some(retry_after) = response.headers().get(header::RETRY_AFTER) {
-                    if let Ok(retry_after) = retry_after.to_str() {
-                        if let Ok(retry_after) = retry_after.parse::<u64>() {
-                            if retry_after < 120 {
-                                duration = Duration::from_secs(retry_after);
-                            }
-                        }
-                    }
-                }
-
-                connection_retries -= 1;
-                debug!(
-                    "Too many requests: server responded with {response:?}, {connection_retries} \
-                     retries left, pausing for {duration:?}"
-                );
-
-                sleep(duration);
-                continue;
+        if let Err(tungstenite::Error::Http(response)) = &result
+            && response.status() == StatusCode::TOO_MANY_REQUESTS
+            && connection_retries > 0
+        {
+            let mut duration = Duration::from_millis(500);
+            if let Some(retry_after) = response.headers().get(header::RETRY_AFTER)
+                && let Ok(retry_after) = retry_after.to_str()
+                && let Ok(retry_after) = retry_after.parse::<u64>()
+                && retry_after < 120
+            {
+                duration = Duration::from_secs(retry_after);
             }
+
+            connection_retries -= 1;
+            debug!(
+                "Too many requests: server responded with {response:?}, {connection_retries} \
+                 retries left, pausing for {duration:?}"
+            );
+
+            sleep(duration);
+            continue;
         }
         return result.map_err(Box::new);
     }
@@ -535,54 +525,6 @@ impl PubsubClient {
         let result = PubsubClientSubscription {
             message_type: PhantomData,
             operation: "program",
-            socket,
-            subscription_id,
-            t_cleanup: Some(t_cleanup),
-            exit,
-        };
-
-        Ok((result, receiver))
-    }
-
-    /// Subscribe to vote events.
-    ///
-    /// Receives messages of type [`RpcVote`] when a new vote is observed. These
-    /// votes are observed prior to confirmation and may never be confirmed.
-    ///
-    /// This method is disabled by default. It can be enabled by passing
-    /// `--rpc-pubsub-enable-vote-subscription` to `agave-validator`.
-    ///
-    /// # RPC Reference
-    ///
-    /// This method corresponds directly to the [`voteSubscribe`] RPC method.
-    ///
-    /// [`voteSubscribe`]: https://solana.com/docs/rpc/websocket/votesubscribe
-    pub fn vote_subscribe<R: IntoClientRequest>(
-        request: R,
-    ) -> Result<VoteSubscription, PubsubClientError> {
-        let client_request = request.into_client_request().map_err(Box::new)?;
-        let socket = connect_with_retry(client_request)?;
-        let (sender, receiver) = unbounded();
-
-        let socket = Arc::new(RwLock::new(socket));
-        let socket_clone = socket.clone();
-        let exit = Arc::new(AtomicBool::new(false));
-        let exit_clone = exit.clone();
-        let body = json!({
-            "jsonrpc":"2.0",
-            "id":1,
-            "method":"voteSubscribe",
-        })
-        .to_string();
-        let subscription_id = PubsubVoteClientSubscription::send_subscribe(&socket_clone, body)?;
-
-        let t_cleanup = std::thread::spawn(move || {
-            Self::cleanup_with_sender(exit_clone, &socket_clone, sender)
-        });
-
-        let result = PubsubClientSubscription {
-            message_type: PhantomData,
-            operation: "vote",
             socket,
             subscription_id,
             t_cleanup: Some(t_cleanup),

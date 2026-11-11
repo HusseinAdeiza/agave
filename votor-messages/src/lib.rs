@@ -1,14 +1,14 @@
 #![cfg(feature = "agave-unstable-api")]
 //! Alpenglow vote message types
-#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![deny(missing_docs)]
 
+pub mod certificate;
 pub mod consensus_message;
+pub mod finalized_slot;
 pub mod fraction;
 pub mod migration;
 pub mod reward_certificate;
+pub mod stake;
+pub mod unverified_vote_message;
 pub mod vote;
-
-#[cfg_attr(feature = "frozen-abi", macro_use)]
-#[cfg(feature = "frozen-abi")]
-extern crate solana_frozen_abi_macro;
+pub mod wire;

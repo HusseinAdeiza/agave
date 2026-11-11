@@ -44,12 +44,15 @@ impl<T> std::convert::From<crossbeam_channel::SendError<T>> for Error {
 mod tests {
     use {
         crate::result::{Error, Result},
-        crossbeam_channel::{RecvError, RecvTimeoutError, unbounded},
-        std::{io, io::Write, panic},
+        crossbeam_channel::{RecvError, RecvTimeoutError, bounded},
+        std::{
+            assert_matches,
+            io::{self, Write},
+        },
     };
 
     fn send_error() -> Result<()> {
-        let (s, r) = unbounded();
+        let (s, r) = bounded(1024);
         drop(r);
         s.send(())?;
         Ok(())

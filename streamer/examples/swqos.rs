@@ -142,14 +142,13 @@ async fn main() -> anyhow::Result<()> {
             NaiveTime::MIN,
         );
         let logfile = std::fs::File::create(&path)?;
-        info!("Logfile in {}", &path);
+        info!("Logfile in {path}");
         let mut logfile = std::io::BufWriter::new(logfile);
         let mut sum = 0;
         for batch in receiver {
             let now = Utc::now().naive_utc();
             let delta_time = (now - solana_epoch).num_microseconds().unwrap() as u64;
             for pkt in batch.iter() {
-                let pkt = pkt.to_bytes_packet();
                 if pkt.buffer().len() < 32 {
                     continue;
                 }

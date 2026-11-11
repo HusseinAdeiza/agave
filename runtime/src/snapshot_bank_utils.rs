@@ -25,7 +25,8 @@ use {
             rebuild_storages_from_snapshot_dir, verify_and_unarchive_snapshots,
         },
     },
-    agave_fs::{dirs, io_setup::IoSetupState},
+    agave_fs::io_setup::IoSetupState,
+    agave_memory::{HugePageAlign, HugePages},
     agave_snapshots::{
         SnapshotArchiveKind, SnapshotKind,
         error::{
@@ -148,8 +149,6 @@ pub fn bank_from_snapshot_archives(
     debug_keys: Option<Arc<HashSet<Pubkey>>>,
     leader_for_tests: Option<SlotLeader>,
     limit_load_slot_count_from_snapshot: Option<usize>,
-    accounts_db_skip_shrink: bool,
-    accounts_db_force_initial_clean: bool,
     verify_index: bool,
     accounts_db_config: AccountsDbConfig,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
@@ -170,7 +169,8 @@ pub fn bank_from_snapshot_archives(
     let io_setup = IoSetupState::default()
         .with_shared_sqpoll()?
         .with_direct_io(snapshot_config.use_direct_io)
-        .with_buffers_registered(snapshot_config.use_registered_io_uring_buffers);
+        .with_buffers_registered(snapshot_config.use_registered_io_uring_buffers)
+        .with_huge_pages(HugePages::Transparent(HugePageAlign::Start));
     let (
         UnarchivedSnapshots {
             full_storage: mut storage,
@@ -265,12 +265,8 @@ pub fn bank_from_snapshot_archives(
     )?;
 
     let mut measure_verify = Measure::start("verify");
-    if !bank.verify_snapshot_bank(
-        accounts_db_skip_shrink || !full_snapshot_archive_info.is_remote(),
-        accounts_db_force_initial_clean,
-        full_snapshot_archive_info.slot(),
-        Some(&info.calculated_accounts_lt_hash),
-    ) && limit_load_slot_count_from_snapshot.is_none()
+    if !bank.verify_snapshot_bank(Some(&info.calculated_accounts_lt_hash))
+        && limit_load_slot_count_from_snapshot.is_none()
     {
         panic!("Snapshot bank for slot {} failed to verify", bank.slot());
     }
@@ -307,8 +303,6 @@ pub fn bank_from_latest_snapshot_archives(
     runtime_config: &RuntimeConfig,
     debug_keys: Option<Arc<HashSet<Pubkey>>>,
     limit_load_slot_count_from_snapshot: Option<usize>,
-    accounts_db_skip_shrink: bool,
-    accounts_db_force_initial_clean: bool,
     verify_index: bool,
     accounts_db_config: AccountsDbConfig,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
@@ -341,8 +335,6 @@ pub fn bank_from_latest_snapshot_archives(
         debug_keys,
         None, // leader_for_tests
         limit_load_slot_count_from_snapshot,
-        accounts_db_skip_shrink,
-        accounts_db_force_initial_clean,
         verify_index,
         accounts_db_config,
         accounts_update_notifier,
@@ -367,7 +359,7 @@ pub fn bank_from_snapshot_dir(
     leader_for_tests: Option<SlotLeader>,
     limit_load_slot_count_from_snapshot: Option<usize>,
     verify_index: bool,
-    accounts_db_config: AccountsDbConfig,
+    mut accounts_db_config: AccountsDbConfig,
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
     exit: Arc<AtomicBool>,
 ) -> agave_snapshots::Result<Bank> {
@@ -376,11 +368,22 @@ pub fn bank_from_snapshot_dir(
         bank_snapshot.snapshot_dir.display()
     );
 
-    // Clear the contents of the account paths run directories.  When constructing the bank, the appendvec
-    // files will be extracted from the snapshot hardlink directories into these run/ directories.
-    for path in account_paths {
-        dirs::remove_dir_contents(path);
+    // Size the index up front from the snapshot's account count, unless it was configured
+    // explicitly. Fastboot only: snapshot archives carry no such count.
+    let num_accounts_hint = snapshot_utils::read_startup_hints(&bank_snapshot.snapshot_dir)?
+        .and_then(|startup_hints| startup_hints.num_accounts());
+    if let Some(num_accounts) = num_accounts_hint {
+        let index_config = accounts_db_config.index.get_or_insert_default();
+        if index_config.num_initial_accounts.is_none() {
+            let num_accounts = num_accounts as usize;
+            info!("Sizing accounts index for {num_accounts} accounts, per the snapshot");
+            index_config.num_initial_accounts = Some(num_accounts);
+        }
     }
+
+    // Storages from this snapshot already live under `account_paths`; the storages list
+    // inside the bank snapshot dir tells us which ones belong to it, and stale files
+    // (e.g. from later slots) are pruned by `rebuild_storages_from_snapshot_dir`.
 
     let next_append_vec_id = Arc::new(AtomicAccountsFileId::new(0));
 
@@ -449,12 +452,8 @@ pub fn bank_from_snapshot_dir(
 
     bank.status_cache.write().unwrap().append(&slot_deltas);
 
-    if !bank.verify_snapshot_bank(
-        true,
-        false,
-        0, // since force_clean is false, this value is unused
-        Some(&info.calculated_accounts_lt_hash),
-    ) && limit_load_slot_count_from_snapshot.is_none()
+    if !bank.verify_snapshot_bank(Some(&info.calculated_accounts_lt_hash))
+        && limit_load_slot_count_from_snapshot.is_none()
     {
         panic!("Snapshot bank for slot {} failed to verify", bank.slot());
     }
@@ -735,7 +734,8 @@ pub fn bank_to_full_snapshot_archive(
         snapshot_config.snapshot_version,
         snapshot_package.bank_snapshot_package,
         snapshot_storages.as_slice(),
-        false, // we do not intend to fastboot, so skip flushing and hard linking the storages
+        false, // we do not intend to fastboot, so skip finalization
+        &snapshot_package.startup_hints,
         &io_setup,
     )?;
 
@@ -808,7 +808,8 @@ pub fn bank_to_incremental_snapshot_archive(
         snapshot_config.snapshot_version,
         snapshot_package.bank_snapshot_package,
         snapshot_storages.as_slice(),
-        false, // we do not intend to fastboot, so skip flushing and hard linking the storages
+        false, // we do not intend to fastboot, so skip finalization
+        &snapshot_package.startup_hints,
         &io_setup,
     )?;
 
@@ -837,21 +838,23 @@ mod tests {
             genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
             snapshot_package::BankSnapshotPackage,
             snapshot_utils::{
-                clean_orphaned_account_snapshot_dirs, create_tmp_accounts_dir_for_tests,
-                get_bank_snapshots, get_highest_bank_snapshot, get_highest_loadable_bank_snapshot,
-                purge_all_bank_snapshots, purge_bank_snapshot,
+                create_tmp_accounts_dir_for_tests, get_bank_snapshots, get_highest_bank_snapshot,
+                get_highest_loadable_bank_snapshot, purge_all_bank_snapshots, purge_bank_snapshot,
                 purge_bank_snapshots_older_than_slot, purge_incomplete_bank_snapshots,
                 purge_old_bank_snapshots, purge_old_bank_snapshots_at_startup,
-                snapshot_storage_rebuilder::get_slot_and_append_vec_id,
+                snapshot_storage_rebuilder::parse_storage_filename,
             },
             status_cache::{Status, StatusCache},
         },
         agave_snapshots::{
             SnapshotVersion, error::VerifySlotDeltasError, paths::get_bank_snapshot_dir,
         },
+        agave_votor_messages::consensus_message::BlockId,
         semver::Version,
-        solana_accounts_db::accounts_db::ACCOUNTS_DB_CONFIG_FOR_TESTING,
-        solana_hash::Hash,
+        solana_accounts_db::{
+            accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsFileId},
+            accounts_file::AccountsFileProvider,
+        },
         solana_keypair::Keypair,
         solana_native_token::LAMPORTS_PER_SOL,
         solana_pubkey::Pubkey,
@@ -886,7 +889,7 @@ mod tests {
         genesis_config: &GenesisConfig,
         bank_snapshots_dir: impl AsRef<Path>,
         num_total: usize,
-        should_flush_and_hard_link_storages: bool,
+        should_finalize: bool,
     ) -> Arc<Bank> {
         let (bank0, bank_forks) =
             Bank::new_for_tests(genesis_config).wrap_with_bank_forks_for_tests();
@@ -900,13 +903,13 @@ mod tests {
                 slot,
             );
             bank.fill_bank_with_ticks_for_tests();
-            bank.set_block_id(Some(Hash::default()));
+            bank.set_block_id(Some(BlockId::default()));
 
             create_bank_snapshot_from_bank(
                 &bank_snapshots_dir,
                 &bank,
                 SnapshotVersion::default(),
-                should_flush_and_hard_link_storages,
+                should_finalize,
             )
             .unwrap();
         }
@@ -915,7 +918,7 @@ mod tests {
     }
 
     /// Creates a bank snapshot from a bank, regardless of state. The Bank will be frozen during
-    /// the process. Passing in should_flush_and_hard_link_storages as true will create a
+    /// the process. Passing in should_finalize as true will create a
     /// a fastbootable bank snapshot
     ///
     /// Requires:
@@ -925,7 +928,7 @@ mod tests {
         bank_snapshots_dir: impl AsRef<Path>,
         bank: &Bank,
         snapshot_version: SnapshotVersion,
-        should_flush_and_hard_link_storages: bool,
+        should_finalize: bool,
     ) -> agave_snapshots::Result<()> {
         assert!(bank.is_complete());
         assert!(bank.block_id().is_some());
@@ -948,7 +951,8 @@ mod tests {
             snapshot_version,
             bank_snapshot_package,
             snapshot_storages.as_slice(),
-            should_flush_and_hard_link_storages,
+            should_finalize,
+            &serde_snapshot::StartupHints::new_from_bank(bank),
             &IoSetupState::default(),
         )?;
 
@@ -957,13 +961,27 @@ mod tests {
 
     /// Test roundtrip of bank to a full snapshot, then back again.  This test creates the simplest
     /// bank possible, so the contents of the snapshot archive will be quite minimal.
-    #[test]
-    fn test_roundtrip_bank_to_and_from_full_snapshot_simple() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_roundtrip_bank_to_and_from_full_snapshot_simple(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
         let genesis_config = GenesisConfig::default();
-        let original_bank = Bank::new_for_tests(&genesis_config);
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let original_bank = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        );
 
         original_bank.fill_bank_with_ticks_for_tests();
-        original_bank.set_block_id(Some(Hash::default()));
+        original_bank.set_block_id(Some(BlockId::default()));
 
         let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
@@ -989,9 +1007,7 @@ mod tests {
             Some(*original_bank.leader()), // genesis doesn't have a staked node
             None,
             false,
-            false,
-            false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -1001,8 +1017,11 @@ mod tests {
 
     /// This tests handling of obsolete accounts during a full snapshot with obsolete accounts
     /// marked in the accounts database. This test injects them directly
-    #[test]
-    fn test_roundtrip_bank_to_and_from_full_snapshot_with_obsolete_account() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_roundtrip_bank_to_and_from_full_snapshot_with_obsolete_account(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
         let key3 = Keypair::new();
@@ -1017,10 +1036,21 @@ mod tests {
             &Pubkey::new_unique(),
             1_000_000 * LAMPORTS_PER_SOL,
         );
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
 
-        let bank = Bank::new_for_tests(&genesis_config);
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
 
-        let (bank0, bank_forks) = Bank::wrap_with_bank_forks_for_tests(bank);
         let leader = *bank0.leader();
         bank0
             .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key1.pubkey())
@@ -1045,7 +1075,7 @@ mod tests {
             .unwrap();
 
         bank1.fill_bank_with_ticks_for_tests();
-        bank1.set_block_id(Some(Hash::default()));
+        bank1.set_block_id(Some(BlockId::default()));
 
         let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
@@ -1070,9 +1100,7 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            false,
-            false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -1083,8 +1111,11 @@ mod tests {
     /// Test roundtrip of bank to a full snapshot, then back again.  This test is more involved
     /// than the simple version above; creating multiple banks over multiple slots and doing
     /// multiple transfers.  So this full snapshot should contain more data.
-    #[test]
-    fn test_roundtrip_bank_to_and_from_snapshot_complex() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_roundtrip_bank_to_and_from_snapshot_complex(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
         let key3 = Keypair::new();
@@ -1100,7 +1131,19 @@ mod tests {
             &Pubkey::new_unique(),
             1_000_000 * LAMPORTS_PER_SOL,
         );
-        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
         let leader = *bank0.leader();
         bank0
             .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key1.pubkey())
@@ -1146,7 +1189,7 @@ mod tests {
             .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key1.pubkey())
             .unwrap();
         bank4.fill_bank_with_ticks_for_tests();
-        bank4.set_block_id(Some(Hash::default()));
+        bank4.set_block_id(Some(BlockId::default()));
 
         let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
@@ -1172,8 +1215,6 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            false,
-            false,
             ACCOUNTS_DB_CONFIG_FOR_TESTING,
             None,
             Arc::default(),
@@ -1191,8 +1232,11 @@ mod tests {
     /// This is intended to mimic the real behavior of transactions, where only a small number of
     /// accounts are modified often, which are captured by the incremental snapshot.  The majority
     /// of the accounts are not modified often, and are captured by the full snapshot.
-    #[test]
-    fn test_roundtrip_bank_to_and_from_incremental_snapshot() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_roundtrip_bank_to_and_from_incremental_snapshot(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
         let key3 = Keypair::new();
@@ -1208,7 +1252,19 @@ mod tests {
             &Pubkey::new_unique(),
             1_000_000 * LAMPORTS_PER_SOL,
         );
-        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
         let leader = *bank0.leader();
         bank0
             .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key1.pubkey())
@@ -1233,7 +1289,7 @@ mod tests {
             .transfer(5 * LAMPORTS_PER_SOL, &mint_keypair, &key5.pubkey())
             .unwrap();
         bank1.fill_bank_with_ticks_for_tests();
-        bank1.set_block_id(Some(Hash::default()));
+        bank1.set_block_id(Some(BlockId::default()));
 
         let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
@@ -1269,7 +1325,7 @@ mod tests {
             .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key1.pubkey())
             .unwrap();
         bank4.fill_bank_with_ticks_for_tests();
-        bank4.set_block_id(Some(Hash::default()));
+        bank4.set_block_id(Some(BlockId::default()));
 
         let incremental_snapshot_archive_info =
             bank_to_incremental_snapshot_archive(&snapshot_config, &bank4, full_snapshot_slot)
@@ -1286,9 +1342,7 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            false,
-            false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -1297,8 +1351,9 @@ mod tests {
     }
 
     /// Test rebuilding bank from the latest snapshot archives
-    #[test]
-    fn test_bank_from_latest_snapshot_archives() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_bank_from_latest_snapshot_archives(accounts_file_provider: AccountsFileProvider) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
         let key3 = Keypair::new();
@@ -1312,7 +1367,19 @@ mod tests {
             &Pubkey::new_unique(),
             1_000_000 * LAMPORTS_PER_SOL,
         );
-        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
         let leader = *bank0.leader();
         bank0
             .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key1.pubkey())
@@ -1337,7 +1404,7 @@ mod tests {
             .transfer(3 * LAMPORTS_PER_SOL, &mint_keypair, &key3.pubkey())
             .unwrap();
         bank1.fill_bank_with_ticks_for_tests();
-        bank1.set_block_id(Some(Hash::default()));
+        bank1.set_block_id(Some(BlockId::default()));
 
         let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
@@ -1372,7 +1439,7 @@ mod tests {
             .transfer(3 * LAMPORTS_PER_SOL, &mint_keypair, &key3.pubkey())
             .unwrap();
         bank4.fill_bank_with_ticks_for_tests();
-        bank4.set_block_id(Some(Hash::default()));
+        bank4.set_block_id(Some(BlockId::default()));
 
         bank_to_incremental_snapshot_archive(&snapshot_config, &bank4, full_snapshot_slot).unwrap();
 
@@ -1384,9 +1451,7 @@ mod tests {
             None,
             None,
             false,
-            false,
-            false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -1400,7 +1465,7 @@ mod tests {
         let genesis_config = GenesisConfig::default();
         let bank = Bank::new_for_tests(&genesis_config);
         bank.fill_bank_with_ticks_for_tests();
-        bank.set_block_id(Some(Hash::default()));
+        bank.set_block_id(Some(BlockId::default()));
 
         // freeze the bank before mucking with capitalization, since
         // freezing also changes capitalization (fees, incinerator, etc).
@@ -1428,8 +1493,6 @@ mod tests {
             Some(*bank.leader()),
             None,
             false,
-            false,
-            false,
             ACCOUNTS_DB_CONFIG_FOR_TESTING,
             None,
             Arc::default(),
@@ -1447,30 +1510,32 @@ mod tests {
         }
     }
 
-    /// Test that cleaning works well in the edge cases of zero-lamport accounts and snapshots.
+    /// Test that the full tombstone path works end to end across snapshots.
     /// Here's the scenario:
     ///
     /// slot 1:
-    ///     - send some lamports to Account1 (from Account2) to bring it to life
-    ///     - take a full snapshot
+    ///     - fund Account1 (from Account2) to bring it to life
+    ///     - take a full snapshot, capturing Account1 with a non-zero balance
     /// slot 2:
-    ///     - make Account1 have zero lamports (send back to Account2)
-    ///     - take an incremental snapshot
-    ///     - ensure deserializing from this snapshot is equal to this bank
+    ///     - drain Account1 back to zero lamports (send to Account2)
+    ///     - root and flush so slot 2's storage (holding the zero-lamport Account1) is written
     /// slot 3:
-    ///     - remove Account2's reference back to slot 2 by transferring from the mint to Account2
-    /// slot 4:
-    ///     - ensure `clean_accounts()` has run and that Account1 is gone
-    ///     - take another incremental snapshot
-    ///     - ensure deserializing from this snapshots is equal to this bank
+    ///     - update Account2 again so its slot-2 version dies, giving slot 2 dead bytes
+    ///     - root, flush, and clean so the slot-1 (funded) version of Account1 is removed, leaving
+    ///       the zero-lamport account at slot 2 as the lone reference
+    ///     - shrink slot 2 into a tombstone: Account1 is removed from the index, its bytes retained
+    ///     - take an incremental snapshot, which must carry the tombstone
+    ///     - ensure deserializing from full + incremental is equal to this bank
     ///     - ensure Account1 hasn't come back from the dead
     ///
-    /// The check at slot 4 will fail with the pre-incremental-snapshot cleaning logic.  Because
-    /// of the cleaning/purging at slot 4, the incremental snapshot at slot 4 will no longer have
-    /// information about Account1, but the full snapshost _does_ have info for Account1, which is
-    /// no longer correct!
-    #[test]
-    fn test_incremental_snapshots_handle_zero_lamport_accounts() {
+    /// The full snapshot is older than slot 2, so shrink must NOT purge the zero-lamport account; it
+    /// has to retain the bytes as a tombstone. The incremental snapshot then carries that tombstone
+    /// so that rebuilding from full + incremental overrides the still-funded full-snapshot version
+    /// and the account ends up deleted. If the tombstone were dropped during shrink, the rebuild
+    /// would resurrect Account1 from the full snapshot and the checks below would fail.
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_incremental_snapshots_handle_tombstones(accounts_file_provider: AccountsFileProvider) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
 
@@ -1496,10 +1561,184 @@ mod tests {
         // test expects 0 transaction fee
         genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
 
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+
         let lamports_to_transfer = 123_456 * LAMPORTS_PER_SOL;
-        let (bank0, bank_forks) =
-            Bank::new_with_paths_for_tests(&genesis_config, None, vec![accounts_dir.clone()], None)
-                .wrap_with_bank_forks_for_tests();
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![accounts_dir.clone()],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
+        let leader = *bank0.leader();
+        bank0
+            .transfer(lamports_to_transfer, &mint_keypair, &key2.pubkey())
+            .unwrap();
+        bank0.fill_bank_with_ticks_for_tests();
+
+        let full_snapshot_slot = 1;
+        let bank1 = Bank::new_from_parent_with_bank_forks(
+            bank_forks.as_ref(),
+            bank0,
+            leader,
+            full_snapshot_slot,
+        );
+        bank1
+            .transfer(lamports_to_transfer, &key2, &key1.pubkey())
+            .unwrap();
+        bank1.fill_bank_with_ticks_for_tests();
+        bank1.set_block_id(Some(BlockId::default()));
+        let full_snapshot_archive_info =
+            bank_to_full_snapshot_archive(&snapshot_config, &bank1).unwrap();
+
+        let zeroed_slot = full_snapshot_slot + 1;
+        let bank2 =
+            Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank1, leader, zeroed_slot);
+        bank2
+            .transfer(lamports_to_transfer, &key1, &key2.pubkey())
+            .unwrap();
+        assert_eq!(
+            bank2.get_balance(&key1.pubkey()),
+            0,
+            "Ensure Account1's balance is zero"
+        );
+        bank2.fill_bank_with_ticks_for_tests();
+        bank2.set_block_id(Some(BlockId::default()));
+        // root and flush so slot 2's storage holding the zero-lamport Account1 is written
+        bank2.squash();
+        bank2.force_flush_accounts_cache();
+
+        let slot = zeroed_slot + 1;
+        let bank3 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank2, leader, slot);
+        bank3
+            .transfer(lamports_to_transfer, &mint_keypair, &key2.pubkey())
+            .unwrap();
+        bank3.fill_bank_with_ticks_for_tests();
+        bank3.set_block_id(Some(BlockId::default()));
+
+        // flush and clean so slot 1's funded Account1 is removed, leaving the zero-lamport account
+        // at slot 2 as the lone reference
+        bank3.squash();
+        bank3.force_flush_accounts_cache();
+        bank3.clean_accounts();
+
+        let accounts_db = &bank3.rc.accounts.accounts_db;
+        // full snapshot is older than slot 2, so shrink keeps the tombstone instead of purging
+        accounts_db.set_latest_full_snapshot_slot(full_snapshot_slot);
+        assert!(
+            !accounts_db
+                .get_storages(zeroed_slot..zeroed_slot + 1)
+                .0
+                .is_empty(),
+            "Ensure the zeroed slot's storage is retained so the tombstone survives for the \
+             incremental snapshot"
+        );
+
+        let incremental_snapshot_archive_info =
+            bank_to_incremental_snapshot_archive(&snapshot_config, &bank3, full_snapshot_slot)
+                .unwrap();
+
+        let deserialized_bank = bank_from_snapshot_archives(
+            slice::from_ref(&accounts_dir),
+            &full_snapshot_archive_info,
+            Some(&incremental_snapshot_archive_info),
+            &snapshot_config,
+            &genesis_config,
+            &RuntimeConfig::default(),
+            None,
+            None, // leader_for_tests
+            None,
+            false,
+            accounts_db_config,
+            None,
+            Arc::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            deserialized_bank, *bank3,
+            "Ensure rebuilding from full + incremental (with the tombstone) matches the live bank"
+        );
+        assert!(
+            deserialized_bank
+                .get_account_modified_slot(&key1.pubkey())
+                .is_none(),
+            "Ensure Account1 has not been brought back from the dead"
+        );
+    }
+
+    /// Test that cleaning works well in the edge cases of zero-lamport accounts and snapshots.
+    /// Here's the scenario:
+    ///
+    /// slot 1:
+    ///     - send some lamports to Account1 (from Account2) to bring it to life
+    ///     - take a full snapshot
+    /// slot 2:
+    ///     - make Account1 have zero lamports (send back to Account2)
+    ///     - take an incremental snapshot
+    ///     - ensure deserializing from this snapshot is equal to this bank
+    /// slot 3:
+    ///     - remove Account2's reference back to slot 2 by transferring from the mint to Account2
+    /// slot 4:
+    ///     - ensure `clean_accounts()` has run and that Account1 is gone
+    ///     - take another incremental snapshot
+    ///     - ensure deserializing from this snapshots is equal to this bank
+    ///     - ensure Account1 hasn't come back from the dead
+    ///
+    /// The check at slot 4 will fail with the pre-incremental-snapshot cleaning logic.  Because
+    /// of the cleaning/purging at slot 4, the incremental snapshot at slot 4 will no longer have
+    /// information about Account1, but the full snapshost _does_ have info for Account1, which is
+    /// no longer correct!
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_incremental_snapshots_handle_zero_lamport_accounts(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
+        let key1 = Keypair::new();
+        let key2 = Keypair::new();
+
+        let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
+        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
+        let full_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
+        let incremental_snapshot_archives_dir = tempfile::TempDir::new().unwrap();
+        let snapshot_config = snapshot_config_for_tests(
+            &bank_snapshots_dir,
+            &full_snapshot_archives_dir,
+            &incremental_snapshot_archives_dir,
+        );
+
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair,
+            ..
+        } = create_genesis_config_with_leader(
+            1_000_000 * LAMPORTS_PER_SOL,
+            &Pubkey::new_unique(),
+            1_000_000 * LAMPORTS_PER_SOL,
+        );
+        // test expects 0 transaction fee
+        genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
+
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+
+        let lamports_to_transfer = 123_456 * LAMPORTS_PER_SOL;
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![accounts_dir.clone()],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
         let leader = *bank0.leader();
         bank0
             .transfer(lamports_to_transfer, &mint_keypair, &key2.pubkey())
@@ -1512,7 +1751,7 @@ mod tests {
             .transfer(lamports_to_transfer, &key2, &key1.pubkey())
             .unwrap();
         bank1.fill_bank_with_ticks_for_tests();
-        bank1.set_block_id(Some(Hash::default()));
+        bank1.set_block_id(Some(BlockId::default()));
 
         let full_snapshot_slot = slot;
         let full_snapshot_archive_info =
@@ -1541,7 +1780,7 @@ mod tests {
             "Ensure Account1's balance is zero"
         );
         bank2.fill_bank_with_ticks_for_tests();
-        bank2.set_block_id(Some(Hash::default()));
+        bank2.set_block_id(Some(BlockId::default()));
 
         // Take an incremental snapshot and then do a roundtrip on the bank and ensure it
         // deserializes correctly.
@@ -1559,9 +1798,7 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            false,
-            false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config.clone(),
             None,
             Arc::default(),
         )
@@ -1590,7 +1827,7 @@ mod tests {
             bank4.get_account_modified_slot(&key1.pubkey()).is_none(),
             "Ensure Account1 has been cleaned and purged from AccountsDb"
         );
-        bank4.set_block_id(Some(Hash::default()));
+        bank4.set_block_id(Some(BlockId::default()));
 
         // Take an incremental snapshot and then do a roundtrip on the bank and ensure it
         // deserializes correctly
@@ -1609,9 +1846,7 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            false,
-            false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -1648,7 +1883,7 @@ mod tests {
         let slot = 1;
         let bank1 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank0, leader, slot);
         bank1.fill_bank_with_ticks_for_tests();
-        bank1.set_block_id(Some(Hash::default()));
+        bank1.set_block_id(Some(BlockId::default()));
 
         let all_snapshots_dir = tempfile::TempDir::new().unwrap();
 
@@ -1663,7 +1898,7 @@ mod tests {
             .transfer(LAMPORTS_PER_SOL, &mint_keypair, &key1.pubkey())
             .unwrap();
         bank2.fill_bank_with_ticks_for_tests();
-        bank2.set_block_id(Some(Hash::default()));
+        bank2.set_block_id(Some(BlockId::default()));
 
         bank_to_incremental_snapshot_archive(&snapshot_config, &bank2, full_snapshot_slot).unwrap();
 
@@ -1673,10 +1908,10 @@ mod tests {
     }
 
     #[test]
-    fn test_bank_snapshot_dir_accounts_hardlinks() {
+    fn test_bank_snapshot_dir_storages_list() {
         let bank = Bank::new_for_tests(&GenesisConfig::default());
         bank.fill_bank_with_ticks_for_tests();
-        bank.set_block_id(Some(Hash::default()));
+        bank.set_block_id(Some(BlockId::default()));
 
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         create_bank_snapshot_from_bank(
@@ -1687,25 +1922,59 @@ mod tests {
         )
         .unwrap();
 
-        let accounts_hardlinks_dir = get_bank_snapshot_dir(&bank_snapshots_dir, bank.slot())
-            .join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-        assert!(fs::metadata(&accounts_hardlinks_dir).is_ok());
+        let bank_snapshot_dir = get_bank_snapshot_dir(&bank_snapshots_dir, bank.slot());
+        let storages_list_file =
+            bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_STORAGES_LIST_FILENAME);
+        assert!(fs::metadata(&storages_list_file).is_ok());
 
-        let mut hardlink_dirs = Vec::new();
-        // This directory contain symlinks to all accounts snapshot directories.
-        for entry in fs::read_dir(accounts_hardlinks_dir).unwrap() {
-            let entry = entry.unwrap();
-            let symlink = entry.path();
-            let dst_path = fs::read_link(symlink).unwrap();
-            assert!(fs::metadata(&dst_path).is_ok());
-            hardlink_dirs.push(dst_path);
-        }
+        assert!(purge_bank_snapshot(&bank_snapshot_dir).is_ok());
+        assert!(fs::metadata(&bank_snapshot_dir).is_err());
+    }
+
+    #[test]
+    fn test_bank_snapshot_dir_startup_hints() {
+        let bank = Bank::new_for_tests(&GenesisConfig::default());
+        bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(BlockId::default()));
+
+        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
+        create_bank_snapshot_from_bank(
+            &bank_snapshots_dir,
+            &bank,
+            SnapshotVersion::default(),
+            true,
+        )
+        .unwrap();
 
         let bank_snapshot_dir = get_bank_snapshot_dir(&bank_snapshots_dir, bank.slot());
-        assert!(purge_bank_snapshot(bank_snapshot_dir).is_ok());
+        let startup_hints = snapshot_utils::read_startup_hints(&bank_snapshot_dir)
+            .unwrap()
+            .unwrap();
+        let num_accounts = bank.rc.accounts.accounts_db.accounts_index.num_accounts() as u64;
+        assert_ne!(num_accounts, 0);
+        assert_eq!(startup_hints.num_accounts(), Some(num_accounts));
 
-        // When the bank snapshot is removed, all the snapshot hardlink directories should be removed.
-        assert!(hardlink_dirs.iter().all(|dir| fs::metadata(dir).is_err()));
+        // A truncated file is corrupt local state, not a missing hint
+        let startup_hints_path =
+            bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_STARTUP_HINTS_FILENAME);
+        fs::write(&startup_hints_path, [0u8; 3]).unwrap();
+        assert!(snapshot_utils::read_startup_hints(&bank_snapshot_dir).is_err());
+
+        // An oversized file is rejected before being read
+        fs::write(
+            &startup_hints_path,
+            vec![0u8; snapshot_utils::MAX_STARTUP_HINTS_FILE_SIZE as usize + 1],
+        )
+        .unwrap();
+        assert!(snapshot_utils::read_startup_hints(&bank_snapshot_dir).is_err());
+
+        // Snapshots predating the hints file still load
+        fs::remove_file(&startup_hints_path).unwrap();
+        assert!(
+            snapshot_utils::read_startup_hints(&bank_snapshot_dir)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Test versioning when fastbooting
@@ -1765,14 +2034,14 @@ mod tests {
 
     #[test_case(false)]
     #[test_case(true)]
-    fn test_get_highest_bank_snapshot(should_flush_and_hard_link_storages: bool) {
+    fn test_get_highest_bank_snapshot(should_finalize: bool) {
         let genesis_config = GenesisConfig::default();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         let _bank = create_snapshot_dirs_for_tests(
             &genesis_config,
             &bank_snapshots_dir,
             4,
-            should_flush_and_hard_link_storages,
+            should_finalize,
         );
 
         let snapshot = get_highest_bank_snapshot(&bank_snapshots_dir).unwrap();
@@ -1803,83 +2072,16 @@ mod tests {
         assert_eq!(snapshot.slot, 1);
     }
 
-    #[test]
-    fn test_clean_orphaned_account_snapshot_dirs() {
-        let genesis_config = GenesisConfig::default();
-        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
-        let _bank = create_snapshot_dirs_for_tests(&genesis_config, &bank_snapshots_dir, 2, true);
-
-        let snapshot_dir_slot_2 = bank_snapshots_dir.path().join("2");
-        let accounts_link_dir_slot_2 =
-            snapshot_dir_slot_2.join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-
-        // the symlinks point to the account snapshot hardlink directories <account_path>/snapshot/<slot>/ for slot 2
-        // get them via read_link
-        let hardlink_dirs_slot_2: Vec<PathBuf> = fs::read_dir(accounts_link_dir_slot_2)
-            .unwrap()
-            .map(|entry| {
-                let symlink = entry.unwrap().path();
-                fs::read_link(symlink).unwrap()
-            })
-            .collect();
-
-        // remove the bank snapshot directory for slot 2, so the account snapshot slot 2 directories become orphaned
-        fs::remove_dir_all(snapshot_dir_slot_2).unwrap();
-
-        // verify the orphaned account snapshot hardlink directories are still there
-        assert!(
-            hardlink_dirs_slot_2
-                .iter()
-                .all(|dir| fs::metadata(dir).is_ok())
-        );
-
-        let account_snapshot_paths: Vec<PathBuf> = hardlink_dirs_slot_2
-            .iter()
-            .map(|dir| dir.parent().unwrap().parent().unwrap().to_path_buf())
-            .collect();
-        // clean the orphaned hardlink directories
-        clean_orphaned_account_snapshot_dirs(&bank_snapshots_dir, &account_snapshot_paths).unwrap();
-
-        // verify the hardlink directories are gone
-        assert!(
-            hardlink_dirs_slot_2
-                .iter()
-                .all(|dir| fs::metadata(dir).is_err())
-        );
-    }
-
-    // Ensure that `clean_orphaned_account_snapshot_dirs()` works correctly for bank snapshots
-    // that *do not* hard link the storages into their staging dir.
-    #[test]
-    fn test_clean_orphaned_account_snapshot_dirs_no_hard_link() {
-        let genesis_config = GenesisConfig::default();
-        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
-        let _bank = create_snapshot_dirs_for_tests(&genesis_config, &bank_snapshots_dir, 2, false);
-
-        // Ensure the bank snapshot dir does exist.
-        let bank_snapshot_dir = get_bank_snapshot_dir(&bank_snapshots_dir, 2);
-        assert!(fs::exists(&bank_snapshot_dir).unwrap());
-
-        // Ensure the accounts hard links dir does *not* exist for this bank snapshot
-        // (since we asked create_snapshot_dirs_for_tests() to *not* hard link).
-        let bank_snapshot_accounts_hard_link_dir =
-            bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-        assert!(!fs::exists(&bank_snapshot_accounts_hard_link_dir).unwrap());
-
-        // Now make sure clean_orphaned_account_snapshot_dirs() doesn't error.
-        clean_orphaned_account_snapshot_dirs(&bank_snapshots_dir, &[]).unwrap();
-    }
-
     #[test_case(false)]
     #[test_case(true)]
-    fn test_purge_incomplete_bank_snapshots(should_flush_and_hard_link_storages: bool) {
+    fn test_purge_incomplete_bank_snapshots(should_finalize: bool) {
         let genesis_config = GenesisConfig::default();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         let _bank = create_snapshot_dirs_for_tests(
             &genesis_config,
             &bank_snapshots_dir,
             2,
-            should_flush_and_hard_link_storages,
+            should_finalize,
         );
 
         // remove the "version" files so the snapshots will be purged
@@ -1910,8 +2112,9 @@ mod tests {
     ///     - remove Account2's reference back to slot 2 by transferring from the mint to Account2
     ///     - take a full snap shot
     ///     - verify that recovery from full snapshot does not bring account1 back to life
-    #[test]
-    fn test_snapshots_handle_zero_lamport_accounts() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_snapshots_handle_zero_lamport_accounts(accounts_file_provider: AccountsFileProvider) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
         let key3 = Keypair::new();
@@ -1928,15 +2131,20 @@ mod tests {
             1_000_000 * LAMPORTS_PER_SOL,
         );
 
-        let lamports_to_transfer = 123_456 * LAMPORTS_PER_SOL;
-        let bank_test_config = BankTestConfig {
-            accounts_db_config: ACCOUNTS_DB_CONFIG_FOR_TESTING,
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
         };
 
-        let bank0 =
-            Bank::new_with_paths_for_tests(&genesis_config, Some(bank_test_config), vec![], None);
+        let lamports_to_transfer = 123_456 * LAMPORTS_PER_SOL;
+        let bank_test_config = BankTestConfig {
+            accounts_db_config: accounts_db_config.clone(),
+        };
 
-        let (bank0, bank_forks) = Bank::wrap_with_bank_forks_for_tests(bank0);
+        let (bank0, bank_forks) =
+            Bank::new_with_paths_for_tests(&genesis_config, Some(bank_test_config), vec![], None)
+                .wrap_with_bank_forks_for_tests();
+
         let leader = *bank0.leader();
 
         bank0
@@ -1989,7 +2197,7 @@ mod tests {
             .transfer(lamports_to_transfer, &mint_keypair, &key2.pubkey())
             .unwrap();
         bank3.fill_bank_with_ticks_for_tests();
-        bank3.set_block_id(Some(Hash::default()));
+        bank3.set_block_id(Some(BlockId::default()));
 
         assert!(
             bank3.get_account_modified_slot(&key1.pubkey()).is_none(),
@@ -2018,9 +2226,7 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            false,
-            false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -2050,8 +2256,9 @@ mod tests {
     ///
     /// If zero lamport accounts are not handled correctly, Account1 or Account2 will come back
     /// failing the test
-    #[test]
-    fn test_fastboot_handle_zero_lamport_accounts() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_fastboot_handle_zero_lamport_accounts(accounts_file_provider: AccountsFileProvider) {
         let key1 = Keypair::new();
         let key2 = Keypair::new();
 
@@ -2068,11 +2275,22 @@ mod tests {
 
         // Disable fees so fees don't need to be calculated
         genesis_config.fee_rate_governor = solana_fee_calculator::FeeRateGovernor::new(0, 0);
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
 
         let lamports = 123_456 * LAMPORTS_PER_SOL;
 
-        let bank0 = Bank::new_for_tests(&genesis_config);
-        let (bank0, bank_forks) = Bank::wrap_with_bank_forks_for_tests(bank0);
+        let (bank0, bank_forks) = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        )
+        .wrap_with_bank_forks_for_tests();
         let leader = *bank0.leader();
         bank0.transfer(lamports, &mint, &key2.pubkey()).unwrap();
         bank0.transfer(lamports, &mint, &key1.pubkey()).unwrap();
@@ -2094,10 +2312,10 @@ mod tests {
         let bank2 = Bank::new_from_parent_with_bank_forks(bank_forks.as_ref(), bank1, leader, slot);
         bank2.transfer(lamports * 2, &key2, &mint.pubkey()).unwrap();
         bank2.fill_bank_with_ticks_for_tests();
-        bank2.set_block_id(Some(Hash::default()));
+        bank2.set_block_id(Some(BlockId::default()));
         assert_eq!(bank2.get_balance(&key2.pubkey()), 0);
 
-        // Take a bank snapshot, passing `true` for `should_flush_and_hard_link_storages`.
+        // Take a bank snapshot, passing `true` for `should_finalize`.
         // This ensures that `serialize_snapshot` performs all necessary steps to create
         // a snapshot that supports fastbooting.
         create_bank_snapshot_from_bank(
@@ -2120,7 +2338,7 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -2168,19 +2386,31 @@ mod tests {
         .unwrap();
     }
 
-    #[test]
-    fn test_bank_from_snapshot_dir_good() {
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_bank_from_snapshot_dir_good(accounts_file_provider: AccountsFileProvider) {
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config_with_leader(
             1_000_000 * LAMPORTS_PER_SOL,
             &Pubkey::new_unique(),
             1_000_000 * LAMPORTS_PER_SOL,
         );
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
-        let bank = Bank::new_for_tests(&genesis_config);
+        let bank = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        );
         bank.fill_bank_with_ticks_for_tests();
-        bank.set_block_id(Some(Hash::default()));
+        bank.set_block_id(Some(BlockId::default()));
 
-        // Take a bank snapshot, passing `true` for `should_flush_and_hard_link_storages`.
+        // Take a bank snapshot, passing `true` for `should_finalize`.
         // This ensures that `serialize_snapshot` performs all necessary steps to create
         // a snapshot that supports fastbooting.
         create_bank_snapshot_from_bank(
@@ -2203,7 +2433,7 @@ mod tests {
             None, // leader_for_tests
             None,
             false,
-            ACCOUNTS_DB_CONFIG_FOR_TESTING,
+            accounts_db_config,
             None,
             Arc::default(),
         )
@@ -2216,13 +2446,114 @@ mod tests {
             fs::read_dir(path).unwrap().for_each(|entry| {
                 let path = entry.unwrap().path();
                 let filename = path.file_name().unwrap();
-                let (_slot, append_vec_id) =
-                    get_slot_and_append_vec_id(filename.to_str().unwrap()).unwrap();
-                max_id = std::cmp::max(max_id, append_vec_id);
+                let parsed_filename = parse_storage_filename(filename.to_str().unwrap()).unwrap();
+                max_id = std::cmp::max(max_id, parsed_filename.id);
             });
         }
-        let next_id = bank.accounts().accounts_db.next_id.load(Ordering::Relaxed) as usize;
+        let next_id = bank.accounts().accounts_db.next_id.load(Ordering::Relaxed);
         assert_eq!(max_id, next_id - 1);
+    }
+
+    /// Drop a stale `<slot>.<id>` file into the account_paths run dir before calling
+    /// `bank_from_snapshot_dir`, and verify that the fastboot rebuild path removes it (because
+    /// the `(slot, id)` pair isn't in the storages list) while keeping the snapshot's own
+    /// storage files in place and producing a working bank.
+    #[test_case(AccountsFileProvider::AppendVec)]
+    #[test_case(AccountsFileProvider::Split)]
+    fn test_bank_from_snapshot_dir_prunes_stale_storage(
+        accounts_file_provider: AccountsFileProvider,
+    ) {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config_with_leader(
+            1_000_000 * LAMPORTS_PER_SOL,
+            &Pubkey::new_unique(),
+            1_000_000 * LAMPORTS_PER_SOL,
+        );
+        let accounts_db_config = AccountsDbConfig {
+            accounts_file_provider,
+            ..ACCOUNTS_DB_CONFIG_FOR_TESTING
+        };
+        let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
+        let bank = Bank::new_with_paths_for_tests(
+            &genesis_config,
+            Some(BankTestConfig {
+                accounts_db_config: accounts_db_config.clone(),
+            }),
+            vec![],
+            None,
+        );
+        bank.fill_bank_with_ticks_for_tests();
+        bank.set_block_id(Some(BlockId::default()));
+
+        create_bank_snapshot_from_bank(
+            &bank_snapshots_dir,
+            &bank,
+            SnapshotVersion::default(),
+            true,
+        )
+        .unwrap();
+        let bank_snapshot = get_highest_bank_snapshot(&bank_snapshots_dir).unwrap();
+        let account_paths = &bank.rc.accounts.accounts_db.paths;
+
+        // Collect the legit paths (created by `create_bank_snapshot_from_bank` above) before
+        // we drop any stale files, so we can assert they survive the prune.
+        let pre_load_legit_files: Vec<_> = account_paths
+            .iter()
+            .flat_map(|account_path| {
+                fs::read_dir(account_path)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+            })
+            .collect();
+        assert!(
+            !pre_load_legit_files.is_empty(),
+            "expected at least one accounts storage file"
+        );
+
+        // Pick a `(slot, id)` that the snapshot doesn't reference. The snapshot only covers
+        // storages up to `bank.slot()`, so a far-future slot is guaranteed to be stale.
+        let stale_slot = bank.slot() + 1_000;
+        let stale_id = AccountsFileId::MAX;
+        let stale_files: Vec<_> = account_paths
+            .iter()
+            .flat_map(|account_path| {
+                ["", ".meta", ".data"].map(|suffix| {
+                    let stale = account_path.join(format!("{stale_slot}.{stale_id}{suffix}"));
+                    fs::write(&stale, b"junk").unwrap();
+                    stale
+                })
+            })
+            .collect();
+
+        let bank_constructed = bank_from_snapshot_dir(
+            account_paths,
+            &bank_snapshot,
+            &genesis_config,
+            &RuntimeConfig::default(),
+            None,
+            None,
+            None,
+            false,
+            accounts_db_config,
+            None,
+            Arc::default(),
+        )
+        .unwrap();
+        assert_eq!(bank_constructed, bank);
+
+        for stale in stale_files {
+            assert!(
+                !stale.exists(),
+                "stale storage file '{}' should have been pruned",
+                stale.display(),
+            );
+        }
+        for legit in pre_load_legit_files {
+            assert!(
+                legit.exists(),
+                "snapshot storage file '{}' should have survived the prune",
+                legit.display(),
+            );
+        }
     }
 
     /// Ensure bank_from_snapshot_dir() catches a snapshot with incorrect capitalization.
@@ -2232,7 +2563,7 @@ mod tests {
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         let bank = Bank::new_for_tests(&genesis_config);
         bank.fill_bank_with_ticks_for_tests();
-        bank.set_block_id(Some(Hash::default()));
+        bank.set_block_id(Some(BlockId::default()));
 
         // freeze the bank before mucking with capitalization, since
         // freezing also changes capitalization (fees, incinerator, etc).
@@ -2280,14 +2611,14 @@ mod tests {
 
     #[test_case(false)]
     #[test_case(true)]
-    fn test_purge_all_bank_snapshots(should_flush_and_hard_link_storages: bool) {
+    fn test_purge_all_bank_snapshots(should_finalize: bool) {
         let genesis_config = GenesisConfig::default();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         let _bank = create_snapshot_dirs_for_tests(
             &genesis_config,
             &bank_snapshots_dir,
             10,
-            should_flush_and_hard_link_storages,
+            should_finalize,
         );
         // Keep bank in this scope so that its account_paths tmp dirs are not released, and purge_all_bank_snapshots
         // can clear the account hardlinks correctly.
@@ -2299,14 +2630,14 @@ mod tests {
 
     #[test_case(false)]
     #[test_case(true)]
-    fn test_purge_old_bank_snapshots(should_flush_and_hard_link_storages: bool) {
+    fn test_purge_old_bank_snapshots(should_finalize: bool) {
         let genesis_config = GenesisConfig::default();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
         let _bank = create_snapshot_dirs_for_tests(
             &genesis_config,
             &bank_snapshots_dir,
             10,
-            should_flush_and_hard_link_storages,
+            should_finalize,
         );
         // Keep bank in this scope so that its account_paths tmp dirs are not released, and purge_old_bank_snapshots
         // can clear the account hardlinks correctly.
@@ -2326,7 +2657,7 @@ mod tests {
 
     #[test_case(false)]
     #[test_case(true)]
-    fn test_purge_bank_snapshots_older_than_slot(should_flush_and_hard_link_storages: bool) {
+    fn test_purge_bank_snapshots_older_than_slot(should_finalize: bool) {
         let genesis_config = GenesisConfig::default();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
 
@@ -2335,7 +2666,7 @@ mod tests {
             &genesis_config,
             &bank_snapshots_dir,
             9,
-            should_flush_and_hard_link_storages,
+            should_finalize,
         );
         let bank_snapshots_before = get_bank_snapshots(&bank_snapshots_dir);
 
@@ -2359,7 +2690,7 @@ mod tests {
 
     #[test_case(false)]
     #[test_case(true)]
-    fn test_purge_old_bank_snapshots_at_startup(should_flush_and_hard_link_storages: bool) {
+    fn test_purge_old_bank_snapshots_at_startup(should_finalize: bool) {
         let genesis_config = GenesisConfig::default();
         let bank_snapshots_dir = tempfile::TempDir::new().unwrap();
 
@@ -2368,7 +2699,7 @@ mod tests {
             &genesis_config,
             &bank_snapshots_dir,
             9,
-            should_flush_and_hard_link_storages,
+            should_finalize,
         );
 
         purge_old_bank_snapshots_at_startup(&bank_snapshots_dir);
@@ -2640,8 +2971,8 @@ mod tests {
             .maximum_full_snapshot_archives_to_retain
             .get();
 
-        // Take some snapshots. Do not flush or hard link storages so that get highest loadable
-        // can be tested when the snapshot has not been marked loadable
+        // Take some snapshots. Do not finalize so that get highest loadable
+        // can be tested when the snapshot has not been marked loadable.
         let _bank = create_snapshot_dirs_for_tests(
             &GenesisConfig::default(),
             &snapshot_config.bank_snapshots_dir,

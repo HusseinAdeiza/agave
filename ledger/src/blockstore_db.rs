@@ -1,4 +1,4 @@
-pub use rocksdb::Direction as IteratorDirection;
+pub use rocksdb::{DBPinnableSlice, Direction as IteratorDirection};
 use {
     crate::{
         blockstore::{
@@ -20,8 +20,8 @@ use {
     prost::Message,
     rocksdb::{
         self, ColumnFamily, ColumnFamilyDescriptor, CompactionDecision, DB, DBCompressionType,
-        DBIterator, DBPinnableSlice, DBRawIterator, IteratorMode as RocksIteratorMode, LiveFile,
-        Options, WriteBatch as RWriteBatch,
+        DBIterator, IteratorMode as RocksIteratorMode, LiveFile, Options,
+        WriteBatch as RWriteBatch,
         compaction_filter::CompactionFilter,
         compaction_filter_factory::{CompactionFilterContext, CompactionFilterFactory},
         properties as RocksProperties,
@@ -38,8 +38,12 @@ use {
             Arc,
             atomic::{AtomicU64, Ordering},
         },
+        thread,
     },
-    wincode::{SchemaReadOwned, deserialize},
+    wincode::{
+        SchemaRead,
+        config::{ConfigCore, DefaultConfig},
+    },
 };
 
 const BLOCKSTORE_METRICS_ERROR: i64 = -1;
@@ -352,6 +356,19 @@ impl Rocks {
         Ok(opt)
     }
 
+    pub(crate) fn new_pinnable_slice(&self) -> DBPinnableSlice<'_> {
+        self.db.new_pinnable_slice()
+    }
+
+    fn get_pinned_cf_into<'db>(
+        &'db self,
+        cf: &ColumnFamily,
+        key: impl AsRef<[u8]>,
+        value: &mut DBPinnableSlice<'db>,
+    ) -> Result<bool> {
+        Ok(self.db.get_pinned_cf_into(cf, key, value)?)
+    }
+
     fn put_cf<K: AsRef<[u8]>>(&self, cf: &ColumnFamily, key: K, value: &[u8]) -> Result<()> {
         self.db.put_cf(cf, key, value)?;
         Ok(())
@@ -396,22 +413,24 @@ impl Rocks {
         self.db.iterator_cf(cf, iterator_mode)
     }
 
-    pub(crate) fn raw_iterator_cf(&self, cf: &ColumnFamily) -> Result<DBRawIterator<'_>> {
+    #[cfg(test)]
+    pub(crate) fn raw_iterator_cf(&self, cf: &ColumnFamily) -> Result<rocksdb::DBRawIterator<'_>> {
         Ok(self.db.raw_iterator_cf(cf))
     }
 
-    pub(crate) fn batch(&self) -> Result<WriteBatch> {
-        Ok(WriteBatch {
+    pub(crate) fn batch(&self) -> WriteBatch {
+        WriteBatch {
             write_batch: RWriteBatch::default(),
-        })
+        }
     }
 
-    pub(crate) fn write(&self, batch: WriteBatch) -> Result<()> {
+    pub(crate) fn write<B: AsMut<WriteBatch>>(&self, mut batch: B) -> Result<()> {
+        let batch = batch.as_mut();
         let op_start_instant = maybe_enable_rocksdb_perf(
             self.column_options.rocks_perf_sample_interval,
             &self.write_batch_perf_status,
         );
-        let result = self.db.write(batch.write_batch);
+        let result = self.db.write(&mut batch.write_batch);
         if let Some(op_start_instant) = op_start_instant {
             report_rocksdb_write_perf(
                 PERF_METRIC_OP_NAME_WRITE_BATCH, // We use write_batch as cf_name for write batch.
@@ -525,6 +544,12 @@ pub struct WriteBatch {
     write_batch: RWriteBatch,
 }
 
+impl AsMut<Self> for WriteBatch {
+    fn as_mut(&mut self) -> &mut Self {
+        self
+    }
+}
+
 pub(crate) struct BlockstoreByteReference<'a> {
     slice: DBPinnableSlice<'a>,
 }
@@ -553,6 +578,10 @@ impl AsRef<[u8]> for BlockstoreByteReference<'_> {
 }
 
 impl WriteBatch {
+    pub(crate) fn clear(&mut self) {
+        self.write_batch.clear();
+    }
+
     fn put_cf<K: AsRef<[u8]>>(&mut self, cf: &ColumnFamily, key: K, value: &[u8]) {
         self.write_batch.put_cf(cf, key, value);
     }
@@ -566,6 +595,55 @@ impl WriteBatch {
     }
 }
 
+/// A pinned deserialized value with the ability to hold references into a [`DBPinnableSlice`].
+///
+/// All references in the deserialized payload will be tied to the lifetime of the [`DBPinnableSlice`].
+///
+/// Use this for zero-copy access to a value stored in the blockstore -- no reason to keep
+/// the [`DBPinnableSlice`] alive for owned values.
+pub struct DBPinnedT<'a, C: ConfigCore, T: SchemaRead<'a, C>> {
+    val: T::Dst,
+    _slice: DBPinnableSlice<'a>,
+    _phantom: PhantomData<C>,
+}
+
+impl<'a, C, T> std::ops::Deref for DBPinnedT<'a, C, T>
+where
+    C: ConfigCore,
+    T: SchemaRead<'a, C>,
+{
+    type Target = T::Dst;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.val
+    }
+}
+
+impl<'de, T, C> DBPinnedT<'de, C, T>
+where
+    C: ConfigCore,
+    T: SchemaRead<'de, C>,
+{
+    fn decode(slice: DBPinnableSlice<'de>) -> Result<Self> {
+        let bytes = slice.as_ref();
+        // SAFETY: `DBPinnableSlice` provides a stable reference into the underlying storage and keeps
+        // the RocksDB value pointer valid until it is dropped.
+        // `DBPinnedT` stores `val` before `_slice`, so `val` is dropped first;
+        // any references decoded into `val` cannot outlive the pinned bytes.
+        let val = T::get(unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) })?;
+        Ok(Self {
+            val,
+            _slice: slice,
+            _phantom: PhantomData,
+        })
+    }
+
+    #[inline]
+    pub fn get(&self) -> &T::Dst {
+        &self.val
+    }
+}
 impl<C> LedgerColumn<C>
 where
     C: Column + ColumnName,
@@ -608,6 +686,41 @@ where
             );
         }
         result
+    }
+
+    pub fn get_slice_into<'db>(
+        &'db self,
+        index: C::Index,
+        value: &mut DBPinnableSlice<'db>,
+    ) -> Result<bool> {
+        let is_perf_enabled = maybe_enable_rocksdb_perf(
+            self.column_options.rocks_perf_sample_interval,
+            &self.read_perf_status,
+        );
+
+        let key = <C as Column>::key(&index);
+        let result = self.backend.get_pinned_cf_into(self.handle(), key, value);
+
+        if let Some(op_start_instant) = is_perf_enabled {
+            report_rocksdb_read_perf(
+                C::NAME,
+                PERF_METRIC_OP_NAME_GET,
+                &op_start_instant.elapsed(),
+                &self.column_options,
+            );
+        }
+        result
+    }
+
+    #[inline]
+    pub fn get_pinned_t<'a, T>(
+        &'a self,
+        index: C::Index,
+    ) -> Result<Option<DBPinnedT<'a, DefaultConfig, T>>>
+    where
+        T: SchemaRead<'a, DefaultConfig>,
+    {
+        self.get_slice(index)?.map(DBPinnedT::decode).transpose()
     }
 
     /// Create a key type suitable for use with multi_get_bytes() and
@@ -828,6 +941,19 @@ where
         self.get_raw(key)
     }
 
+    pub(crate) fn get_with_pinnable_slice<'db>(
+        &'db self,
+        index: C::Index,
+        pinnable_slice: &mut DBPinnableSlice<'db>,
+    ) -> Result<Option<C::Type>> {
+        if !self.get_slice_into(index, pinnable_slice)? {
+            return Ok(None);
+        }
+        let result = C::deserialize(pinnable_slice.as_ref()).map(Some);
+        pinnable_slice.reset();
+        result
+    }
+
     pub fn get_raw<K: AsRef<[u8]>>(&self, key: K) -> Result<Option<C::Type>> {
         let mut result = Ok(None);
         let is_perf_enabled = maybe_enable_rocksdb_perf(
@@ -888,47 +1014,6 @@ impl<C> LedgerColumn<C>
 where
     C: ProtobufColumn + ColumnName,
 {
-    pub fn get_protobuf_or_wincode<
-        T: SchemaReadOwned<wincode::config::DefaultConfig, Dst = T> + Into<C::Type>,
-    >(
-        &self,
-        index: C::Index,
-    ) -> Result<Option<C::Type>> {
-        let key = <C as Column>::key(&index);
-        self.get_raw_protobuf_or_wincode::<T>(key)
-    }
-
-    pub(crate) fn get_raw_protobuf_or_wincode<
-        T: SchemaReadOwned<wincode::config::DefaultConfig, Dst = T> + Into<C::Type>,
-    >(
-        &self,
-        key: impl AsRef<[u8]>,
-    ) -> Result<Option<C::Type>> {
-        let is_perf_enabled = maybe_enable_rocksdb_perf(
-            self.column_options.rocks_perf_sample_interval,
-            &self.read_perf_status,
-        );
-        let result = self.backend.get_pinned_cf(self.handle(), key);
-        if let Some(op_start_instant) = is_perf_enabled {
-            report_rocksdb_read_perf(
-                C::NAME,
-                PERF_METRIC_OP_NAME_GET,
-                &op_start_instant.elapsed(),
-                &self.column_options,
-            );
-        }
-
-        if let Some(pinnable_slice) = result? {
-            let value = match C::Type::decode(pinnable_slice.as_ref()) {
-                Ok(value) => value,
-                Err(_) => deserialize::<T>(pinnable_slice.as_ref())?.into(),
-            };
-            Ok(Some(value))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub fn get_protobuf(&self, index: C::Index) -> Result<Option<C::Type>> {
         let is_perf_enabled = maybe_enable_rocksdb_perf(
             self.column_options.rocks_perf_sample_interval,
@@ -1137,13 +1222,14 @@ fn get_db_options(blockstore_options: &BlockstoreOptions) -> Options {
 /// The default number of threads to use for rocksdb compaction in the rocksdb
 /// low priority threadpool
 pub fn default_num_compaction_threads() -> NonZeroUsize {
-    NonZeroUsize::new(num_cpus::get()).expect("thread count is non-zero")
+    thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
 /// The default number of threads to use for rocksdb memtable flushes in the
 /// rocksdb high priority threadpool
 pub fn default_num_flush_threads() -> NonZeroUsize {
-    NonZeroUsize::new((num_cpus::get() / 4).max(1)).expect("thread count is non-zero")
+    let num_cpus = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    NonZeroUsize::new(num_cpus / 4).unwrap_or(NonZeroUsize::MIN)
 }
 
 // Returns whether automatic compactions should be disabled for the entire

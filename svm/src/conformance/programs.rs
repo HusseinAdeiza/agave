@@ -1,22 +1,23 @@
 //! Program helpers: builtins, keyed accounts, and program cache.
 
 #[cfg(feature = "metrics")]
-use solana_program_runtime::program_metrics::LoadProgramMetrics;
+use solana_program_runtime::program_cache::metrics::LoadProgramMetrics;
 use {
     crate::program_loader::load_program_with_pubkey,
     solana_account::{Account, AccountSharedData},
     solana_compute_budget::compute_budget::ComputeBudget,
-    solana_instruction::error::InstructionError,
     solana_program_runtime::{
         invoke_context::BuiltinFunctionRegisterer,
-        loaded_programs::{ProgramCacheForTxBatch, ProgramRuntimeEnvironment},
-        program_cache_entry::ProgramCacheEntry,
+        program_cache::{
+            entry::ProgramCacheEntry, env::ProgramRuntimeEnvironment,
+            tx_batch::ProgramCacheForTxBatch,
+        },
         solana_sbpf::program::BuiltinFunctionDefinition,
     },
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable},
-    solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
+    solana_svm_callback::AccountLoadCallback,
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_timings::ExecuteTimings,
     solana_syscalls::create_program_runtime_environment,
@@ -55,6 +56,18 @@ static SVM_BUILTINS: &[SvmBuiltinPrototype] = &[
         name: "compute_budget_program",
         register_fn: solana_compute_budget_program::Entrypoint::register,
     },
+    #[cfg(feature = "conformance")]
+    SvmBuiltinPrototype {
+        program_id: solana_vote_program::id(),
+        name: "vote_program",
+        register_fn: solana_vote_program::vote_processor::Entrypoint::register,
+    },
+    #[cfg(feature = "conformance")]
+    SvmBuiltinPrototype {
+        program_id: solana_sdk_ids::zk_elgamal_proof_program::id(),
+        name: "zk_elgamal_proof_program",
+        register_fn: solana_zk_elgamal_proof_program::Entrypoint::register,
+    },
 ];
 
 fn create_keyed_account_for_builtin_program(program_id: &Pubkey, name: &str) -> (Pubkey, Account) {
@@ -70,8 +83,23 @@ fn create_keyed_account_for_builtin_program(program_id: &Pubkey, name: &str) -> 
     (*program_id, account)
 }
 
+pub fn keyed_account_for_builtin_pubkey(program_id: &Pubkey) -> Option<(Pubkey, Account)> {
+    SVM_BUILTINS
+        .iter()
+        .find(|builtin| builtin.program_id == *program_id)
+        .map(|builtin| create_keyed_account_for_builtin_program(&builtin.program_id, builtin.name))
+}
+
 pub fn keyed_account_for_system_program() -> (Pubkey, Account) {
     create_keyed_account_for_builtin_program(&SVM_BUILTINS[0].program_id, SVM_BUILTINS[0].name)
+}
+
+pub fn keyed_account_for_bpf_loader_program() -> (Pubkey, Account) {
+    create_keyed_account_for_builtin_program(&SVM_BUILTINS[2].program_id, SVM_BUILTINS[2].name)
+}
+
+pub fn keyed_account_for_bpf_loader_upgradeable_program() -> (Pubkey, Account) {
+    create_keyed_account_for_builtin_program(&SVM_BUILTINS[3].program_id, SVM_BUILTINS[3].name)
 }
 
 pub fn keyed_account_for_compute_budget_program() -> (Pubkey, Account) {
@@ -85,11 +113,7 @@ pub fn new_program_cache_with_builtins(slot: u64) -> ProgramCacheForTxBatch {
     for builtin in SVM_BUILTINS {
         cache.replenish(
             builtin.program_id,
-            Arc::new(ProgramCacheEntry::new_builtin(
-                0u64,
-                builtin.name.len(),
-                builtin.register_fn,
-            )),
+            Arc::new(ProgramCacheEntry::new_builtin(builtin.register_fn)),
         );
     }
 
@@ -103,8 +127,8 @@ pub fn add_program_to_program_cache(
     loader_key: &Pubkey,
     elf: &[u8],
     feature_set: &SVMFeatureSet,
-    compute_budget: &ComputeBudget,
 ) {
+    let compute_budget = ComputeBudget::new_with_defaults(feature_set.raise_cpi_nesting_limit_to_8);
     let program_runtime_environment = create_program_runtime_environment(
         feature_set,
         &compute_budget.to_budget(),
@@ -113,13 +137,11 @@ pub fn add_program_to_program_cache(
     )
     .unwrap();
 
-    let entry = ProgramCacheEntry::new(
+    let entry = ProgramCacheEntry::load(
         loader_key,
         program_runtime_environment,
         0, // deployment_slot
-        0, // effective_slot
         elf,
-        elf.len(),
         #[cfg(feature = "metrics")]
         &mut LoadProgramMetrics::default(),
     )
@@ -134,13 +156,14 @@ pub fn fill_program_cache_from_accounts(
     program_runtime_environment: &ProgramRuntimeEnvironment,
     accounts: &[(Pubkey, Account)],
     slot: u64,
-) -> Result<(), InstructionError> {
+) {
     let mut newly_loaded_programs = HashSet::<Pubkey>::new();
 
     for acc in accounts {
-        if !newly_loaded_programs.insert(acc.0) {
-            return Err(InstructionError::UnsupportedProgramId);
-        }
+        assert!(
+            newly_loaded_programs.insert(acc.0),
+            "invariant violation: duplicate account load",
+        );
 
         if program_cache.find(&acc.0).is_none() {
             if !solana_sdk_ids::bpf_loader_deprecated::check_id(&acc.1.owner)
@@ -149,7 +172,7 @@ pub fn fill_program_cache_from_accounts(
             {
                 continue;
             }
-            if let Some((loaded_program, _last_modification_slot)) = load_program_with_pubkey(
+            if let Some(loaded_program) = load_program_with_pubkey(
                 &FillFromAccountsCallback(accounts),
                 program_runtime_environment,
                 &acc.0,
@@ -160,19 +183,15 @@ pub fn fill_program_cache_from_accounts(
             }
         }
     }
-
-    Ok(())
 }
 
 struct FillFromAccountsCallback<'a>(&'a [(Pubkey, Account)]);
 
-impl InvokeContextCallback for FillFromAccountsCallback<'_> {}
-
-impl TransactionProcessingCallback for FillFromAccountsCallback<'_> {
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, u64)> {
+impl AccountLoadCallback for FillFromAccountsCallback<'_> {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         self.0
             .iter()
             .find(|(found_pubkey, _)| *found_pubkey == *pubkey)
-            .map(|(_, account)| (AccountSharedData::from(account.clone()), 0u64))
+            .map(|(_, account)| AccountSharedData::from(account.clone()))
     }
 }

@@ -2,10 +2,9 @@
 //! By default, signatures are verified in parallel using all available CPU
 //! cores.
 use {
-    crate::packet::{PacketBatch, PacketFlags, PacketRefMut},
+    crate::packet::{BytesPacket, PacketBatch, PacketFlags},
     agave_transaction_view::{
-        transaction_data::TransactionData, transaction_version::TransactionVersion,
-        transaction_view::SanitizedTransactionView,
+        transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
     },
     rayon::prelude::*,
 };
@@ -16,7 +15,7 @@ pub const VERIFY_PACKET_CHUNK_SIZE: usize = 128;
 /// Returns true if the signature on the packet verifies.
 /// Caller must do packet.set_discard(true) if this returns false.
 #[must_use]
-fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool, enable_tx_v1: bool) -> bool {
+fn verify_packet(packet: &mut BytesPacket, reject_non_vote: bool) -> bool {
     // If this packet was already marked as discard, drop it
     if packet.meta().discard() {
         return false;
@@ -27,30 +26,15 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool, enable_tx_v1:
     };
 
     let (is_simple_vote_tx, verified) = {
-        let Ok(view) = SanitizedTransactionView::try_new_sanitized(data, true) else {
+        let Ok(view) = SanitizedTransactionView::try_new_sanitized(data) else {
             return false;
         };
-
-        if !enable_tx_v1 && matches!(view.version(), TransactionVersion::V1) {
-            return false;
-        }
 
         let is_simple_vote_tx = is_simple_vote_transaction_view(&view);
         if reject_non_vote && !is_simple_vote_tx {
             (is_simple_vote_tx, false)
         } else {
-            let signatures = view.signatures();
-            if signatures.is_empty() {
-                (is_simple_vote_tx, false)
-            } else {
-                let message = view.message_data();
-                let static_account_keys = view.static_account_keys();
-                let verified = signatures
-                    .iter()
-                    .zip(static_account_keys.iter())
-                    .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message));
-                (is_simple_vote_tx, verified)
-            }
+            (is_simple_vote_tx, verify_transaction_view_signatures(&view))
         }
     };
 
@@ -59,6 +43,18 @@ fn verify_packet(packet: &mut PacketRefMut, reject_non_vote: bool, enable_tx_v1:
     }
 
     verified
+}
+
+/// Returns true if every signature on the sanitized transaction verifies
+/// against its corresponding static account key. Short circuit on first bad signature
+pub fn verify_transaction_view_signatures<D: AsRef<[u8]>>(
+    view: &SanitizedTransactionView<D>,
+) -> bool {
+    let message = view.message_data();
+    view.signatures()
+        .iter()
+        .zip(view.static_account_keys())
+        .all(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message))
 }
 
 pub fn count_packets_in_batches(batches: &[PacketBatch]) -> usize {
@@ -72,7 +68,7 @@ pub fn count_valid_packets<'a>(batches: impl IntoIterator<Item = &'a PacketBatch
         .sum()
 }
 
-fn is_simple_vote_transaction_view<D: TransactionData>(view: &SanitizedTransactionView<D>) -> bool {
+fn is_simple_vote_transaction_view<D: AsRef<[u8]>>(view: &SanitizedTransactionView<D>) -> bool {
     // vote could have 1 or 2 sigs; zero sig has already been excluded by sanitization.
     if view.num_signatures() > 2 {
         return false;
@@ -109,34 +105,21 @@ pub fn ed25519_verify(
     batches: &mut [PacketBatch],
     reject_non_vote: bool,
     packet_count: usize,
-    enable_tx_v1: bool,
 ) {
     debug!("CPU ECDSA for {packet_count}");
     thread_pool.install(|| {
-        batches.par_iter_mut().flatten().for_each(|mut packet| {
-            if !packet.meta().discard()
-                && !verify_packet(&mut packet, reject_non_vote, enable_tx_v1)
-            {
+        batches.par_iter_mut().flatten().for_each(|packet| {
+            if !packet.meta().discard() && !verify_packet(packet, reject_non_vote) {
                 packet.meta_mut().set_discard(true);
             }
         });
     });
 }
 
-pub fn ed25519_verify_serial(batch: &mut PacketBatch, reject_non_vote: bool, enable_tx_v1: bool) {
-    for mut packet in batch.iter_mut() {
-        if !packet.meta().discard() && !verify_packet(&mut packet, reject_non_vote, enable_tx_v1) {
+pub fn ed25519_verify_serial(batch: &mut PacketBatch, reject_non_vote: bool) {
+    for packet in batch.iter_mut() {
+        if !packet.meta().discard() && !verify_packet(packet, reject_non_vote) {
             packet.meta_mut().set_discard(true);
-        }
-    }
-}
-
-pub fn mark_disabled(batches: &mut [PacketBatch], r: &[Vec<u8>]) {
-    for (batch, v) in batches.iter_mut().zip(r) {
-        for (mut pkt, f) in batch.iter_mut().zip(v) {
-            if !pkt.meta().discard() {
-                pkt.meta_mut().set_discard(*f == 0);
-            }
         }
     }
 }
@@ -169,10 +152,9 @@ mod tests {
         crate::{
             packet::{BytesPacket, BytesPacketBatch},
             sigverify::{self},
-            test_tx::{
-                new_test_tx_with_number_of_ixs, new_test_vote_tx, test_multisig_tx, test_tx,
-            },
+            test_tx::{new_test_vote_tx, test_multisig_tx, test_tx},
         },
+        agave_transaction_view::result::TransactionViewError,
         bytes::Bytes,
         solana_hash::Hash,
         solana_keypair::Keypair,
@@ -185,7 +167,7 @@ mod tests {
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::{Transaction, versioned::VersionedTransaction},
-        test_case::test_case,
+        std::assert_matches,
     };
 
     fn new_test_vote_tx_v0() -> VersionedTransaction {
@@ -209,27 +191,15 @@ mod tests {
         let payer = Keypair::new();
         let recipient = Pubkey::new_unique();
         let instruction = system_instruction::transfer(&payer.pubkey(), &recipient, 1);
-        let message = solana_message::v1::Message::try_compile(
+        let message = solana_message::v1::Message::try_compile_with_config(
             &payer.pubkey(),
             &[instruction],
             Hash::new_unique(),
+            solana_message::v1::TransactionConfig::empty(),
         )
         .unwrap();
 
         VersionedTransaction::try_new(VersionedMessage::V1(message), &[&payer]).unwrap()
-    }
-
-    #[test]
-    fn test_mark_disabled() {
-        let batch_size = 1;
-        let mut batch = BytesPacketBatch::with_capacity(batch_size);
-        batch.resize(batch_size, BytesPacket::empty());
-        let mut batches: Vec<PacketBatch> = vec![batch.into()];
-        mark_disabled(&mut batches, &[vec![0]]);
-        assert!(batches[0].get(0).unwrap().meta().discard());
-        batches[0].get_mut(0).unwrap().meta_mut().set_discard(false);
-        mark_disabled(&mut batches, &[vec![1]]);
-        assert!(!batches[0].get(0).unwrap().meta().discard());
     }
 
     fn packet_from_num_sigs(required_num_sigs: u8, actual_num_sigs: usize) -> BytesPacket {
@@ -245,7 +215,7 @@ mod tests {
         };
         let mut tx = Transaction::new_unsigned(message);
         tx.signatures = vec![Signature::default(); actual_num_sigs];
-        BytesPacket::from_data(None, tx).unwrap()
+        BytesPacket::from_data(tx).unwrap()
     }
 
     #[test]
@@ -254,28 +224,20 @@ mod tests {
         let actual_num_sigs = 5;
 
         let mut packet = packet_from_num_sigs(required_num_sigs, actual_num_sigs);
-        assert!(!sigverify::verify_packet(
-            &mut packet.as_mut(),
-            false,
-            false
-        ));
+        assert!(!sigverify::verify_packet(&mut packet, false));
     }
 
     #[test]
     fn test_small_packet() {
         let tx = test_tx();
-        let mut data = bincode::serialize(&tx).unwrap();
+        let mut data = wincode::serialize(&tx).unwrap();
 
         data[0] = 0xff;
         data[1] = 0xff;
         data.truncate(2);
 
         let mut packet = BytesPacket::from_bytes(None, Bytes::from(data));
-        assert!(!sigverify::verify_packet(
-            &mut packet.as_mut(),
-            false,
-            false
-        ));
+        assert!(!sigverify::verify_packet(&mut packet, false));
     }
 
     #[test]
@@ -287,14 +249,14 @@ mod tests {
         tx.signatures = vec![sig; NUM_SIG];
         tx.message.account_keys = vec![];
         tx.message.header.num_required_signatures = NUM_SIG as u8;
-        let mut packet = BytesPacket::from_data(None, tx).unwrap();
+        let mut packet = BytesPacket::from_data(tx).unwrap();
 
-        assert!(!verify_packet(&mut packet.as_mut(), false, false));
+        assert!(!verify_packet(&mut packet, false));
 
         packet.meta_mut().set_discard(false);
         let mut batches = generate_packet_batches(&packet, 1, 1);
         ed25519_verify(&mut batches);
-        assert!(batches[0].get(0).unwrap().meta().discard());
+        assert!(batches[0].first().unwrap().meta().discard());
     }
 
     #[test]
@@ -318,36 +280,32 @@ mod tests {
         let sig = keypair1.try_sign_message(&tx.message_data()).unwrap();
         tx.signatures = vec![sig; NUM_SIG];
 
-        let mut packet = BytesPacket::from_data(None, tx).unwrap();
+        let mut packet = BytesPacket::from_data(tx).unwrap();
 
-        assert!(!verify_packet(&mut packet.as_mut(), false, false));
+        assert!(!verify_packet(&mut packet, false));
 
         packet.meta_mut().set_discard(false);
         let mut batches = generate_packet_batches(&packet, 1, 1);
         ed25519_verify(&mut batches);
-        assert!(batches[0].get(0).unwrap().meta().discard());
+        assert!(batches[0].first().unwrap().meta().discard());
     }
 
     #[test]
     fn test_large_sig_len() {
         let tx = test_tx();
-        let mut data = bincode::serialize(&tx).unwrap();
+        let mut data = wincode::serialize(&tx).unwrap();
 
         // Make the signatures len huge
         data[0] = 0x7f;
 
         let mut packet = BytesPacket::from_bytes(None, Bytes::from(data));
-        assert!(!sigverify::verify_packet(
-            &mut packet.as_mut(),
-            false,
-            false
-        ));
+        assert!(!sigverify::verify_packet(&mut packet, false));
     }
 
     #[test]
     fn test_really_large_sig_len() {
         let tx = test_tx();
-        let mut data = bincode::serialize(&tx).unwrap();
+        let mut data = wincode::serialize(&tx).unwrap();
 
         // Make the signatures len huge
         data[0] = 0xff;
@@ -356,17 +314,13 @@ mod tests {
         data[3] = 0xff;
 
         let mut packet = BytesPacket::from_bytes(None, Bytes::from(data));
-        assert!(!sigverify::verify_packet(
-            &mut packet.as_mut(),
-            false,
-            false
-        ));
+        assert!(!sigverify::verify_packet(&mut packet, false));
     }
 
     #[test]
     fn test_invalid_pubkey_len() {
         let tx = test_tx();
-        let mut data = bincode::serialize(&tx).unwrap();
+        let mut data = wincode::serialize(&tx).unwrap();
 
         // make pubkey len huge
         const PUBKEY_OFFSET: usize =
@@ -374,11 +328,7 @@ mod tests {
         data[PUBKEY_OFFSET] = 0x7f;
 
         let mut packet = BytesPacket::from_bytes(None, Bytes::from(data));
-        assert!(!sigverify::verify_packet(
-            &mut packet.as_mut(),
-            false,
-            false
-        ));
+        assert!(!sigverify::verify_packet(&mut packet, false));
     }
 
     #[test]
@@ -395,18 +345,14 @@ mod tests {
         };
         let mut tx = Transaction::new_unsigned(message);
         tx.signatures = vec![Signature::default()];
-        let mut packet = BytesPacket::from_data(None, tx).unwrap();
-        assert!(!sigverify::verify_packet(
-            &mut packet.as_mut(),
-            false,
-            false
-        ));
+        let mut packet = BytesPacket::from_data(tx).unwrap();
+        assert!(!sigverify::verify_packet(&mut packet, false));
     }
 
     #[test]
     fn test_unsupported_version() {
         let tx = test_tx();
-        let mut data = bincode::serialize(&tx).unwrap();
+        let mut data = wincode::serialize(&tx).unwrap();
 
         // Set message version to 2. V1 is supported by transaction-view, but
         // still explicitly feature-gated by sigverify.
@@ -414,11 +360,7 @@ mod tests {
         data[MESSAGE_OFFSET] = MESSAGE_VERSION_PREFIX + 2;
 
         let mut packet = BytesPacket::from_bytes(None, Bytes::from(data));
-        assert!(!sigverify::verify_packet(
-            &mut packet.as_mut(),
-            false,
-            false
-        ));
+        assert!(!sigverify::verify_packet(&mut packet, false));
     }
 
     fn generate_bytes_packet_batches(
@@ -464,7 +406,7 @@ mod tests {
 
     fn test_verify_n(n: usize, modify_data: bool) {
         let tx = test_tx();
-        let mut data = bincode::serialize(&tx).unwrap();
+        let mut data = wincode::serialize(&tx).unwrap();
 
         // jumble some data to test failure
         if modify_data {
@@ -490,7 +432,7 @@ mod tests {
     fn ed25519_verify(batches: &mut [PacketBatch]) {
         let threadpool = threadpool_for_tests();
         let packet_count = sigverify::count_packets_in_batches(batches);
-        sigverify::ed25519_verify(&threadpool, batches, false, packet_count, false);
+        sigverify::ed25519_verify(&threadpool, batches, false, packet_count);
     }
 
     #[test]
@@ -498,7 +440,7 @@ mod tests {
         let mut tx = test_tx();
         // pretend malicious leader dropped a signature...
         tx.signatures.pop();
-        let packet = BytesPacket::from_data(None, tx).unwrap();
+        let packet = BytesPacket::from_data(tx).unwrap();
 
         let mut batches = generate_packet_batches(&packet, 1, 1);
 
@@ -552,7 +494,7 @@ mod tests {
         agave_logger::setup();
 
         let tx = test_multisig_tx();
-        let mut data = bincode::serialize(&tx).unwrap();
+        let mut data = wincode::serialize(&tx).unwrap();
 
         let n = 4;
         let num_batches = 3;
@@ -601,12 +543,9 @@ mod tests {
         {
             let mut tx = test_tx();
             tx.message.instructions[0].data = vec![1, 2, 3];
-            let packet = BytesPacket::from_data(None, tx).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(
-                packet.as_ref().data(..).unwrap(),
-                true,
-            )
-            .unwrap();
+            let packet = BytesPacket::from_data(tx).unwrap();
+            let view =
+                SanitizedTransactionView::try_new_sanitized(packet.data(..).unwrap()).unwrap();
             assert!(!is_simple_vote_transaction_view(&view));
         }
 
@@ -614,25 +553,19 @@ mod tests {
         {
             let mut tx = new_test_vote_tx(&mut rng);
             tx.message.instructions[0].data = vec![1, 2, 3];
-            let packet = BytesPacket::from_data(None, tx).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(
-                packet.as_ref().data(..).unwrap(),
-                true,
-            )
-            .unwrap();
+            let packet = BytesPacket::from_data(tx).unwrap();
+            let view =
+                SanitizedTransactionView::try_new_sanitized(packet.data(..).unwrap()).unwrap();
             assert!(is_simple_vote_transaction_view(&view));
         }
 
         // single versioned vote tx is not
         {
             let tx = new_test_vote_tx_v0();
-            let packet = BytesPacket::from_data(None, tx).unwrap();
+            let packet = BytesPacket::from_data(tx).unwrap();
 
-            let view = SanitizedTransactionView::try_new_sanitized(
-                packet.as_ref().data(..).unwrap(),
-                true,
-            )
-            .unwrap();
+            let view =
+                SanitizedTransactionView::try_new_sanitized(packet.data(..).unwrap()).unwrap();
             assert!(!is_simple_vote_transaction_view(&view));
             assert!(!packet.meta().is_simple_vote_tx());
         }
@@ -652,12 +585,9 @@ mod tests {
                     CompiledInstruction::new(4, &(), vec![0, 2]),
                 ],
             );
-            let packet = BytesPacket::from_data(None, tx).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(
-                packet.as_ref().data(..).unwrap(),
-                true,
-            )
-            .unwrap();
+            let packet = BytesPacket::from_data(tx).unwrap();
+            let view =
+                SanitizedTransactionView::try_new_sanitized(packet.data(..).unwrap()).unwrap();
             assert!(!is_simple_vote_transaction_view(&view));
         }
 
@@ -667,49 +597,37 @@ mod tests {
             tx.signatures.push(Signature::default());
             tx.message.header.num_required_signatures = 3;
             tx.message.instructions[0].data = vec![1, 2, 3];
-            let packet = BytesPacket::from_data(None, tx).unwrap();
-            let view = SanitizedTransactionView::try_new_sanitized(
-                packet.as_ref().data(..).unwrap(),
-                true,
-            )
-            .unwrap();
+            let packet = BytesPacket::from_data(tx).unwrap();
+            let view =
+                SanitizedTransactionView::try_new_sanitized(packet.data(..).unwrap()).unwrap();
             assert!(!is_simple_vote_transaction_view(&view));
         }
     }
 
-    #[test_case(false, false; "ok_ixs_legacy")]
-    #[test_case(true, false; "too_many_ixs_legacy")]
-    #[test_case(false, true; "ok_ixs_versioned")]
-    #[test_case(true, true; "too_many_ixs_versioned")]
-    fn test_number_of_instructions(too_many_ixs: bool, is_versioned_tx: bool) {
-        let mut number_of_ixs = 64;
-        if too_many_ixs {
-            number_of_ixs += 1;
-        }
-
-        let mut packet = if is_versioned_tx {
-            let tx: VersionedTransaction = new_test_tx_with_number_of_ixs(number_of_ixs);
-            BytesPacket::from_data(None, tx.clone()).unwrap()
-        } else {
-            let tx: Transaction = new_test_tx_with_number_of_ixs(number_of_ixs);
-            BytesPacket::from_data(None, tx.clone()).unwrap()
-        };
-
-        assert_eq!(
-            sigverify::verify_packet(&mut packet.as_mut(), false, false),
-            !too_many_ixs
-        );
-    }
-
-    #[test_case(false, false; "tx_v1_disabled")]
-    #[test_case(true, true; "tx_v1_enabled")]
-    fn test_verify_packet_tx_v1_feature_gate(enable_tx_v1: bool, expected: bool) {
+    #[test]
+    fn test_verify_packet_tx_v1() {
         let tx = test_tx_v1();
         let mut packet = BytesPacket::from_bytes(None, wincode::serialize(&tx).unwrap());
 
-        assert_eq!(
-            verify_packet(&mut packet.as_mut(), false, enable_tx_v1),
-            expected,
+        assert!(verify_packet(&mut packet, false));
+    }
+
+    #[test]
+    fn test_verify_packet_tx_v1_no_signatures() {
+        let mut tx = test_tx_v1();
+        let VersionedMessage::V1(message) = &mut tx.message else {
+            unreachable!()
+        };
+
+        message.header.num_required_signatures = 0;
+        tx.signatures.clear();
+        let data = wincode::serialize(&tx).unwrap();
+
+        assert_matches!(
+            SanitizedTransactionView::try_new_sanitized(data.as_slice()),
+            Err(TransactionViewError::SanitizeError)
         );
+        let mut packet = BytesPacket::from_bytes(None, Bytes::from(data));
+        assert!(!verify_packet(&mut packet, false));
     }
 }

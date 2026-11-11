@@ -12,7 +12,7 @@ mod bench {
     use {
         criterion::{Criterion, criterion_group},
         solana_account::{Account, AccountSharedData},
-        solana_program_runtime::serialization::serialize_parameters,
+        solana_program_runtime::{abi::ABI, serialization::serialize_parameters},
         solana_pubkey::Pubkey,
         solana_rent::Rent,
         solana_sdk_ids::{bpf_loader, bpf_loader_deprecated},
@@ -118,7 +118,7 @@ mod bench {
         transaction_context
             .configure_top_level_instruction_for_tests(0, instruction_accounts, instruction_data)
             .unwrap();
-        transaction_context.push().unwrap();
+        transaction_context.push(true).unwrap();
         transaction_context
     }
 
@@ -132,6 +132,7 @@ mod bench {
             b.iter(|| {
                 let _ = serialize_parameters(
                     &instruction_context,
+                    ABI::V0,
                     true,  // virtual_address_space_adjustments
                     true,  // account_data_direct_mapping
                     false, // direct_account_pointers_in_program_input
@@ -150,6 +151,7 @@ mod bench {
             b.iter(|| {
                 let _ = serialize_parameters(
                     &instruction_context,
+                    ABI::V0,
                     false, // virtual_address_space_adjustments
                     false, // account_data_direct_mapping
                     false, // direct_account_pointers_in_program_input
@@ -169,6 +171,7 @@ mod bench {
             b.iter(|| {
                 let _ = serialize_parameters(
                     &instruction_context,
+                    ABI::V1,
                     true, // virtual_address_space_adjustments
                     true, // account_data_direct_mapping
                     true, // direct_account_pointers_in_program_input
@@ -187,6 +190,7 @@ mod bench {
             b.iter(|| {
                 let _ = serialize_parameters(
                     &instruction_context,
+                    ABI::V1,
                     false, // virtual_address_space_adjustments
                     false, // account_data_direct_mapping
                     false, // direct_account_pointers_in_program_input
@@ -206,6 +210,7 @@ mod bench {
             b.iter(|| {
                 let _ = serialize_parameters(
                     &instruction_context,
+                    ABI::V0,
                     true, // virtual_address_space_adjustments
                     true, // account_data_direct_mapping
                     true, // direct_account_pointers_in_program_input
@@ -225,6 +230,7 @@ mod bench {
             b.iter(|| {
                 let _ = serialize_parameters(
                     &instruction_context,
+                    ABI::V1,
                     true, // virtual_address_space_adjustments
                     true, // account_data_direct_mapping
                     true, // direct_account_pointers_in_program_input

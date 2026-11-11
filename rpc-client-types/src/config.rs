@@ -9,10 +9,14 @@ pub use {
     solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcSignatureStatusConfig {
+    #[serde(default)]
     pub search_transaction_history: bool,
+    #[serde(flatten)]
+    pub commitment: Option<CommitmentConfig>,
+    pub min_context_slot: Option<Slot>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +51,7 @@ pub struct RpcSimulateTransactionConfig {
     pub min_context_slot: Option<Slot>,
     #[serde(default)]
     pub inner_instructions: bool,
+    pub inner_instructions_encoding: Option<UiTransactionEncoding>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +66,7 @@ pub struct RpcRequestAirdropConfig {
 #[serde(rename_all = "camelCase")]
 pub struct RpcLeaderScheduleConfig {
     pub identity: Option<String>, // validator identity, as a base-58 encoded string
+    pub key_by_vote_account: Option<bool>, // key the schedule by vote account instead of identity
     #[serde(flatten)]
     pub commitment: Option<CommitmentConfig>,
 }
@@ -173,7 +179,6 @@ pub struct RpcProgramAccountsConfig {
 #[serde(rename_all = "camelCase")]
 pub enum RpcTransactionLogsFilter {
     All,
-    AllWithVotes,
     Mentions(Vec<String>), // base58-encoded list of addresses
 }
 
@@ -309,6 +314,7 @@ pub struct RpcTransactionConfig {
     #[serde(flatten)]
     pub commitment: Option<CommitmentConfig>,
     pub max_supported_transaction_version: Option<u8>,
+    pub min_context_slot: Option<Slot>,
 }
 
 impl EncodingConfig for RpcTransactionConfig {
@@ -342,4 +348,26 @@ pub struct RpcContextConfig {
     #[serde(flatten)]
     pub commitment: Option<CommitmentConfig>,
     pub min_context_slot: Option<Slot>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RpcVatActiveSetRankMapConfig {
+    /// Filter by validator identity, as a base-58 encoded string.
+    pub identity: Option<String>,
+    /// Minimum finalized bank context slot; no minimum is enforced when omitted.
+    pub min_context_slot: Option<Slot>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RpcTransactionLogsFilter;
+
+    #[test]
+    fn test_removed_all_with_votes_filter() {
+        assert!(serde_json::from_str::<RpcTransactionLogsFilter>(r#""allWithVotes""#).is_err());
+        let filter: RpcTransactionLogsFilter = serde_json::from_str(r#""all""#).unwrap();
+        assert_eq!(filter, RpcTransactionLogsFilter::All);
+        assert_eq!(serde_json::to_string(&filter).unwrap(), r#""all""#);
+    }
 }

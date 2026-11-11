@@ -59,6 +59,11 @@ There are three release channels that map to branches as follows:
 * beta - tracks the largest (and latest) `vX.Y` stabilization branch, more stable.
 * stable - tracks the second largest `vX.Y` stabilization branch, most stable.
 
+Edge serves the tip of `master`. Beta and stable serve the latest tag on their
+branch, not its tip. The "sync release channels" step at the end of every tag's
+`agave-secondary` build copies those tags' artifacts into the channels. If a
+channel is stale, retry that step on any tag build.
+
 ## Steps to Create a Branch
 
 ### Major release branch
@@ -68,26 +73,34 @@ for at least one full minor version before removal.
 
 ### Create the new branch
 
-#### Cutting a branch without promoting channels
+#### How channels are resolved
 
-By default, pushing a new `vX.Y` head auto-promotes it to `BETA_CHANNEL` and
-demotes the prior beta to stable, because `ci/channel-info.sh` picks the top-2
-`vX.Y` heads. To cut a branch without that promotion (e.g. to begin backports
-while keeping the current beta in place), set the pins in
-`ci/channel-overrides` on master *before* pushing the new branch:
+`cargo xtask channel-info` derives the channels from each `vX.Y` branch's
+`workspace.package.version`. Heads are sorted descending, and the release stage
+of the top head decides the promotion:
+
+* top head is `-alpha` — it is not yet a channel; beta and stable stay at the
+  prior pair
+* otherwise — the top head is beta and the one below it is stable
+
+So cutting a branch does not promote it. A freshly-cut `vX.Y` is at
+`X.Y.0-alpha.K`, which means backports can begin while the current beta is held
+in place, with no manual step. Promotion happens when the release engineer bumps
+that branch to `-beta`.
+
+#### Channel pin overrides
+
+`ci/channel-overrides` forces the channels regardless of the versions on the
+branches. It is an emergency escape hatch, for when auto-resolution has to be
+overridden; the normal branch-cut flow above does not need it.
 
 ```
-# current beta, to be held
 PINNED_BETA_CHANNEL=vX.Y
-# current stable, to be held
 PINNED_STABLE_CHANNEL=vX.Y-1
 ```
 
 Only the file that lives on master is used; every branch's CI fetches it from there, so no
-backport is needed.
-
-When ready to promote, open a PR on master that clears or updates the pins.
-Then proceed with the usual "Miscellaneous Clean up" steps below.
+backport is needed. To release the override, open a PR on master that clears the pins.
 
 #### Steps
 
@@ -102,33 +115,40 @@ Then proceed with the usual "Miscellaneous Clean up" steps below.
     git checkout -b <branchname> <the last commit right before the version bump commit>
     git push -u upstream <branchname>
     ```
-1. Confirm that your freshly cut release branch is shown as `BETA_CHANNEL` and the previous release branch as `STABLE_CHANNEL`:
+1. Confirm the resolved channels. The freshly cut branch is at `-alpha`, so
+   `BETA_CHANNEL` and `STABLE_CHANNEL` should both be unchanged from before the
+   cut; the new branch becomes beta once its version is bumped to `-beta`:
     ```
-    ci/channel-info.sh
+    cargo xtask channel-info
     ```
    Note: if `ci/channel-overrides` on master has `PINNED_BETA_CHANNEL` /
    `PINNED_STABLE_CHANNEL` set, those values override auto-detect everywhere.
 
-### Update the Changelog
+### Miscellaneous Cleanup
 
-Create a PR that makes the following updates to [CHANGELOG.md](https://github.com/anza-xyz/agave/blob/master/CHANGELOG.md) in master:
+#### Configure backporting
+
+1. Update [mergify.yml](https://github.com/anza-xyz/agave/blob/master/.mergify.yml) to add backport actions for the new branch, remove actions for the obsolete branch and update the list of non EoL version branches.
+1. Adjust the [Github backport labels](https://github.com/anza-xyz/agave/labels) to add the new branch label and remove the label for the obsolete branch.
+
+#### Master Branch
+
+Create a PR that makes the following updates to [CHANGELOG.md](https://github.com/anza-xyz/agave/blob/master/CHANGELOG.md):
 * Advance the channel links with the newly created branch becoming beta.
 * Add a new section `X.Y.0-Unreleased` for the new master version.
 * Remove the `Unreleased` annotation for the section that has now become beta.
 
-### Miscellaneous Clean up
-
 #### Newly Promoted Stable (Former Beta) Branch
 
 1. Pin the spl-token-cli version in the newly promoted stable branch by setting `splTokenCliVersion` in scripts/spl-token-cli-version.sh to the latest release that depends on the stable branch (usually this will be the latest spl-token-cli release).
-1. Pin the cargo-build-sbf and cargo-test-sbf versions in the newly promoted stable branch by setting `cargoBuildSbfVersion` and `cargoTestSbfVersion` in scripts/cargo-build-sbf-version.sh to the latest release that depends on the stable branch (usually this will be the latest releases).
 
 #### Newly Created Beta Branch
 
 1. Update [CHANGELOG.md](https://github.com/anza-xyz/agave/blob/master/CHANGELOG.md) to remove the channel links on the new branch. Additionally, remove any wording about the new branch being unreleased.
 1. Update [CODEOWNERS](https://github.com/anza-xyz/agave/blob/master/.github/CODEOWNERS) to `* @anza-xyz/backport-reviewers` on the new branch.
-1. Update [mergify.yml](https://github.com/anza-xyz/agave/blob/master/.mergify.yml) to add backport actions for the new branch and remove actions for the obsolete branch.
-1. Adjust the [Github backport labels](https://github.com/anza-xyz/agave/labels) to add the new branch label and remove the label for the obsolete branch.
+
+#### Announcing
+
 1. Announce on Discord #development that the release branch exists so people know to use the new backport labels.
 
 ## Steps to Create a Release

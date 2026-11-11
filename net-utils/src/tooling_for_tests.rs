@@ -3,13 +3,18 @@ use {
     anyhow::Context,
     log::{debug, error, info},
     pcap_file::pcapng::PcapNgReader,
+    pretty_hex::{HexConfig, PrettyHex},
     std::{fs::File, io::Write, path::PathBuf},
 };
 
 /// Prints a hexdump of a given byte buffer into stderr
 pub fn hexdump(bytes: &[u8]) -> anyhow::Result<()> {
-    hxdmp::hexdump(bytes, &mut std::io::stderr())?;
-    std::io::stderr().write_all(b"\n")?;
+    let config = HexConfig {
+        title: false,
+        group: 0,
+        ..HexConfig::default()
+    };
+    writeln!(std::io::stderr().lock(), "{:?}", bytes.hex_conf(config))?;
     Ok(())
 }
 
@@ -32,10 +37,7 @@ impl Iterator for PcapReader {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let block = match self.reader.next_block() {
-                Some(block) => block.ok()?,
-                None => return None,
-            };
+            let block = self.reader.next_block()?.ok()?;
             let data = match block {
                 pcap_file::pcapng::Block::Packet(ref block) => {
                     &block.data[0..block.original_len as usize]

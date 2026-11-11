@@ -49,6 +49,12 @@ pub struct ShredFetchStats {
     pub(super) num_shreds_merkle_data_chained: usize,
     pub ping_count: usize,
     pub ping_err_verify_count: usize,
+    /// repair pings dropped because buffer is full
+    pub ping_overflow_count: usize,
+    /// repair pongs dropped because send() call failed
+    pub pong_send_error_count: usize,
+    /// repair packets no larger than a ping that failed to deserialize as one
+    pub ping_malformed_count: usize,
     pub(super) index_bad_deserialize: usize,
     pub(super) index_out_of_bounds: usize,
     pub(super) slot_bad_deserialize: usize,
@@ -60,9 +66,12 @@ pub struct ShredFetchStats {
     pub(super) misaligned_fec_set: usize,
     pub(super) erasure_config_bad_deserialize: usize,
     pub(super) misaligned_erasure_config: usize,
-    pub(super) shred_flags_bad_deserialize: usize,
+    pub(super) invalid_shred_flags: usize,
+    pub(super) misaligned_coding_position: usize,
     pub(super) misaligned_last_data_index: usize,
     pub(super) unexpected_data_complete_shred: usize,
+    pub(super) invalid_proof_size: usize,
+    pub(super) invalid_data_size: usize,
     since: Option<Instant>,
     pub overflow_shreds: usize,
 }
@@ -167,6 +176,9 @@ impl ShredFetchStats {
             ),
             ("ping_count", self.ping_count, i64),
             ("ping_err_verify_count", self.ping_err_verify_count, i64),
+            ("ping_overflow_count", self.ping_overflow_count, i64),
+            ("pong_send_error_count", self.pong_send_error_count, i64),
+            ("ping_malformed_count", self.ping_malformed_count, i64),
             ("slot_bad_deserialize", self.slot_bad_deserialize, i64),
             ("index_bad_deserialize", self.index_bad_deserialize, i64),
             ("index_out_of_bounds", self.index_out_of_bounds, i64),
@@ -190,9 +202,10 @@ impl ShredFetchStats {
                 self.misaligned_erasure_config,
                 i64
             ),
+            ("invalid_shred_flags", self.invalid_shred_flags, i64),
             (
-                "shred_flags_bad_deserialize",
-                self.shred_flags_bad_deserialize,
+                "misaligned_coding_position",
+                self.misaligned_coding_position,
                 i64
             ),
             (
@@ -205,7 +218,9 @@ impl ShredFetchStats {
                 "unexpected_data_complete_shred",
                 self.unexpected_data_complete_shred,
                 i64
-            )
+            ),
+            ("invalid_proof_size", self.invalid_proof_size, i64),
+            ("invalid_data_size", self.invalid_data_size, i64)
         );
         *self = Self {
             since: Some(Instant::now()),

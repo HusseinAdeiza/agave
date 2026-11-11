@@ -3,10 +3,10 @@ use {
         poh_recorder::{PohRecorderError, Record},
         record_channels::{RecordSender, RecordSenderError},
     },
-    solana_clock::BankId,
     solana_entry::entry::hash_transactions,
     solana_hash::Hash,
     solana_measure::measure_us,
+    solana_runtime::bank::BankId,
     solana_transaction::versioned::VersionedTransaction,
     std::num::Saturating,
 };
@@ -35,7 +35,7 @@ pub struct RecordTransactionsSummary {
     pub starting_transaction_index: Option<usize>,
 }
 
-/// Adds transactions into the PoH stream, by sending them to the PoH service.
+/// Adds transactions into the PoH stream by sending them to the block creation loop.
 #[derive(Clone, Debug)]
 pub struct TransactionRecorder {
     // shared by all users of PohRecorder
@@ -47,7 +47,8 @@ impl TransactionRecorder {
         Self { record_sender }
     }
 
-    /// Hashes `transactions` and sends to PoH service for recording. Waits for response up to 1s.
+    /// Hashes `transactions` and sends them to the block creation loop for recording. Waits for
+    /// response up to 1s.
     /// Panics on unexpected (non-`MaxHeightReached`) errors.
     pub fn record_transactions(
         &self,
@@ -61,8 +62,7 @@ impl TransactionRecorder {
             let (hash, hash_us) = measure_us!(hash_transactions(&transactions));
             record_transactions_timings.hash_us = Saturating(hash_us);
 
-            let (res, poh_record_us) =
-                measure_us!(self.record(bank_id, vec![hash], vec![transactions]));
+            let (res, poh_record_us) = measure_us!(self.record(bank_id, hash, transactions));
             record_transactions_timings.poh_record_us = Saturating(poh_record_us);
 
             match res {
@@ -104,10 +104,10 @@ impl TransactionRecorder {
     pub fn record(
         &self,
         bank_id: BankId,
-        mixins: Vec<Hash>,
-        transaction_batches: Vec<Vec<VersionedTransaction>>,
+        mixin: Hash,
+        transactions: Vec<VersionedTransaction>,
     ) -> Result<Option<usize>, RecordSenderError> {
         self.record_sender
-            .try_send(Record::new(mixins, transaction_batches, bank_id))
+            .try_send(Record::new(mixin, transactions, bank_id))
     }
 }

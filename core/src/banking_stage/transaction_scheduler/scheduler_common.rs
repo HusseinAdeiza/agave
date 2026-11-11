@@ -14,13 +14,17 @@ use {
     },
     crossbeam_channel::{Receiver, Sender, TryRecvError},
     itertools::izip,
+    solana_clock::Slot,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
 };
+
+const MAX_RECYCLED_BATCHES: usize = 1024;
 
 pub struct Batches<Tx> {
     ids: Vec<Vec<TransactionId>>,
     transactions: Vec<Vec<Tx>>,
     max_ages: Vec<Vec<MaxAge>>,
+    recycled_batches: Vec<(Vec<TransactionId>, Vec<Tx>, Vec<MaxAge>)>,
     total_cus: Vec<u64>,
     entry_bytes: Vec<u64>,
     target_num_transactions_per_batch: usize,
@@ -41,6 +45,7 @@ impl<Tx> Batches<Tx> {
             ids: make_vecs(num_threads, target_num_transactions_per_batch),
             transactions: make_vecs(num_threads, target_num_transactions_per_batch),
             max_ages: make_vecs(num_threads, target_num_transactions_per_batch),
+            recycled_batches: Vec::with_capacity(num_threads),
             total_cus: vec![0; num_threads],
             entry_bytes: vec![ENTRY_OVERHEAD_BYTES; num_threads],
             target_num_transactions_per_batch,
@@ -91,20 +96,20 @@ impl<Tx> Batches<Tx> {
         &mut self,
         thread_id: ThreadId,
     ) -> (Vec<TransactionId>, Vec<Tx>, Vec<MaxAge>, u64) {
+        let (replacement_ids, replacement_transactions, replacement_max_ages) =
+            self.recycled_batches.pop().unwrap_or_else(|| {
+                (
+                    Vec::with_capacity(self.target_num_transactions_per_batch),
+                    Vec::with_capacity(self.target_num_transactions_per_batch),
+                    Vec::with_capacity(self.target_num_transactions_per_batch),
+                )
+            });
+
         self.entry_bytes[thread_id] = ENTRY_OVERHEAD_BYTES;
         (
-            core::mem::replace(
-                &mut self.ids[thread_id],
-                Vec::with_capacity(self.target_num_transactions_per_batch),
-            ),
-            core::mem::replace(
-                &mut self.transactions[thread_id],
-                Vec::with_capacity(self.target_num_transactions_per_batch),
-            ),
-            core::mem::replace(
-                &mut self.max_ages[thread_id],
-                Vec::with_capacity(self.target_num_transactions_per_batch),
-            ),
+            core::mem::replace(&mut self.ids[thread_id], replacement_ids),
+            core::mem::replace(&mut self.transactions[thread_id], replacement_transactions),
+            core::mem::replace(&mut self.max_ages[thread_id], replacement_max_ages),
             core::mem::replace(&mut self.total_cus[thread_id], 0),
         )
     }
@@ -192,7 +197,7 @@ impl<Tx> SchedulingCommon<Tx> {
 
     /// Send a batch of transactions to the given thread's `ConsumeWork` channel.
     /// Returns the number of transactions sent.
-    pub fn send_batch(&mut self, thread_index: usize) -> Result<usize, SchedulerError> {
+    pub fn send_batch(&mut self, thread_index: usize, slot: Slot) -> Result<usize, SchedulerError> {
         if self.batches.ids[thread_index].is_empty() {
             return Ok(0);
         }
@@ -205,6 +210,7 @@ impl<Tx> SchedulingCommon<Tx> {
 
         let num_scheduled = ids.len();
         let work = ConsumeWork {
+            target_slot: slot,
             batch_id,
             ids,
             transactions,
@@ -219,9 +225,9 @@ impl<Tx> SchedulingCommon<Tx> {
 
     /// Send all batches of transactions to the worker threads.
     /// Returns the number of transactions sent.
-    pub fn send_batches(&mut self) -> Result<usize, SchedulerError> {
+    pub fn send_batches(&mut self, slot: Slot) -> Result<usize, SchedulerError> {
         (0..self.consume_work_senders.len())
-            .map(|thread_index| self.send_batch(thread_index))
+            .map(|thread_index| self.send_batch(thread_index, slot))
             .sum()
     }
 }
@@ -237,10 +243,11 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
             Ok(FinishedConsumeWork {
                 work:
                     ConsumeWork {
+                        target_slot: _,
                         batch_id,
-                        ids,
-                        transactions,
-                        max_ages: _,
+                        mut ids,
+                        mut transactions,
+                        mut max_ages,
                     },
                 retryable_indexes,
             }) => {
@@ -252,17 +259,19 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
 
                 // Assumption - retryable indexes are in order (sorted by workers).
                 let mut retryable_iter = retryable_indexes.iter().peekable();
-                for (index, (id, transaction)) in izip!(ids, transactions).enumerate() {
-                    if let Some(&retryable_index) = retryable_iter.peek() {
-                        if retryable_index.index == index {
-                            container.retry_transaction(
-                                id,
-                                transaction,
-                                retryable_index.immediately_retryable,
-                            );
-                            retryable_iter.next();
-                            continue;
-                        }
+                for (index, (id, transaction)) in
+                    izip!(ids.drain(..), transactions.drain(..)).enumerate()
+                {
+                    if let Some(&retryable_index) = retryable_iter.peek()
+                        && retryable_index.index == index
+                    {
+                        container.retry_transaction(
+                            id,
+                            transaction,
+                            retryable_index.immediately_retryable,
+                        );
+                        retryable_iter.next();
+                        continue;
                     }
                     container.remove_by_id(id);
                 }
@@ -275,6 +284,13 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
                         .map(|index| index.index)
                         .collect::<Vec<_>>(),
                 );
+
+                max_ages.clear();
+                if self.batches.recycled_batches.len() < MAX_RECYCLED_BATCHES {
+                    self.batches
+                        .recycled_batches
+                        .push((ids, transactions, max_ages));
+                }
 
                 Ok((num_transactions, num_retryable))
             }
@@ -291,16 +307,17 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
         let thread_id = self.in_flight_tracker.complete_batch(batch_id);
         for transaction in transactions {
             let account_keys = transaction.account_keys();
-            let write_account_locks = account_keys
+            let account_locks = account_keys
                 .iter()
                 .enumerate()
-                .filter_map(|(index, key)| transaction.is_writable(index).then_some(key));
-            let read_account_locks = account_keys
-                .iter()
-                .enumerate()
-                .filter_map(|(index, key)| (!transaction.is_writable(index)).then_some(key));
-            self.account_locks
-                .unlock_accounts(write_account_locks, read_account_locks, thread_id);
+                .map(|(index, key)| (key, transaction.is_writable(index)))
+                .chain(
+                    transaction
+                        .implicit_read_locks()
+                        .iter()
+                        .map(|key| (key, false)),
+                );
+            self.account_locks.unlock_accounts(account_locks, thread_id);
         }
     }
 }
@@ -313,7 +330,7 @@ mod tests {
             consumer::RetryableIndex,
             transaction_scheduler::transaction_state_container::TransactionStateContainer,
         },
-        crossbeam_channel::unbounded,
+        crossbeam_channel::bounded,
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_pubkey::Pubkey,
@@ -325,6 +342,7 @@ mod tests {
 
     const NUM_WORKERS: usize = 4;
     const DUMMY_COST: u64 = 1;
+    const TEST_SLOT: Slot = 42;
 
     fn simple_transaction() -> RuntimeTransaction<SanitizedTransaction> {
         RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
@@ -361,23 +379,22 @@ mod tests {
             .take_transaction_for_scheduling();
 
         let account_keys = transaction.account_keys();
-        let write_account_locks = account_keys
+        let account_locks = account_keys
             .iter()
             .enumerate()
-            .filter_map(|(index, key)| transaction.is_writable(index).then_some(key));
-        let read_account_locks = account_keys
-            .iter()
-            .enumerate()
-            .filter_map(|(index, key)| (!transaction.is_writable(index)).then_some(key));
+            .map(|(index, key)| (key, transaction.is_writable(index)))
+            .chain(
+                transaction
+                    .implicit_read_locks()
+                    .iter()
+                    .map(|key| (key, false)),
+            );
 
         common
             .account_locks
-            .try_lock_accounts(
-                write_account_locks,
-                read_account_locks,
-                ThreadSet::any(NUM_WORKERS),
-                |_thread_set| thread_id,
-            )
+            .try_lock_accounts(account_locks, ThreadSet::any(NUM_WORKERS), |_thread_set| {
+                thread_id
+            })
             .unwrap();
         let transaction_bytes = transaction.serialized_size() as u64;
         common.batches.add_transaction_to_batch(
@@ -470,8 +487,8 @@ mod tests {
         add_transactions_to_container(&mut container, 3);
 
         let (work_senders, work_receivers): (Vec<Sender<_>>, Vec<Receiver<_>>) =
-            (0..NUM_WORKERS).map(|_| unbounded()).unzip();
-        let (_finished_work_sender, finished_work_receiver) = unbounded();
+            (0..NUM_WORKERS).map(|_| bounded(1024)).unzip();
+        let (_finished_work_sender, finished_work_receiver) = bounded(1024);
         let mut common = SchedulingCommon::new(work_senders, finished_work_receiver, 10);
         assert_eq!(
             common.batches.entry_bytes(),
@@ -480,7 +497,7 @@ mod tests {
 
         pop_and_add_transaction(&mut container, &mut common, 0);
         assert!(common.batches.entry_bytes()[0] > ENTRY_OVERHEAD_BYTES);
-        let num_scheduled = common.send_batch(0).unwrap();
+        let num_scheduled = common.send_batch(0, TEST_SLOT).unwrap();
         assert_eq!(num_scheduled, 1);
         assert_eq!(common.batches.entry_bytes()[0], ENTRY_OVERHEAD_BYTES);
         assert_eq!(work_receivers[0].len(), 1);
@@ -493,17 +510,18 @@ mod tests {
             &[DUMMY_COST, 0, 0, 0]
         );
 
-        let num_scheduled = common.send_batch(1).unwrap();
+        let num_scheduled = common.send_batch(1, TEST_SLOT).unwrap();
         assert_eq!(num_scheduled, 0);
         assert_eq!(work_receivers[1].len(), 0); // not actually sent since no transactions.
 
-        work_receivers[0].recv().unwrap();
+        let work = work_receivers[0].recv().unwrap();
+        assert_eq!(work.target_slot, TEST_SLOT);
 
         // Multiple batches.
         pop_and_add_transaction(&mut container, &mut common, 0);
         pop_and_add_transaction(&mut container, &mut common, 2);
 
-        common.send_batches().unwrap();
+        common.send_batches(TEST_SLOT).unwrap();
         assert_eq!(work_receivers[0].len(), 1);
         assert_eq!(work_receivers[1].len(), 0);
         assert_eq!(work_receivers[2].len(), 1);
@@ -524,13 +542,13 @@ mod tests {
         add_transactions_to_container(&mut container, 1);
 
         let (work_senders, work_receivers): (Vec<Sender<_>>, Vec<Receiver<_>>) =
-            (0..NUM_WORKERS).map(|_| unbounded()).unzip();
-        let (finished_work_sender, finished_work_receiver) = unbounded();
+            (0..NUM_WORKERS).map(|_| bounded(1024)).unzip();
+        let (finished_work_sender, finished_work_receiver) = bounded(1024);
         let mut common = SchedulingCommon::new(work_senders, finished_work_receiver, 10);
 
         // Send a batch. Return completed work.
         pop_and_add_transaction(&mut container, &mut common, 0);
-        let num_scheduled = common.send_batch(0).unwrap();
+        let num_scheduled = common.send_batch(0, TEST_SLOT).unwrap();
 
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
@@ -552,7 +570,7 @@ mod tests {
         pop_and_add_transaction(&mut container, &mut common, 0);
         pop_and_add_transaction(&mut container, &mut common, 0);
         pop_and_add_transaction(&mut container, &mut common, 0);
-        let num_scheduled = common.send_batch(0).unwrap();
+        let num_scheduled = common.send_batch(0, TEST_SLOT).unwrap();
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
         let retryable_indexes = vec![
@@ -579,14 +597,14 @@ mod tests {
         let mut container = TransactionStateContainer::with_capacity(1024);
 
         let (work_senders, work_receivers): (Vec<Sender<_>>, Vec<Receiver<_>>) =
-            (0..NUM_WORKERS).map(|_| unbounded()).unzip();
-        let (finished_work_sender, finished_work_receiver) = unbounded();
+            (0..NUM_WORKERS).map(|_| bounded(1024)).unzip();
+        let (finished_work_sender, finished_work_receiver) = bounded(1024);
         let mut common = SchedulingCommon::new(work_senders, finished_work_receiver, 10);
         // Retryable indexes out-of-order.
         add_transactions_to_container(&mut container, 2);
         pop_and_add_transaction(&mut container, &mut common, 0);
         pop_and_add_transaction(&mut container, &mut common, 0);
-        let num_scheduled = common.send_batch(0).unwrap();
+        let num_scheduled = common.send_batch(0, TEST_SLOT).unwrap();
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
         let retryable_indexes = vec![RetryableIndex::new(1, true), RetryableIndex::new(0, true)];

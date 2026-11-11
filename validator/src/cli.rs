@@ -18,13 +18,12 @@ use {
         hidden_unless_forced,
         input_validators::{
             is_parsable, is_pubkey, is_pubkey_or_keypair, is_slot, is_url_or_moniker,
-            validate_cpu_ranges,
         },
     },
     solana_clock::Slot,
-    solana_core::banking_trace::BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
     solana_epoch_schedule::MINIMUM_SLOTS_PER_EPOCH,
     solana_faucet::faucet::{self, FAUCET_PORT},
+    solana_gossip::cluster_info::DEFAULT_NUM_VOTOR_QUIC_ENDPOINTS,
     solana_hash::Hash,
     solana_net_utils::{MINIMUM_VALIDATOR_PORT_RANGE_WIDTH, VALIDATOR_PORT_RANGE},
     solana_send_transaction_service::send_transaction_service::{self},
@@ -34,7 +33,6 @@ use {
         DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER, DEFAULT_MAX_STAKED_CONNECTIONS,
         DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS, DEFAULT_QUIC_ENDPOINTS,
     },
-    solana_tpu_client::tpu_client::DEFAULT_VOTE_USE_QUIC,
     std::{cmp::Ordering, path::PathBuf, str::FromStr},
 };
 
@@ -72,6 +70,7 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
         .subcommand(SubCommand::with_name("run").about("Run the validator"))
         .subcommand(commands::plugin::command())
         .subcommand(commands::set_identity::command())
+        .subcommand(commands::set_event_filter::command())
         .subcommand(commands::set_log_filter::command())
         .subcommand(commands::staked_nodes_overrides::command())
         .subcommand(commands::wait_for_restart_window::command())
@@ -130,78 +129,68 @@ fn deprecated_arguments() -> Vec<DeprecatedArg> {
     }
 
     add_arg!(
-        // deprecated in v4.1.0
-        Arg::with_name("account_shrink_path")
-            .long("account-shrink-path")
-            .value_name("PATH")
+        // deprecated in v4.5.0
+        Arg::with_name("banking_trace_dir_byte_limit")
+            .long("enable-banking-trace")
+            .value_name("BYTES")
+            .validator(is_parsable::<u64>)
             .takes_value(true)
-            .multiple(true)
-            .help("Path to accounts shrink path which can hold a compacted account set."),
-        usage_warning: "Shrink paths are no longer used.",
+            .help("No-op; banking trace has been removed"),
+        usage_warning: "Banking trace has been removed.",
     );
     add_arg!(
-        // deprecated in v4.2.0; the `mmap` value was deprecated in v4.0.0, and now mmap mode has
-        // been removed entirely. The only remaining mode (`file`) is the default and only
-        // behavior, so this flag is now a no-op.
-        Arg::with_name("accounts_db_access_storages_method")
-            .long("accounts-db-access-storages-method")
-            .value_name("METHOD")
-            .takes_value(true)
-            .possible_values(&["mmap", "file"])
-            .help("No-op; account storages are always accessed via file I/O"),
-    );
-    add_arg!(
-        // deprecated in v4.0.0
-        Arg::with_name("enable_accounts_disk_index")
-            .long("enable-accounts-disk-index")
-            .help("Enables the disk-based accounts index")
-            .conflicts_with("accounts_index_limit"),
-        replaced_by: "accounts-index-limit",
-    );
-    add_arg!(
-        // deprecated in v4.1.0
-        Arg::with_name("experimental_retransmit_xdp_cpu_cores")
-            .long("experimental-retransmit-xdp-cpu-cores")
-            .takes_value(true)
-            .value_name("CPU_LIST")
-            .conflicts_with("xdp_cpu_cores")
-            .validator(|value| {
-                validate_cpu_ranges(value, "--experimental-retransmit-xdp-cpu-cores")
-            })
-            .help(
-                "Enable XDP retransmit on the specified CPU cores. Use --xdp-cpu-cores instead",
-            ),
-        replaced_by: "xdp-cpu-cores",
-    );
-    add_arg!(
-        // deprecated in v4.1.0
-        Arg::with_name("experimental_retransmit_xdp_interface")
-            .long("experimental-retransmit-xdp-interface")
-            .takes_value(true)
-            .value_name("INTERFACE")
-            .conflicts_with("xdp_interface")
-            .requires("experimental_retransmit_xdp_cpu_cores")
-            .help("Network interface to use for XDP retransmit. Use --xdp-interface instead"),
-        replaced_by: "xdp-interface",
-    );
-    add_arg!(
-        // deprecated in v4.1.0
-        Arg::with_name("experimental_retransmit_xdp_zero_copy")
-            .long("experimental-retransmit-xdp-zero-copy")
+        // deprecated in v4.3.0
+        Arg::with_name("disable_banking_trace")
+            .long("disable-banking-trace")
+            .conflicts_with("banking_trace_dir_byte_limit")
             .takes_value(false)
-            .conflicts_with("xdp_zero_copy")
-            .requires("experimental_retransmit_xdp_cpu_cores")
-            .help("Enable XDP zero copy. Use --xdp-zero-copy instead"),
-        replaced_by: "xdp-zero-copy",
+            .help("Disables the banking trace. No-op, banking trace is disabled by default."),
     );
     add_arg!(
-        // deprecated in v4.0.0
-        Arg::with_name("tpu_connection_pool_size")
-            .long("tpu-connection-pool-size")
+        // deprecated in v4.3.0
+        Arg::with_name("limit_ledger_size")
+            .long("limit-ledger-size")
+            .value_name("SHRED_COUNT")
+            .takes_value(true)
+            .min_values(0)
+            .max_values(1)
+            /* .default_value() intentionally not used here! */
+            .conflicts_with("limit_blockstore_size")
+            .help("Keep this amount of shreds in root slots."),
+        replaced_by: "limit-blockstore-size",
+    );
+    add_arg!(
+        // deprecated in v4.5.0
+        Arg::with_name("require_tower")
+            .long("require-tower")
+            .takes_value(false)
+            .help("Refuse to start if saved tower state is not found"),
+        usage_warning: "The --require-tower flag has been deprecated and will be removed in the \
+            future. The flag is only relevant to TowerBFT and setting it is now a no-op.",
+    );
+    add_arg!(
+        // deprecated in v4.5.0
+        Arg::with_name("tpu_max_connections_per_peer")
+            .long("tpu-max-connections-per-peer")
+            .takes_value(true)
+            .validator(is_parsable::<u32>)
+            .help(
+                "Controls the max concurrent connections per IpAddr or staked identity. Overrides \
+                 tpu-max-connections-per-unstaked-peer and tpu-max-connections-per-staked-peer",
+            ),
+        usage_warning: "It still overrides --tpu-max-connections-per-unstaked-peer and \
+                        --tpu-max-connections-per-staked-peer, but will be removed in a future \
+                        release. Set both of those instead.",
+    );
+    add_arg!(
+        // deprecated in v4.5.0
+        Arg::with_name("tpu_vote_transaction_receive_threads")
+            .long("tpu-vote-transaction-receive-threads")
+            .value_name("NUMBER")
             .takes_value(true)
             .validator(is_parsable::<usize>)
-            .help("Controls the TPU connection pool size per remote address"),
-         usage_warning:"This parameter is misleading, avoid setting it",
+            .help("No-op; the TPU vote QUIC server has been removed"),
+        usage_warning: "Votes are no longer received over QUIC on the TPU vote port.",
     );
     res
 }
@@ -248,7 +237,7 @@ pub struct DefaultArgs {
     pub dynamic_port_range: String,
     pub ledger_path: String,
 
-    pub tower_storage: String,
+    #[deprecated(since = "4.5.0", note = "Unused")]
     pub send_transaction_service_config: send_transaction_service::Config,
 
     pub maximum_local_snapshot_age: String,
@@ -279,9 +268,8 @@ pub struct DefaultArgs {
     pub tpu_max_streams_per_ms: String,
 
     pub num_quic_endpoints: String,
-    pub vote_use_quic: String,
+    pub num_votor_endpoints: String,
 
-    pub banking_trace_dir_byte_limit: String,
     pub block_production_pacing_fill_time_millis: String,
 
     pub thread_args: DefaultThreadArgs,
@@ -294,7 +282,7 @@ impl DefaultArgs {
             ledger_path: "ledger".to_string(),
             dynamic_port_range: format!("{}-{}", VALIDATOR_PORT_RANGE.0, VALIDATOR_PORT_RANGE.1),
             maximum_local_snapshot_age: "2500".to_string(),
-            tower_storage: "file".to_string(),
+            #[allow(deprecated)]
             send_transaction_service_config: send_transaction_service::Config::default(),
             maximum_full_snapshot_archives_to_retain: DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN
                 .to_string(),
@@ -319,7 +307,6 @@ impl DefaultArgs {
             accounts_shrink_ratio: DEFAULT_ACCOUNTS_SHRINK_RATIO.to_string(),
             tpu_max_connections_per_ipaddr_per_minute:
                 DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE.to_string(),
-            vote_use_quic: DEFAULT_VOTE_USE_QUIC.to_string(),
             tpu_max_connections_per_unstaked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER
                 .to_string(),
             tpu_max_connections_per_staked_peer: DEFAULT_MAX_QUIC_CONNECTIONS_PER_STAKED_PEER
@@ -332,7 +319,7 @@ impl DefaultArgs {
             tpu_max_fwd_unstaked_connections: 0.to_string(),
             tpu_max_streams_per_ms: DEFAULT_MAX_STREAMS_PER_MS.to_string(),
             num_quic_endpoints: DEFAULT_QUIC_ENDPOINTS.to_string(),
-            banking_trace_dir_byte_limit: BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT.to_string(),
+            num_votor_endpoints: DEFAULT_NUM_VOTOR_QUIC_ENDPOINTS.to_string(),
             block_production_pacing_fill_time_millis: BankingStage::default_fill_time_millis()
                 .to_string(),
             thread_args: DefaultThreadArgs::default(),
@@ -354,6 +341,7 @@ pub fn port_validator(port: String) -> Result<(), String> {
 
 pub fn port_range_validator(port_range: String) -> Result<(), String> {
     if let Some((start, end)) = solana_net_utils::parse_port_range(&port_range) {
+        // The port range is half-open: [start, end)
         if end - start < MINIMUM_VALIDATOR_PORT_RANGE_WIDTH {
             Err(format!(
                 "Port range is too small.  Try --dynamic-port-range {}-{}",
@@ -400,7 +388,7 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .takes_value(true)
                 .validator(is_url_or_moniker)
                 .help(
-                    "URL for Solana's JSON RPC or moniker (or their first letter): [mainnet-beta, \
+                    "URL for Solana's JSON RPC or moniker (or their first letter): [mainnet, \
                      testnet, devnet, localhost]",
                 ),
         )
@@ -655,8 +643,12 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .long("dynamic-port-range")
                 .value_name("MIN_PORT-MAX_PORT")
                 .takes_value(true)
+                .default_value(&default_args.dynamic_port_range)
                 .validator(port_range_validator)
-                .help("Range to use for dynamically assigned ports [default: 1024-65535]"),
+                .help(
+                    "Range to use for dynamically assigned ports. MIN_PORT-MAX_PORT yields the \
+                     range [MIN_PORT, MAX_PORT)",
+                ),
         )
         .arg(
             Arg::with_name("bind_address")
@@ -768,12 +760,27 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 ),
         )
         .arg(
+            // deprecated in v4.3.0
             Arg::with_name("limit_ledger_size")
                 .long("limit-ledger-size")
                 .value_name("SHRED_COUNT")
                 .takes_value(true)
-                .default_value(default_args.limit_ledger_size.as_str())
+                .min_values(0)
+                .max_values(1)
+                .conflicts_with("limit_blockstore_size")
                 .help("Keep this amount of shreds in root slots."),
+        )
+        .arg(
+            Arg::with_name("limit_blockstore_size")
+                .long("limit-blockstore-size")
+                .value_name("SHRED_COUNT")
+                .takes_value(true)
+                .default_value(default_args.limit_blockstore_size.as_str())
+                .help(
+                    "Limit the number of total shreds that the Blockstore retains. Once the \
+                     Blockstore reaches this capacity, shreds will be purged in a FIFO (oldest \
+                     slots first) manner.",
+                ),
         )
         .arg(
             Arg::with_name("faucet_sol")
@@ -828,6 +835,12 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
                 .help("Enables external processes to connect and manage block production"),
         )
         .arg(
+            Arg::with_name("alpenglow")
+                .long("alpenglow")
+                .takes_value(false)
+                .help("Activate Alpenglow at genesis"),
+        )
+        .arg(
             Arg::with_name("deactivate_feature")
                 .long("deactivate-feature")
                 .takes_value(true)
@@ -878,7 +891,8 @@ pub fn test_app<'a>(version: &'a str, default_args: &'a DefaultTestArgs) -> App<
 pub struct DefaultTestArgs {
     pub rpc_port: String,
     pub faucet_port: String,
-    pub limit_ledger_size: String,
+    pub dynamic_port_range: String,
+    pub limit_blockstore_size: String,
     pub faucet_sol: String,
     pub faucet_time_slice_secs: String,
 }
@@ -888,11 +902,10 @@ impl DefaultTestArgs {
         DefaultTestArgs {
             rpc_port: 8899.to_string(),
             faucet_port: FAUCET_PORT.to_string(),
-            /* 10,000 was derived empirically by watching the size
-             * of the rocksdb/ directory self-limit itself to the
-             * 40MB-150MB range when running `solana-test-validator`
-             */
-            limit_ledger_size: 10_000.to_string(),
+            dynamic_port_range: format!("{}-{}", VALIDATOR_PORT_RANGE.0, VALIDATOR_PORT_RANGE.1),
+            // See comments in ledger/src/blockstore/cleanup_service.rs for more
+            // details, but 800k shreds is approximately 1 GB of space
+            limit_blockstore_size: 800_000.to_string(),
             faucet_sol: (1_000_000.).to_string(),
             faucet_time_slice_secs: (faucet::TIME_SLICE).to_string(),
         }

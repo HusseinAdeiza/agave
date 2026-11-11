@@ -2,11 +2,11 @@
 pull_request_rules:
   - name: label changes from community
     conditions:
-      - author≠@agave-external-triage
       - author≠@anza
       - author≠mergify[bot]
       - author≠dependabot[bot]
       - author≠github-actions[bot]
+      - author≠agave-version-bumper[bot]
     actions:
       label:
         add:
@@ -14,11 +14,11 @@ pull_request_rules:
           - need:merge-assist
   - name: request review for community changes
     conditions:
-      - author≠@agave-external-triage
       - author≠@anza
       - author≠mergify[bot]
       - author≠dependabot[bot]
       - author≠github-actions[bot]
+      - author≠agave-version-bumper[bot]
       # Only request reviews from the pr subscribers group if no one
       # has reviewed the community PR yet. These checks only match
       # reviewers with admin, write or maintain permission on the repository.
@@ -30,153 +30,33 @@ pull_request_rules:
       request_reviews:
         teams:
           - "@anza-xyz/community-pr-subscribers"
-  - name: label changes from agave-external-triage
+  - name: v4.4 backport
     conditions:
-      - author≠@anza
-      - author≠mergify[bot]
-      - author≠dependabot[bot]
-      - author≠github-actions[bot]
-      - author=@agave-external-triage
-    actions:
-      label:
-        add:
-          - need:merge-assist
-  - name: automatic merge (squash) on CI success
-    conditions:
-      - and:
-        - status-success=buildkite/agave
-        - status-success=ci-gate
-        - label=automerge
-        - label!=no-automerge
-        - or:
-          # only require docs checks if docs files changed
-          - -files~=^docs/
-          - status-success=build & deploy docs
-        - or:
-          - -files~=(\.rs|Cargo\.toml|Cargo\.lock|\.github/scripts/cargo-clippy-before-script\.sh|\.github/workflows/cargo\.yml)$
-          - or:
-            - check-success=clippy-nightly (macos-latest)
-            - check-success=clippy-nightly (macos-latest-large)
-        - or:
-          - -files~=(\.rs|Cargo\.toml|Cargo\.lock|cargo-build-sbf|cargo-test-sbf|ci/downstream-projects/run-spl\.sh|\.github/workflows/downstream-project-spl\.yml)$
-          - and:
-            - status-success=check (associated-token-account)
-            - status-success=check (feature-proposal)
-            - status-success=check (instruction-padding)
-            - status-success=check (memo)
-            - status-success=check (record)
-            - status-success=check (single-pool)
-            - status-success=check (slashing)
-            - status-success=check (stake-pool)
-            - status-success=check (token-2022)
-            - status-success=test_cli (single-pool)
-            - status-success=test_cli (token-2022)
-            - status-success=cargo-test-sbf (associated-token-account)
-            - status-success=cargo-test-sbf (feature-proposal)
-            - status-success=cargo-test-sbf (instruction-padding)
-            - status-success=cargo-test-sbf (memo)
-            - status-success=cargo-test-sbf (record)
-            - status-success=cargo-test-sbf (single-pool)
-            - status-success=cargo-test-sbf (slashing)
-            - status-success=cargo-test-sbf (stake-pool)
-            - status-success=cargo-test-sbf (token-2022)
-        - or:
-          - -files~=(Cargo\.toml|.github/workflows/crate-check\.yml|ci/check-crates\.sh)$
-          - check-success=crate check
-    actions:
-      merge:
-        method: squash
-  - name: remove automerge label on CI failure
-    conditions:
-      - and:
-        - label=automerge
-        - "#status-failure!=0"
-        - -merged
-    actions:
-      label:
-        remove:
-          - automerge
-      comment:
-        message: automerge label removed due to a CI failure
-  - name: v3.1 feature-gate backport
-    conditions:
-      - label=v3.1
-      - label=feature-gate
+      - label=v4.4
     actions:
       backport:
-        assignees: &BackportAssignee
-          - "{{ merged_by|replace('mergify[bot]', label|select('equalto', 'community')|first|default(author)|replace('community', '@anza-xyz/community-pr-subscribers')) }}"
-        title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
-        ignore_conflicts: true
-        labels:
-          - feature-gate
-        branches:
-          - v3.1
-  - name: v3.1 non-feature-gate backport
-    conditions:
-      - label=v3.1
-      - label!=feature-gate
-    actions:
-      backport:
-        assignees: *BackportAssignee
+        assignees:
+          - "{{ merged_by }}"
         title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
         ignore_conflicts: true
         branches:
-          - v3.1
-  - name: v4.0 feature-gate backport
+          - v4.4
+  - name: v4.5 backport
     conditions:
-      - label=v4.0
-      - label=feature-gate
+      - label=v4.5
     actions:
       backport:
-        assignees: *BackportAssignee
-        title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
-        ignore_conflicts: true
-        labels:
-          - feature-gate
-        branches:
-          - v4.0
-  - name: v4.0 non-feature-gate backport
-    conditions:
-      - label=v4.0
-      - label!=feature-gate
-    actions:
-      backport:
-        assignees: *BackportAssignee
+        assignees:
+          - "{{ merged_by }}"
         title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
         ignore_conflicts: true
         branches:
-          - v4.0
-  - name: v4.1 feature-gate backport
-    conditions:
-      - label=v4.1
-      - label=feature-gate
-    actions:
-      backport:
-        assignees: *BackportAssignee
-        title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
-        ignore_conflicts: true
-        labels:
-          - feature-gate
-        branches:
-          - v4.1
-  - name: v4.1 non-feature-gate backport
-    conditions:
-      - label=v4.1
-      - label!=feature-gate
-    actions:
-      backport:
-        assignees: *BackportAssignee
-        title: "{{ destination_branch }}: {{ title }} (backport of #{{ number }})"
-        ignore_conflicts: true
-        branches:
-          - v4.1
+          - v4.5
   - name: backport warning comment
     conditions:
       - or:
-        - label=v3.1
-        - label=v4.0
-        - label=v4.1
+        - label=v4.4
+        - label=v4.5
     actions:
       comment:
         message: >
@@ -189,6 +69,14 @@ pull_request_rules:
           into master and ride the normal stabilization schedule. Exceptions
           include CI/metrics changes, CLI improvements and documentation
           updates on a case by case basis.
+  - name: close PRs against EoL version branches
+    conditions:
+      - base ~= ^v[0-9]+\.[0-9]+$
+      - base != v4.4
+      - base != v4.5
+    actions:
+      close:
+        message: "`{{base}}` is end-of-life and no longer accepts changes."
   - name: Reminder to update RPC clients for changes in `rpc/`
     conditions:
       - or:
@@ -226,8 +114,34 @@ pull_request_rules:
           keep refactors to a minimum.
 
 commands_restrictions:
-  # The author of copied PRs is the Mergify user.
-  # Restrict `copy` access to Core Contributors
+  # Only users with write access to the repository may run Mergify commands.
   copy:
     conditions:
-    - author=@anza
+      # The author of copied PRs is the Mergify user.
+      # Restrict `copy` to Core Contributor PRs.
+      - author=@anza
+      - sender-permission>=write
+  backport:
+    conditions:
+      - sender-permission>=write
+  dequeue:
+    conditions:
+      - sender-permission>=write
+  queue:
+    conditions:
+      - sender-permission>=write
+  rebase:
+    conditions:
+      - sender-permission>=write
+  refresh:
+    conditions:
+      - sender-permission>=write
+  requeue:
+    conditions:
+      - sender-permission>=write
+  squash:
+    conditions:
+      - sender-permission>=write
+  update:
+    conditions:
+      - sender-permission>=write

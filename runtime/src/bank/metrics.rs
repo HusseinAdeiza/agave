@@ -1,7 +1,7 @@
 use {
     crate::bank::Bank,
     solana_clock::{Epoch, Slot},
-    solana_program_runtime::loaded_programs::{ForkGraph, ProgramCache},
+    solana_program_runtime::program_cache::{fork_graph::ForkGraph, global::ProgramCache},
     std::sync::atomic::{
         AtomicU64,
         Ordering::{self, Relaxed},
@@ -20,9 +20,8 @@ pub(crate) struct NewEpochTimings {
 pub(crate) struct RewardsMetrics {
     pub(crate) calculate_points_us: AtomicU64,
     pub(crate) redeem_rewards_us: u64,
-    pub(crate) store_stake_accounts_us: AtomicU64,
-    pub(crate) store_commission_accounts_us: AtomicU64,
-    pub(crate) load_and_reward_commission_accounts_us: u64,
+    pub(crate) store_epoch_boundary_accounts_us: AtomicU64,
+    pub(crate) load_and_update_epoch_boundary_accounts_us: u64,
 }
 
 pub(crate) struct NewBankTimings {
@@ -44,7 +43,6 @@ pub(crate) struct NewBankTimings {
     pub(crate) cache_preparation_time_us: u64,
     pub(crate) update_sysvars_time_us: u64,
     pub(crate) fill_sysvar_cache_time_us: u64,
-    pub(crate) populate_cache_for_accounts_lt_hash_us: u64,
 }
 
 pub(crate) struct PrepareBlockExecutionStats {
@@ -53,8 +51,6 @@ pub(crate) struct PrepareBlockExecutionStats {
     pub(crate) cache_preparation_time_us: u64,
     pub(crate) update_sysvars_time_us: u64,
     pub(crate) fill_sysvar_cache_time_us: u64,
-    pub(crate) num_accounts_modified_this_slot: usize,
-    pub(crate) populate_cache_for_accounts_lt_hash_us: u64,
 }
 
 pub(crate) fn report_new_epoch_metrics(
@@ -101,18 +97,13 @@ pub(crate) fn report_new_epoch_metrics(
         ),
         ("redeem_rewards_us", metrics.redeem_rewards_us, i64),
         (
-            "store_stake_accounts_us",
-            metrics.store_stake_accounts_us.load(Relaxed),
+            "store_epoch_boundary_accounts_us",
+            metrics.store_epoch_boundary_accounts_us.load(Relaxed),
             i64
         ),
         (
-            "store_commission_accounts_us",
-            metrics.store_commission_accounts_us.load(Relaxed),
-            i64
-        ),
-        (
-            "load_and_reward_commission_accounts_us",
-            metrics.load_and_reward_commission_accounts_us,
+            "load_and_update_epoch_boundary_accounts_us",
+            metrics.load_and_update_epoch_boundary_accounts_us,
             i64
         ),
     );
@@ -122,7 +113,6 @@ pub(crate) fn report_new_bank_metrics(
     slot: Slot,
     parent_slot: Slot,
     block_height: u64,
-    num_accounts_modified_this_slot: usize,
     timings: NewBankTimings,
 ) {
     datapoint_info!(
@@ -172,16 +162,6 @@ pub(crate) fn report_new_bank_metrics(
             timings.fill_sysvar_cache_time_us,
             i64
         ),
-        (
-            "num_accounts_modified_this_slot",
-            num_accounts_modified_this_slot,
-            i64
-        ),
-        (
-            "populate_cache_for_accounts_lt_hash_us",
-            timings.populate_cache_for_accounts_lt_hash_us,
-            i64
-        ),
     );
 }
 
@@ -195,6 +175,8 @@ pub(crate) struct RewardsStoreMetrics {
     pub(crate) total_stake_accounts_count: usize,
     pub(crate) distributed_rewards: u64,
     pub(crate) burned_rewards: u64,
+    pub(crate) distributed_block_rewards: u64,
+    pub(crate) burned_block_rewards: u64,
     pub(crate) pre_capitalization: u64,
     pub(crate) post_capitalization: u64,
 }
@@ -225,6 +207,12 @@ pub(crate) fn report_partitioned_reward_metrics(bank: &Bank, timings: RewardsSto
         ),
         ("distributed_rewards", timings.distributed_rewards, i64),
         ("burned_rewards", timings.burned_rewards, i64),
+        (
+            "distributed_block_rewards",
+            timings.distributed_block_rewards,
+            i64
+        ),
+        ("burned_block_rewards", timings.burned_block_rewards, i64),
         ("pre_capitalization", timings.pre_capitalization, i64),
         ("post_capitalization", timings.post_capitalization, i64),
     );
@@ -241,6 +229,7 @@ pub(crate) fn report_loaded_programs_stats<T: ForkGraph>(cache: &ProgramCache<T>
     let lost_insertions = stats.lost_insertions.load(Ordering::Relaxed);
     let replacements = stats.replacements.load(Ordering::Relaxed);
     let one_hit_wonders = stats.one_hit_wonders.load(Ordering::Relaxed);
+    let prunes_stale = stats.prunes_stale.load(Ordering::Relaxed);
     let prunes_orphan = stats.prunes_orphan.load(Ordering::Relaxed);
     let prunes_environment = stats.prunes_environment.load(Ordering::Relaxed);
     let empty_entries = stats.empty_entries.load(Ordering::Relaxed);
@@ -256,6 +245,7 @@ pub(crate) fn report_loaded_programs_stats<T: ForkGraph>(cache: &ProgramCache<T>
         ("lost_insertions", lost_insertions, i64),
         ("replace_entry", replacements, i64),
         ("one_hit_wonders", one_hit_wonders, i64),
+        ("prunes_stale", prunes_stale, i64),
         ("prunes_orphan", prunes_orphan, i64),
         ("prunes_environment", prunes_environment, i64),
         ("empty_entries", empty_entries, i64),

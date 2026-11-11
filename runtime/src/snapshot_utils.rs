@@ -1,20 +1,21 @@
 #[cfg(feature = "dev-context-only-utils")]
-use solana_accounts_db::utils::create_accounts_run_and_snapshot_dirs;
+use solana_accounts_db::utils::create_accounts_run_dir;
 use {
     crate::{
         bank::BankFieldsToDeserialize,
         serde_snapshot::{
-            self, AccountsDbFields, ExtraFieldsToSerialize, SerdeObsoleteAccountsMap,
-            SerializableAccountStorageEntry, SnapshotAccountsDbFields, SnapshotBankFields,
-            SnapshotStreams,
+            self, AccountsDbFields, ExtraFieldsToSerialize, LegacyObsoleteAccountsMap,
+            LegacyStoragesList, SerdeObsoleteAccountsMap, SnapshotAccountsDbFields,
+            SnapshotBankFields, SnapshotStreams, StartupHints, StorageListItem, StoragesList,
         },
         snapshot_package::BankSnapshotPackage,
         snapshot_utils::snapshot_storage_rebuilder::{
-            SnapshotStorageRebuilder, get_slot_and_append_vec_id,
+            ParsedSplit, ParsedStorageFilename, ParsedStorageFormat, SnapshotStorageRebuilder,
+            parse_storage_filename, storages_list_to_map,
         },
     },
     agave_fs::{
-        FileInfo,
+        FileInfo, FileSize,
         buffered_reader::large_file_buf_reader,
         buffered_writer::{SizeLimitedWriter, large_file_buf_writer},
         io_setup::IoSetupState,
@@ -22,9 +23,7 @@ use {
     agave_snapshots::{
         ArchiveFormat, Result, SnapshotArchiveKind, SnapshotVersion, archive_snapshot,
         error::{
-            AddBankSnapshotError, GetSnapshotAccountsHardLinkDirError,
-            HardLinkStoragesToSnapshotError, SnapshotError, SnapshotFastbootError,
-            SnapshotNewFromDirError,
+            AddBankSnapshotError, SnapshotError, SnapshotFastbootError, SnapshotNewFromDirError,
         },
         paths::{self as snapshot_paths, incremental_snapshot_archives_iter},
         snapshot_archive_info::{
@@ -42,9 +41,8 @@ use {
     solana_accounts_db::{
         account_storage::AccountStorageMap,
         account_storage_entry::AccountStorageEntry,
-        accounts_db::AtomicAccountsFileId,
-        accounts_file::AccountsFile,
-        utils::{ACCOUNTS_RUN_DIR, ACCOUNTS_SNAPSHOT_DIR, move_and_async_delete_path},
+        accounts_db::{AccountsFileId, AtomicAccountsFileId},
+        utils::{ACCOUNTS_SNAPSHOT_DIR, move_and_async_delete_path},
     },
     solana_clock::Slot,
     solana_measure::{measure::Measure, measure_time, measure_us},
@@ -64,17 +62,24 @@ use {
     wincode::io::std_read::ReadAdapter,
 };
 
-pub mod snapshot_storage_rebuilder;
+pub(crate) mod snapshot_storage_rebuilder;
 
 /// Limit the size of the obsolete accounts file
 /// If it exceeds this limit, remove the file which will force restore from archives
 /// Limit is set assuming 24 bytes per entry, 5% of 10 billion accounts
 /// = 500 million entries * 24 bytes = 12 GB
 pub const MAX_OBSOLETE_ACCOUNTS_FILE_SIZE: u64 = 1024 * 1024 * 1024 * 12; // 12 GB
+/// Limit the size of the storages list file.
+/// Each `(slot, id)` entry encodes to 12 bytes; 100 MiB covers ~8.7 million entries, well past
+/// any realistic storage count.
+pub const MAX_STORAGES_LIST_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MiB
+/// The file holds a handful of scalars; this conservative bound limits the impact of bad state.
+pub const MAX_STARTUP_HINTS_FILE_SIZE: u64 = 4096;
 pub const MAX_SNAPSHOT_DATA_FILE_SIZE: u64 = 32 * 1024 * 1024 * 1024; // 32 GiB
 const MAX_SNAPSHOT_VERSION_FILE_SIZE: u64 = 8; // byte
-/// Buffer size that allows several concurrent reads using default io-uring reader read size (1MiB)
-const OBSOLETE_ACCOUNTS_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
+/// Buffer size for reading auxiliary per-snapshot files (obsolete accounts, storages list).
+/// Sized to allow several concurrent reads at the default io-uring reader read size (1MiB).
+const AUX_SNAPSHOT_FILE_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
 
 // Snapshot Fastboot Version History
 // Legacy - No fastboot version file, storages flushed file presence determines if snapshot is loadable
@@ -82,7 +87,15 @@ const OBSOLETE_ACCOUNTS_READ_BUF_SIZE: usize = 4 * 1024 * 1024;
 // 2.0.0 - Obsolete Accounts File added, storages flushed file not written anymore
 //         Snapshots created with version 2.0.0 will not fastboot to older versions
 //         Snapshots created with versions <2.0.0 will fastboot to version 2.0.0
-const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(2, 0, 0);
+// 3.0.0 - Storages List file added, replaces the per-storage hardlink dirs.
+//         Note: 2.0.0 validators cannot fastboot from 3.0.0 snapshots because the per-storage
+//         hardlink dirs they rely on are no longer written; they must fall back to archive.
+// 3.1.0 - Startup hints file added. Optional tuning state, so snapshots fastboot in either
+//         direction between 3.0.0 and 3.1.0; a validator finding no hints just skips the tuning.
+// 4.0.0 - Obsolete accounts store u32 logical offsets instead of u64 AppendVec file offsets.
+//         Version 3 is converted in memory when loading; older validators cannot load v4.
+// 5.0.0 - Added in agave v4.5. The storages list file format changed to support SplitFile.
+const SNAPSHOT_FASTBOOT_VERSION: Version = Version::new(5, 0, 0);
 
 /// Information about a bank snapshot. Namely the slot of the bank, the path to the snapshot, and
 /// the kind of the snapshot.
@@ -186,17 +199,6 @@ impl BankSnapshotInfo {
     }
 }
 
-/// When constructing a bank a snapshot, traditionally the snapshot was from a snapshot archive.  Now,
-/// the snapshot can be from a snapshot directory, or from a snapshot archive.  This is the flag to
-/// indicate which.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SnapshotFrom {
-    /// Build from the snapshot archive
-    Archive,
-    /// Build directly from the bank snapshot directory
-    Dir,
-}
-
 /// Helper type when rebuilding from snapshots.  Designed to handle when rebuilding from just a
 /// full snapshot, or from both a full snapshot and an incremental snapshot.
 #[derive(Debug)]
@@ -211,7 +213,7 @@ pub struct UnarchivedSnapshot {
     unpack_dir: TempDir,
     pub storage: AccountStorageMap,
     pub bank_fields: BankFieldsToDeserialize,
-    pub(crate) accounts_db_fields: AccountsDbFields<SerializableAccountStorageEntry>,
+    pub(crate) accounts_db_fields: AccountsDbFields,
     pub unpacked_snapshots_dir_and_version: UnpackedSnapshotsDirAndVersion,
     pub measure_untar: Measure,
 }
@@ -222,7 +224,7 @@ pub struct UnarchivedSnapshots {
     pub full_storage: AccountStorageMap,
     pub incremental_storage: Option<AccountStorageMap>,
     pub bank_fields: SnapshotBankFields,
-    pub accounts_db_fields: SnapshotAccountsDbFields<SerializableAccountStorageEntry>,
+    pub accounts_db_fields: SnapshotAccountsDbFields,
     pub full_unpacked_snapshots_dir_and_version: UnpackedSnapshotsDirAndVersion,
     pub incremental_unpacked_snapshots_dir_and_version: Option<UnpackedSnapshotsDirAndVersion>,
     pub full_measure_untar: Measure,
@@ -250,71 +252,6 @@ pub struct UnpackedSnapshotsDirAndVersion {
 pub(crate) struct StorageAndNextAccountsFileId {
     pub storage: AccountStorageMap,
     pub next_append_vec_id: AtomicAccountsFileId,
-}
-
-/// The account snapshot directories under <account_path>/snapshot/<slot> contain account files hardlinked
-/// from <account_path>/run taken at snapshot <slot> time.  They are referenced by the symlinks from the
-/// bank snapshot dir snapshot/<slot>/accounts_hardlinks/.  We observed that sometimes the bank snapshot dir
-/// could be deleted but the account snapshot directories were left behind, possibly by some manual operations
-/// or some legacy code not using the symlinks to clean up the account snapshot hardlink directories.
-/// This function cleans up any account snapshot directories that are no longer referenced by the bank
-/// snapshot dirs, to ensure proper snapshot operations.
-pub fn clean_orphaned_account_snapshot_dirs(
-    bank_snapshots_dir: impl AsRef<Path>,
-    account_snapshot_paths: &[PathBuf],
-) -> io::Result<()> {
-    // Create the HashSet of the account snapshot hardlink directories referenced by the snapshot dirs.
-    // This is used to clean up any hardlinks that are no longer referenced by the snapshot dirs.
-    let mut account_snapshot_dirs_referenced = HashSet::new();
-    let snapshots = get_bank_snapshots(bank_snapshots_dir);
-    for snapshot in snapshots {
-        let account_hardlinks_dir = snapshot
-            .snapshot_dir
-            .join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-        // loop through entries in the snapshot_hardlink_dir, read the symlinks, add the target to the HashSet
-        let Ok(read_dir) = fs::read_dir(&account_hardlinks_dir) else {
-            // The bank snapshot may not have a hard links dir with the storages.
-            // This is fine, and happens for bank snapshots we do *not* fastboot from.
-            // In this case, log it and go to the next bank snapshot.
-            debug!(
-                "failed to read account hardlinks dir '{}'",
-                account_hardlinks_dir.display(),
-            );
-            continue;
-        };
-        for entry in read_dir {
-            let path = entry?.path();
-            let target = fs::read_link(&path).map_err(|err| {
-                IoError::other(format!(
-                    "failed to read symlink '{}': {err}",
-                    path.display(),
-                ))
-            })?;
-            account_snapshot_dirs_referenced.insert(target);
-        }
-    }
-
-    // loop through the account snapshot hardlink directories, if the directory is not in the account_snapshot_dirs_referenced set, delete it
-    for account_snapshot_path in account_snapshot_paths {
-        let read_dir = fs::read_dir(account_snapshot_path).map_err(|err| {
-            IoError::other(format!(
-                "failed to read account snapshot dir '{}': {err}",
-                account_snapshot_path.display(),
-            ))
-        })?;
-        for entry in read_dir {
-            let path = entry?.path();
-            if !account_snapshot_dirs_referenced.contains(&path) {
-                info!(
-                    "Removing orphaned account snapshot hardlink directory '{}'...",
-                    path.display()
-                );
-                move_and_async_delete_path(&path);
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Purges incomplete bank snapshots
@@ -423,10 +360,15 @@ fn is_bank_snapshot_loadable(
 fn is_snapshot_fastboot_compatible(
     version: &Version,
 ) -> std::result::Result<bool, SnapshotFastbootError> {
-    if version.major <= SNAPSHOT_FASTBOOT_VERSION.major {
-        Ok(true)
-    } else {
-        Err(SnapshotFastbootError::IncompatibleVersion(version.clone()))
+    match version.major {
+        5 => Ok(true),
+        4 => Ok(true),
+        3 => Ok(true),
+        v if v > SNAPSHOT_FASTBOOT_VERSION.major => {
+            Err(SnapshotFastbootError::IncompatibleVersion(version.clone()))
+        }
+        // Older format we no longer know how to load — fall back to archive.
+        _ => Ok(false),
     }
 }
 
@@ -533,7 +475,8 @@ pub fn serialize_snapshot(
     snapshot_version: SnapshotVersion,
     bank_snapshot_package: BankSnapshotPackage,
     snapshot_storages: &[Arc<AccountStorageEntry>],
-    should_flush_and_hard_link_storages: bool,
+    should_finalize: bool,
+    startup_hints: &StartupHints,
     io_setup: &IoSetupState,
 ) -> Result<BankSnapshotInfo> {
     let BankSnapshotPackage {
@@ -580,7 +523,6 @@ pub fn serialize_snapshot(
                 stream,
                 bank_fields,
                 bank_hash_stats,
-                snapshot_storages,
                 extra_fields,
             )?;
             Ok(())
@@ -594,8 +536,12 @@ pub fn serialize_snapshot(
         let status_cache_path =
             bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_STATUS_CACHE_FILENAME);
         let (status_cache_consumed_size, status_cache_serialize_us) = measure_us!(
-            serde_snapshot::serialize_status_cache(status_cache_slot_deltas, &status_cache_path)
-                .map_err(|err| AddBankSnapshotError::SerializeStatusCache(Box::new(err)))?
+            serde_snapshot::serialize_status_cache(
+                status_cache_slot_deltas,
+                &status_cache_path,
+                io_setup,
+            )
+            .map_err(|err| AddBankSnapshotError::SerializeStatusCache(Box::new(err)))?
         );
 
         let version_path = bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_VERSION_FILENAME);
@@ -604,19 +550,20 @@ pub fn serialize_snapshot(
                 .map_err(|err| AddBankSnapshotError::WriteSnapshotVersionFile(err, version_path))?
         );
 
-        let (flush_storages_us, hard_link_storages_us, serialize_obsolete_accounts_us) =
-            if should_flush_and_hard_link_storages {
+        let (flush_storages_us, serialize_obsolete_accounts_us, write_storages_list_us) =
+            if should_finalize {
                 let flush_measure = Measure::start("");
                 for storage in snapshot_storages {
+                    // The storage file must exist in order for fastboot on restart to work.
+                    // By default, storage files are deleted when their owning AccountStorageEntry
+                    // is dropped, so we must disable that for all storages.
+                    // And it must be done *before* calling flush().
+                    storage.disable_remove_on_drop();
                     storage.flush().map_err(|err| {
                         AddBankSnapshotError::FlushStorage(err, storage.path().to_path_buf())
                     })?;
                 }
                 let flush_us = flush_measure.end_as_us();
-                let (_, hard_link_us) = measure_us!(
-                    hard_link_storages_to_snapshot(&bank_snapshot_dir, slot, snapshot_storages)
-                        .map_err(AddBankSnapshotError::HardLinkStorages)?
-                );
 
                 let (_, serialize_obsolete_accounts_us) = measure_us!({
                     write_obsolete_accounts_to_snapshot(
@@ -628,13 +575,25 @@ pub fn serialize_snapshot(
                     .map_err(|err| AddBankSnapshotError::SerializeObsoleteAccounts(Box::new(err)))?
                 });
 
+                let (_, write_storages_list_us) = measure_us!(
+                    write_storages_list_to_snapshot(
+                        &bank_snapshot_dir,
+                        snapshot_storages,
+                        io_setup,
+                    )
+                    .map_err(|err| AddBankSnapshotError::WriteStoragesList(Box::new(err)))?
+                );
+
+                write_startup_hints_to_snapshot(&bank_snapshot_dir, startup_hints, io_setup)
+                    .map_err(|err| AddBankSnapshotError::WriteStartupHints(Box::new(err)))?;
+
                 mark_bank_snapshot_as_loadable(&bank_snapshot_dir)
                     .map_err(AddBankSnapshotError::MarkSnapshotLoadable)?;
 
                 (
                     Some(flush_us),
-                    Some(hard_link_us),
                     Some(serialize_obsolete_accounts_us),
+                    Some(write_storages_list_us),
                 )
             } else {
                 (None, None, None)
@@ -647,10 +606,11 @@ pub fn serialize_snapshot(
             "snapshot_bank",
             ("slot", slot, i64),
             ("bank_size", bank_snapshot_consumed_size, i64),
+            ("num_storages", snapshot_storages.len(), i64),
             ("status_cache_size", status_cache_consumed_size, i64),
             ("flush_storages_us", flush_storages_us, Option<i64>),
-            ("hard_link_storages_us", hard_link_storages_us, Option<i64>),
             ("serialize_obsolete_accounts_us", serialize_obsolete_accounts_us, Option<i64>),
+            ("write_storages_list_us", write_storages_list_us, Option<i64>),
             ("bank_serialize_us", bank_serialize.as_us(), i64),
             ("status_cache_serialize_us", status_cache_serialize_us, i64),
             ("write_version_file_us", write_version_file_us, i64),
@@ -769,13 +729,14 @@ fn serialize_obsolete_accounts(
 fn deserialize_obsolete_accounts(
     bank_snapshot_dir: impl AsRef<Path>,
     maximum_obsolete_accounts_file_size: u64,
+    fastboot_version: &Version,
 ) -> Result<SerdeObsoleteAccountsMap> {
     let obsolete_accounts_path = bank_snapshot_dir
         .as_ref()
         .join(snapshot_paths::SNAPSHOT_OBSOLETE_ACCOUNTS_FILENAME);
     let obsolete_accounts_reader = ReadAdapter::new(large_file_buf_reader(
         &obsolete_accounts_path,
-        OBSOLETE_ACCOUNTS_READ_BUF_SIZE,
+        AUX_SNAPSHOT_FILE_READ_BUF_SIZE,
         &IoSetupState::default(),
     )?);
     // If the file is too large return error
@@ -790,9 +751,128 @@ fn deserialize_obsolete_accounts(
         return Err(IoError::other(error_message).into());
     }
 
-    Ok(serde_snapshot::deserialize_wincode_from(
-        obsolete_accounts_reader,
-    )?)
+    let obsolete_accounts = if fastboot_version.major >= 4 {
+        serde_snapshot::deserialize_wincode_from(obsolete_accounts_reader)?
+    } else {
+        let legacy: LegacyObsoleteAccountsMap =
+            serde_snapshot::deserialize_wincode_from(obsolete_accounts_reader)?;
+        SerdeObsoleteAccountsMap::try_from(legacy)?
+    };
+    Ok(obsolete_accounts)
+}
+
+pub fn write_storages_list_to_snapshot(
+    bank_snapshot_dir: impl AsRef<Path>,
+    snapshot_storages: &[Arc<AccountStorageEntry>],
+    io_setup: &IoSetupState,
+) -> Result<FileSize> {
+    let storages_list = StoragesList::new_from_storages(snapshot_storages);
+    serialize_storages_list_to_snapshot(bank_snapshot_dir, storages_list, io_setup)
+}
+
+fn serialize_storages_list_to_snapshot(
+    bank_snapshot_dir: impl AsRef<Path>,
+    storages_list: StoragesList,
+    io_setup: &IoSetupState,
+) -> Result<FileSize> {
+    let storages_list_path = bank_snapshot_dir
+        .as_ref()
+        .join(snapshot_paths::SNAPSHOT_STORAGES_LIST_FILENAME);
+    let mut file_stream = SizeLimitedWriter::new(
+        large_file_buf_writer(&storages_list_path, io_setup)?,
+        MAX_STORAGES_LIST_FILE_SIZE,
+    );
+    serde_snapshot::serialize_into(&mut file_stream, &storages_list).map_err(|err| {
+        IoError::other(format!(
+            "unable to serialize storages list to file '{}': {err}",
+            storages_list_path.display(),
+        ))
+    })?;
+    Ok(file_stream.bytes_written())
+}
+
+fn deserialize_storages_list(
+    storages_list_path: &Path,
+    maximum_storages_list_file_size: u64,
+    fastboot_version: &Version,
+) -> Result<StoragesList> {
+    let storages_list_reader = ReadAdapter::new(large_file_buf_reader(
+        storages_list_path,
+        AUX_SNAPSHOT_FILE_READ_BUF_SIZE,
+        &IoSetupState::default(),
+    )?);
+    // If the file is too large return error
+    let storages_list_file_metadata = fs::metadata(storages_list_path)?;
+    if storages_list_file_metadata.len() > maximum_storages_list_file_size {
+        let error_message = format!(
+            "too large storages list file to deserialize: '{}' has {} bytes (max size is \
+             {maximum_storages_list_file_size} bytes)",
+            storages_list_path.display(),
+            storages_list_file_metadata.len(),
+        );
+        return Err(IoError::other(error_message).into());
+    }
+
+    let storages_list = if fastboot_version.major >= 5 {
+        serde_snapshot::deserialize_wincode_from(storages_list_reader)?
+    } else {
+        let legacy: LegacyStoragesList =
+            serde_snapshot::deserialize_wincode_from(storages_list_reader)?;
+        StoragesList::from(legacy)
+    };
+    Ok(storages_list)
+}
+
+pub fn write_startup_hints_to_snapshot(
+    bank_snapshot_dir: impl AsRef<Path>,
+    startup_hints: &StartupHints,
+    io_setup: &IoSetupState,
+) -> Result<FileSize> {
+    let startup_hints_path = bank_snapshot_dir
+        .as_ref()
+        .join(snapshot_paths::SNAPSHOT_STARTUP_HINTS_FILENAME);
+    let mut file_stream = SizeLimitedWriter::new(
+        large_file_buf_writer(&startup_hints_path, io_setup)?,
+        MAX_STARTUP_HINTS_FILE_SIZE,
+    );
+    serde_snapshot::serialize_into(&mut file_stream, startup_hints).map_err(|err| {
+        IoError::other(format!(
+            "unable to serialize startup hints to file '{}': {err}",
+            startup_hints_path.display(),
+        ))
+    })?;
+    Ok(file_stream.bytes_written())
+}
+
+/// Reads the startup hints written next to a bank snapshot.
+///
+/// `Ok(None)` when the snapshot predates the hints file or its hints came from a newer version;
+/// any other failure to read a present file is an error.
+pub fn read_startup_hints(bank_snapshot_dir: impl AsRef<Path>) -> Result<Option<StartupHints>> {
+    let startup_hints_path = bank_snapshot_dir
+        .as_ref()
+        .join(snapshot_paths::SNAPSHOT_STARTUP_HINTS_FILENAME);
+    if !startup_hints_path.exists() {
+        return Ok(None);
+    }
+
+    let startup_hints_file_metadata = fs::metadata(&startup_hints_path)?;
+    if startup_hints_file_metadata.len() > MAX_STARTUP_HINTS_FILE_SIZE {
+        let error_message = format!(
+            "too large startup hints file to deserialize: '{}' has {} bytes (max size is \
+             {MAX_STARTUP_HINTS_FILE_SIZE} bytes)",
+            startup_hints_path.display(),
+            startup_hints_file_metadata.len(),
+        );
+        return Err(IoError::other(error_message).into());
+    }
+    let startup_hints_reader = ReadAdapter::new(large_file_buf_reader(
+        &startup_hints_path,
+        AUX_SNAPSHOT_FILE_READ_BUF_SIZE,
+        &IoSetupState::default(),
+    )?);
+
+    Ok(StartupHints::read_from(startup_hints_reader)?)
 }
 
 pub fn serialize_snapshot_data_file<F>(
@@ -961,111 +1041,6 @@ fn check_deserialize_file_consumed(
     Ok(())
 }
 
-/// Return account path from the appendvec path after checking its format.
-fn get_account_path_from_appendvec_path(appendvec_path: &Path) -> Option<PathBuf> {
-    let run_path = appendvec_path.parent()?;
-    let run_file_name = run_path.file_name()?;
-    // All appendvec files should be under <account_path>/run/.
-    // When generating the bank snapshot directory, they are hardlinked to <account_path>/snapshot/<slot>/
-    if run_file_name != ACCOUNTS_RUN_DIR {
-        error!(
-            "The account path {} does not have run/ as its immediate parent directory.",
-            run_path.display()
-        );
-        return None;
-    }
-    let account_path = run_path.parent()?;
-    Some(account_path.to_path_buf())
-}
-
-/// From an appendvec path, derive the snapshot hardlink path.  If the corresponding snapshot hardlink
-/// directory does not exist, create it.
-fn get_snapshot_accounts_hardlink_dir(
-    appendvec_path: &Path,
-    bank_slot: Slot,
-    account_paths: &mut HashSet<PathBuf>,
-    hardlinks_dir: impl AsRef<Path>,
-) -> std::result::Result<PathBuf, GetSnapshotAccountsHardLinkDirError> {
-    let account_path = get_account_path_from_appendvec_path(appendvec_path).ok_or_else(|| {
-        GetSnapshotAccountsHardLinkDirError::GetAccountPath(appendvec_path.to_path_buf())
-    })?;
-
-    let snapshot_hardlink_dir = account_path
-        .join(ACCOUNTS_SNAPSHOT_DIR)
-        .join(bank_slot.to_string());
-
-    // Use the hashset to track, to avoid checking the file system.  Only set up the hardlink directory
-    // and the symlink to it at the first time of seeing the account_path.
-    if !account_paths.contains(&account_path) {
-        let idx = account_paths.len();
-        debug!(
-            "for appendvec_path {}, create hard-link path {}",
-            appendvec_path.display(),
-            snapshot_hardlink_dir.display()
-        );
-        fs::create_dir_all(&snapshot_hardlink_dir).map_err(|err| {
-            GetSnapshotAccountsHardLinkDirError::CreateSnapshotHardLinkDir(
-                err,
-                snapshot_hardlink_dir.clone(),
-            )
-        })?;
-        let symlink_path = hardlinks_dir.as_ref().join(format!("account_path_{idx}"));
-        symlink::symlink_dir(&snapshot_hardlink_dir, &symlink_path).map_err(|err| {
-            GetSnapshotAccountsHardLinkDirError::SymlinkSnapshotHardLinkDir {
-                source: err,
-                original: snapshot_hardlink_dir.clone(),
-                link: symlink_path,
-            }
-        })?;
-        account_paths.insert(account_path);
-    };
-
-    Ok(snapshot_hardlink_dir)
-}
-
-/// Hard-link the files from accounts/ to snapshot/<bank_slot>/accounts/
-/// This keeps the appendvec files alive and with the bank snapshot.  The slot and id
-/// in the file names are also updated in case its file is a recycled one with inconsistent slot
-/// and id.
-pub fn hard_link_storages_to_snapshot(
-    bank_snapshot_dir: impl AsRef<Path>,
-    bank_slot: Slot,
-    snapshot_storages: &[Arc<AccountStorageEntry>],
-) -> std::result::Result<(), HardLinkStoragesToSnapshotError> {
-    let accounts_hardlinks_dir = bank_snapshot_dir
-        .as_ref()
-        .join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-    fs::create_dir_all(&accounts_hardlinks_dir).map_err(|err| {
-        HardLinkStoragesToSnapshotError::CreateAccountsHardLinksDir(
-            err,
-            accounts_hardlinks_dir.clone(),
-        )
-    })?;
-
-    let mut account_paths: HashSet<PathBuf> = HashSet::new();
-    for storage in snapshot_storages {
-        let storage_path = storage.accounts.path();
-        let snapshot_hardlink_dir = get_snapshot_accounts_hardlink_dir(
-            storage_path,
-            bank_slot,
-            &mut account_paths,
-            &accounts_hardlinks_dir,
-        )?;
-        // The appendvec could be recycled, so its filename may not be consistent to the slot and id.
-        // Use the storage slot and id to compose a consistent file name for the hard-link file.
-        let hardlink_filename = AccountsFile::file_name(storage.slot(), storage.id());
-        let hard_link_path = snapshot_hardlink_dir.join(hardlink_filename);
-        fs::hard_link(storage_path, &hard_link_path).map_err(|err| {
-            HardLinkStoragesToSnapshotError::HardLinkStorage(
-                err,
-                storage_path.to_path_buf(),
-                hard_link_path,
-            )
-        })?;
-    }
-    Ok(())
-}
-
 /// Unarchives the given full and incremental snapshot archives, as long as they are compatible.
 pub fn verify_and_unarchive_snapshots(
     bank_snapshots_dir: impl AsRef<Path>,
@@ -1095,7 +1070,6 @@ pub fn verify_and_unarchive_snapshots(
         account_paths,
         full_snapshot_archive_info.archive_format(),
         next_append_vec_id.clone(),
-        None,
         io_setup,
     )?;
 
@@ -1122,7 +1096,6 @@ pub fn verify_and_unarchive_snapshots(
             account_paths,
             incremental_snapshot_archive_info.archive_format(),
             next_append_vec_id.clone(),
-            Some(incremental_snapshot_archive_info.base_slot()),
             io_setup,
         )?;
         (
@@ -1180,7 +1153,7 @@ fn get_snapshot_file_kind(filename: &str) -> Option<SnapshotFileKind> {
         Some(SnapshotFileKind::Version)
     } else if BANK_FIELDS_FILE_REGEX.is_match(filename) {
         Some(SnapshotFileKind::BankFields)
-    } else if get_slot_and_append_vec_id(filename).is_ok() {
+    } else if parse_storage_filename(filename).is_some() {
         Some(SnapshotFileKind::Storage)
     } else {
         None
@@ -1238,7 +1211,7 @@ fn get_version_and_snapshot_files(
 struct SnapshotFieldsBundle {
     snapshot_version: SnapshotVersion,
     bank_fields: BankFieldsToDeserialize,
-    accounts_db_fields: AccountsDbFields<SerializableAccountStorageEntry>,
+    accounts_db_fields: AccountsDbFields,
     append_vec_files: Vec<FileInfo>,
 }
 
@@ -1314,7 +1287,6 @@ fn unarchive_snapshot(
     account_paths: &[PathBuf],
     archive_format: ArchiveFormat,
     next_append_vec_id: Arc<AtomicAccountsFileId>,
-    base_slot: Option<Slot>,
     io_setup: &IoSetupState,
 ) -> Result<UnarchivedSnapshot> {
     let unpack_dir = tempfile::Builder::new()
@@ -1334,7 +1306,6 @@ fn unarchive_snapshot(
             io_setup,
         );
 
-        let num_rebuilder_threads = num_cpus::get_physical().saturating_sub(1).max(1);
         let snapshot_result = snapshot_fields_from_files(&file_receiver).and_then(
             |SnapshotFieldsBundle {
                  snapshot_version,
@@ -1343,17 +1314,10 @@ fn unarchive_snapshot(
                  append_vec_files,
                  ..
              }| {
-                let snapshot_storage_lengths =
-                    accounts_db_fields.get_storage_lengths_for_snapshot_slots(base_slot)?;
                 let (storage, measure_untar) = measure_time!(
-                    SnapshotStorageRebuilder::spawn_rebuilder_threads(
-                        snapshot_storage_lengths,
-                        append_vec_files,
-                        file_receiver,
-                        num_rebuilder_threads,
+                    SnapshotStorageRebuilder::rebuild_storages_from_snapshot_archive(
+                        append_vec_files.into_iter().chain(file_receiver),
                         next_append_vec_id,
-                        SnapshotFrom::Archive,
-                        None,
                     )?,
                     measure_name
                 );
@@ -1373,8 +1337,15 @@ fn unarchive_snapshot(
                 })
             },
         );
-        unarchive_handle.join().unwrap()?;
-        snapshot_result
+        // Producer errors are usually the root cause (no files -> no reception).
+        let unarchive_result = unarchive_handle.join().expect("must join unarchive thread");
+        match (unarchive_result, snapshot_result) {
+            // Rebuilder closed the receiver early; the producer's send failure is just the
+            // downstream symptom — surface the rebuilder's error instead.
+            (Err(SnapshotError::CrossbeamSend(_)), snap @ Err(_)) => snap,
+            (Err(err), _) => Err(err),
+            (Ok(()), snap) => snap,
+        }
     })
 }
 
@@ -1412,6 +1383,59 @@ fn spawn_streaming_snapshot_dir_files(
     (file_receiver, handle)
 }
 
+/// Removes storage files from `account_paths` that are not in `expected_storages`.
+///
+/// Files whose names do not parse as a storage are left alone.
+fn prune_stale_storages(
+    account_paths: &[PathBuf],
+    expected_storages: &HashMap<(Slot, AccountsFileId), StorageListItem>,
+) -> Result<()> {
+    for account_path in account_paths {
+        let read_dir = fs::read_dir(account_path).map_err(|err| {
+            IoError::other(format!(
+                "failed to read account path '{}': {err}",
+                account_path.display(),
+            ))
+        })?;
+        for entry in read_dir {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            let Some(ParsedStorageFilename { slot, id, format }) = parse_storage_filename(name)
+            else {
+                // Not a storage file name — leave it alone.
+                continue;
+            };
+
+            let matched =
+                expected_storages
+                    .get(&(slot, id))
+                    .is_some_and(|expected_storage| match (format, expected_storage) {
+                        (ParsedStorageFormat::AppendVec, StorageListItem::AppendVec { .. }) => true,
+                        (
+                            ParsedStorageFormat::Split(split_format),
+                            StorageListItem::Split { has_data_file, .. },
+                        ) => match split_format {
+                            ParsedSplit::Meta => true,
+                            ParsedSplit::Data => *has_data_file,
+                        },
+                        _ => false,
+                    });
+
+            if !matched {
+                info!(
+                    "Removing stale storage file '{}' not in storages list",
+                    path.display(),
+                );
+                fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Performs the common tasks when deserializing a snapshot
 ///
 /// Handles reading the snapshot file and version file,
@@ -1420,14 +1444,10 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
     snapshot_info: &BankSnapshotInfo,
     account_paths: &[PathBuf],
     next_append_vec_id: Arc<AtomicAccountsFileId>,
-) -> Result<(
-    AccountStorageMap,
-    BankFieldsToDeserialize,
-    AccountsDbFields<SerializableAccountStorageEntry>,
-)> {
+) -> Result<(AccountStorageMap, BankFieldsToDeserialize, AccountsDbFields)> {
     let bank_snapshot_dir = &snapshot_info.snapshot_dir;
-    let accounts_hardlinks = bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-    let account_run_paths: HashSet<_> = HashSet::from_iter(account_paths);
+    // it is a programmer error if `snapshot_info` is incompatible
+    debug_assert!(is_bank_snapshot_loadable(snapshot_info.fastboot_version.as_ref()).unwrap());
 
     // With fastboot_version >= 2, obsolete accounts are tracked and stored in the snapshot
     // Even if obsolete accounts are not enabled, the snapshot may still contain obsolete accounts
@@ -1435,8 +1455,13 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
     let obsolete_accounts = snapshot_info
         .fastboot_version
         .as_ref()
-        .is_some_and(|fastboot_version| fastboot_version.major >= 2)
-        .then(|| deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE))
+        .map(|fastboot_version| {
+            deserialize_obsolete_accounts(
+                bank_snapshot_dir,
+                MAX_OBSOLETE_ACCOUNTS_FILE_SIZE,
+                fastboot_version,
+            )
+        })
         .transpose()
         .map_err(|err| {
             IoError::other(format!(
@@ -1445,56 +1470,21 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
             ))
         })?;
 
-    let read_dir = fs::read_dir(&accounts_hardlinks).map_err(|err| {
-        IoError::other(format!(
-            "failed to read accounts hardlinks dir '{}': {err}",
-            accounts_hardlinks.display(),
-        ))
-    })?;
-    for dir_entry in read_dir {
-        let symlink_path = dir_entry?.path();
-        // The symlink point to <account_path>/snapshot/<slot> which contain the account files hardlinks
-        // The corresponding run path should be <account_path>/run/
-        let account_snapshot_path = fs::read_link(&symlink_path).map_err(|err| {
-            IoError::other(format!(
-                "failed to read symlink '{}': {err}",
-                symlink_path.display(),
-            ))
-        })?;
-        let account_run_path = account_snapshot_path
-            .parent()
-            .ok_or_else(|| SnapshotError::InvalidAccountPath(account_snapshot_path.clone()))?
-            .parent()
-            .ok_or_else(|| SnapshotError::InvalidAccountPath(account_snapshot_path.clone()))?
-            .join(ACCOUNTS_RUN_DIR);
-        if !account_run_paths.contains(&account_run_path) {
-            // The appendvec from the bank snapshot storage does not match any of the provided account_paths set.
-            // The account paths have changed so the snapshot is no longer usable.
-            return Err(SnapshotError::AccountPathsMismatch);
-        }
-        // Generate hard-links to make the account files available in the main accounts/, and let the new appendvec
-        // paths be in accounts/
-        let read_dir = fs::read_dir(&account_snapshot_path).map_err(|err| {
-            IoError::other(format!(
-                "failed to read account snapshot dir '{}': {err}",
-                account_snapshot_path.display(),
-            ))
-        })?;
-        for file in read_dir {
-            let file_path = file?.path();
-            let file_name = file_path
-                .file_name()
-                .ok_or_else(|| SnapshotError::InvalidAppendVecPath(file_path.to_path_buf()))?;
-            let dest_path = account_run_path.join(file_name);
-            fs::hard_link(&file_path, &dest_path).map_err(|err| {
-                IoError::other(format!(
-                    "failed to hard link from '{}' to '{}': {err}",
-                    file_path.display(),
-                    dest_path.display(),
-                ))
-            })?;
-        }
-    }
+    // The bank snapshot lists the storage files belonging to it. Anything else in the account
+    // paths is from a later (post-snapshot) slot and must be removed before we load — the
+    // lt hash check at startup verifies the surviving storages.
+    let storages_list_path =
+        bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_STORAGES_LIST_FILENAME);
+    let storages_list = deserialize_storages_list(
+        &storages_list_path,
+        MAX_STORAGES_LIST_FILE_SIZE,
+        snapshot_info
+            .fastboot_version
+            .as_ref()
+            .expect("fastboot requires a version"),
+    )?;
+    let storages_map = storages_list_to_map(&storages_list);
+    prune_stale_storages(account_paths, &storages_map)?;
 
     let snapshot_file_path = snapshot_info.snapshot_path();
     let snapshot_version_path = bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_VERSION_FILENAME);
@@ -1504,30 +1494,34 @@ pub(crate) fn rebuild_storages_from_snapshot_dir(
         account_paths,
     );
 
-    let SnapshotFieldsBundle {
-        bank_fields,
-        accounts_db_fields,
-        append_vec_files,
-        ..
-    } = snapshot_fields_from_files(&file_receiver)?;
+    let snapshot_result = snapshot_fields_from_files(&file_receiver).and_then(
+        |SnapshotFieldsBundle {
+             bank_fields,
+             accounts_db_fields,
+             append_vec_files,
+             ..
+         }| {
+            let storage = SnapshotStorageRebuilder::rebuild_storages_from_local_state(
+                append_vec_files.into_iter().chain(file_receiver),
+                next_append_vec_id,
+                obsolete_accounts
+                    .map(|accounts| accounts.into_hashmap())
+                    .unwrap_or_default(),
+                storages_map,
+            )?;
+            Ok((storage, bank_fields, accounts_db_fields))
+        },
+    );
 
-    let num_rebuilder_threads = num_cpus::get_physical().saturating_sub(1).max(1);
-
-    let snapshot_storage_lengths =
-        accounts_db_fields.get_storage_lengths_for_snapshot_slots(None)?;
-    let storage = SnapshotStorageRebuilder::spawn_rebuilder_threads(
-        snapshot_storage_lengths,
-        append_vec_files,
-        file_receiver,
-        num_rebuilder_threads,
-        next_append_vec_id,
-        SnapshotFrom::Dir,
-        obsolete_accounts,
-    )?;
-    stream_files_handle
-        .join()
-        .expect("should join file stream thread")?;
-    Ok((storage, bank_fields, accounts_db_fields))
+    // Producer errors are usually the root cause (no files -> no reception).
+    let stream_files_result = stream_files_handle.join().expect("must join dir thread");
+    match (stream_files_result, snapshot_result) {
+        // Rebuilder closed the receiver early; the producer's send failure is just the
+        // downstream symptom — surface the rebuilder's error instead.
+        (Err(SnapshotError::CrossbeamSend(_)), snap @ Err(_)) => snap,
+        (Err(err), _) => Err(err),
+        (Ok(()), snap) => snap,
+    }
 }
 
 /// Reads the `snapshot_version` from a file. Before opening the file, its size
@@ -1683,7 +1677,7 @@ pub fn verify_unpacked_snapshots_dir_and_version(
 ) -> Result<(SnapshotVersion, BankSnapshotInfo)> {
     info!(
         "snapshot version: {}",
-        &unpacked_snapshots_dir_and_version.snapshot_version
+        unpacked_snapshots_dir_and_version.snapshot_version
     );
 
     let snapshot_version = unpacked_snapshots_dir_and_version.snapshot_version;
@@ -1715,6 +1709,26 @@ pub enum VerifyBank {
     /// the serialized bank was 'reserialized' into a non-deterministic format
     /// so, deserialize both files and compare deserialized results
     NonDeterministic,
+}
+
+/// For each account run dir, wipes the sibling `snapshot/` dir.
+///
+/// Validator account paths are laid out as a parent containing two siblings: `run/` (the live
+/// storage files) and `snapshot/` (legacy per-slot hardlink dirs, pre-3.0). `account_run_paths`
+/// here holds the `run/` paths, so for each entry we walk up to the parent and wipe the
+/// `snapshot/` sibling. Nothing new is written under `snapshot/` anymore, so any content is
+/// either legacy hardlink dirs (written by pre-3.0 validators during fastboot) or orphans
+/// from purged bank snapshots. Used by the legacy-hardlink migration path and the
+/// archive-load path to drop that leftover state.
+///
+/// Note, sibling `snapshot/` dirs are no longer created as of agave v4.5.
+/// This code can then be removed in agave v4.6.
+pub fn wipe_account_snapshot_dirs(account_run_paths: &[PathBuf]) {
+    for account_run_path in account_run_paths {
+        if let Some(parent) = account_run_path.parent() {
+            move_and_async_delete_path(parent.join(ACCOUNTS_SNAPSHOT_DIR));
+        }
+    }
 }
 
 /// Purges all bank snapshots
@@ -1773,29 +1787,6 @@ fn purge_bank_snapshots<'a>(bank_snapshots: impl IntoIterator<Item = &'a BankSna
 /// Remove the bank snapshot at this path
 pub fn purge_bank_snapshot(bank_snapshot_dir: impl AsRef<Path>) -> Result<()> {
     const FN_ERR: &str = "failed to purge bank snapshot";
-    let accounts_hardlinks_dir = bank_snapshot_dir
-        .as_ref()
-        .join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-    if accounts_hardlinks_dir.is_dir() {
-        // This directory contain symlinks to all accounts snapshot directories.
-        // They should all be removed.
-        let read_dir = fs::read_dir(&accounts_hardlinks_dir).map_err(|err| {
-            IoError::other(format!(
-                "{FN_ERR}: failed to read accounts hardlinks dir '{}': {err}",
-                accounts_hardlinks_dir.display(),
-            ))
-        })?;
-        for entry in read_dir {
-            let accounts_hardlink_dir = entry?.path();
-            let accounts_hardlink_dir = fs::read_link(&accounts_hardlink_dir).map_err(|err| {
-                IoError::other(format!(
-                    "{FN_ERR}: failed to read symlink '{}': {err}",
-                    accounts_hardlink_dir.display(),
-                ))
-            })?;
-            move_and_async_delete_path(&accounts_hardlink_dir);
-        }
-    }
     fs::remove_dir_all(&bank_snapshot_dir).map_err(|err| {
         IoError::other(format!(
             "{FN_ERR}: failed to remove dir '{}': {err}",
@@ -1828,7 +1819,7 @@ pub fn should_take_incremental_snapshot(
 #[cfg(feature = "dev-context-only-utils")]
 pub fn create_tmp_accounts_dir_for_tests() -> (TempDir, PathBuf) {
     let tmp_dir = tempfile::TempDir::new().unwrap();
-    let account_dir = create_accounts_run_and_snapshot_dirs(&tmp_dir).unwrap().0;
+    let account_dir = create_accounts_run_dir(&tmp_dir).unwrap();
     (tmp_dir, account_dir)
 }
 
@@ -1836,6 +1827,7 @@ pub fn create_tmp_accounts_dir_for_tests() -> (TempDir, PathBuf) {
 mod tests {
     use {
         super::*,
+        crate::serde_snapshot::{StorageListItem, deserialize_wincode_from, serialize_into},
         agave_snapshots::{
             paths::{
                 full_snapshot_archives_iter, get_highest_full_snapshot_archive_slot,
@@ -1846,11 +1838,9 @@ mod tests {
                 DEFAULT_MAX_INCREMENTAL_SNAPSHOT_ARCHIVES_TO_RETAIN,
             },
         },
-        assert_matches::assert_matches,
-        bincode::{deserialize_from, serialize_into},
         solana_accounts_db::accounts_file::AccountsFileProvider,
         solana_hash::Hash,
-        std::{convert::TryFrom, mem::size_of},
+        std::{assert_matches, convert::TryFrom, mem::size_of, slice},
         tempfile::NamedTempFile,
         test_case::test_case,
     };
@@ -1914,8 +1904,8 @@ mod tests {
             &snapshot_root_paths,
             expected_consumed_size,
             |stream| {
-                Ok(deserialize_from::<_, u32>(
-                    &mut stream.full_snapshot_stream,
+                Ok(deserialize_wincode_from::<_, u32>(
+                    &mut *stream.full_snapshot_stream,
                 )?)
             },
         )
@@ -1949,8 +1939,8 @@ mod tests {
             &snapshot_root_paths,
             expected_consumed_size - 1,
             |stream| {
-                Ok(deserialize_from::<_, u32>(
-                    &mut stream.full_snapshot_stream,
+                Ok(deserialize_wincode_from::<_, u32>(
+                    &mut *stream.full_snapshot_stream,
                 )?)
             },
         );
@@ -1968,8 +1958,9 @@ mod tests {
             expected_consumed_size * 2,
             &IoSetupState::default(),
             |stream| {
-                serialize_into(&mut *stream, &expected_data)?;
-                serialize_into(&mut *stream, &expected_data)?;
+                // Write two u32s (in one call, since the wincode writer finalizes on finish) so
+                // the file has trailing bytes left over after a single-u32 deserialize.
+                serialize_into(&mut *stream, &(expected_data, expected_data))?;
                 Ok(())
             },
         )
@@ -1984,8 +1975,8 @@ mod tests {
             &snapshot_root_paths,
             expected_consumed_size * 2,
             |stream| {
-                Ok(deserialize_from::<_, u32>(
-                    &mut stream.full_snapshot_stream,
+                Ok(deserialize_wincode_from::<_, u32>(
+                    &mut *stream.full_snapshot_stream,
                 )?)
             },
         );
@@ -2622,49 +2613,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_snapshot_accounts_hardlink_dir() {
-        let slot: Slot = 1;
-
-        let mut account_paths_set: HashSet<PathBuf> = HashSet::new();
-
-        let bank_snapshots_dir_tmp = tempfile::TempDir::new().unwrap();
-        let bank_snapshot_dir = bank_snapshots_dir_tmp.path().join(slot.to_string());
-        let accounts_hardlinks_dir =
-            bank_snapshot_dir.join(snapshot_paths::SNAPSHOT_ACCOUNTS_HARDLINKS);
-        fs::create_dir_all(&accounts_hardlinks_dir).unwrap();
-
-        let (_tmp_dir, accounts_dir) = create_tmp_accounts_dir_for_tests();
-        let appendvec_filename = format!("{slot}.0");
-        let appendvec_path = accounts_dir.join(appendvec_filename);
-
-        let ret = get_snapshot_accounts_hardlink_dir(
-            &appendvec_path,
-            slot,
-            &mut account_paths_set,
-            &accounts_hardlinks_dir,
-        );
-        assert!(ret.is_ok());
-
-        let wrong_appendvec_path = appendvec_path
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(appendvec_path.file_name().unwrap());
-        let ret = get_snapshot_accounts_hardlink_dir(
-            &wrong_appendvec_path,
-            slot,
-            &mut account_paths_set,
-            accounts_hardlinks_dir,
-        );
-
-        assert_matches!(
-            ret,
-            Err(GetSnapshotAccountsHardLinkDirError::GetAccountPath(_))
-        );
-    }
-
-    #[test]
     fn test_get_snapshot_file_kind() {
         assert_eq!(None, get_snapshot_file_kind("file.txt"));
         assert_eq!(
@@ -2681,19 +2629,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_is_snapshot_fastboot_compatible() {
+        for major in 0..=2 {
+            assert!(!is_snapshot_fastboot_compatible(&Version::new(major, 0, 0)).unwrap());
+        }
+        for major in 3..=SNAPSHOT_FASTBOOT_VERSION.major {
+            assert!(is_snapshot_fastboot_compatible(&Version::new(major, 0, 0)).unwrap());
+        }
+        assert!(
+            is_snapshot_fastboot_compatible(&Version::new(
+                SNAPSHOT_FASTBOOT_VERSION.major + 1,
+                0,
+                0,
+            ))
+            .is_err()
+        );
+    }
+
     #[test_case(0)]
     #[test_case(1)]
     #[test_case(10)]
     fn test_serialize_deserialize_account_storage_entries(num_storages: u64) {
         let temp_dir = tempfile::tempdir().unwrap();
         let bank_snapshot_dir = temp_dir.path();
+        let storage_dir = tempfile::tempdir().unwrap();
         let snapshot_slot = num_storages + 1 as Slot;
 
         // Create AccountStorageEntries
         let mut snapshot_storages = Vec::new();
         for i in 0..num_storages {
             let storage = Arc::new(AccountStorageEntry::new(
-                &PathBuf::new(),
+                storage_dir.path(),
                 i,        // Incrementing slot
                 i as u32, // Incrementing id
                 1024,
@@ -2712,14 +2679,17 @@ mod tests {
         .unwrap();
 
         // Deserialize
-        let deserialized_accounts =
-            deserialize_obsolete_accounts(bank_snapshot_dir, MAX_OBSOLETE_ACCOUNTS_FILE_SIZE)
-                .unwrap()
-                .into_dashmap();
+        let mut deserialized_accounts = deserialize_obsolete_accounts(
+            bank_snapshot_dir,
+            MAX_OBSOLETE_ACCOUNTS_FILE_SIZE,
+            &SNAPSHOT_FASTBOOT_VERSION,
+        )
+        .unwrap()
+        .into_hashmap();
 
         // Verify
         for storage in &snapshot_storages {
-            let obsolete_accounts = deserialized_accounts.remove(&storage.slot()).unwrap().1;
+            let obsolete_accounts = deserialized_accounts.remove(&storage.slot()).unwrap();
             assert!(obsolete_accounts.into_tuple().2 == 0);
         }
     }
@@ -2729,6 +2699,7 @@ mod tests {
     fn test_serialize_obsolete_accounts_too_large_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let bank_snapshot_dir = temp_dir.path();
+        let storage_dir = tempfile::tempdir().unwrap();
         let num_storages = 10;
         let snapshot_slot = num_storages + 1 as Slot;
 
@@ -2736,7 +2707,7 @@ mod tests {
         let mut snapshot_storages = Vec::new();
         for i in 0..num_storages {
             let storage = Arc::new(AccountStorageEntry::new(
-                &PathBuf::new(),
+                storage_dir.path(),
                 i,        // Incrementing slot
                 i as u32, // Incrementing id
                 1024,
@@ -2764,6 +2735,7 @@ mod tests {
     fn test_deserialize_obsolete_accounts_too_large_file() {
         let temp_dir = tempfile::tempdir().unwrap();
         let bank_snapshot_dir = temp_dir.path();
+        let storage_dir = tempfile::tempdir().unwrap();
         let num_storages = 10;
         let snapshot_slot = num_storages + 1 as Slot;
 
@@ -2771,7 +2743,7 @@ mod tests {
         let mut snapshot_storages = Vec::new();
         for i in 0..num_storages {
             let storage = Arc::new(AccountStorageEntry::new(
-                &PathBuf::new(),
+                storage_dir.path(),
                 i,        // Incrementing slot
                 i as u32, // Incrementing id
                 1024,
@@ -2791,7 +2763,7 @@ mod tests {
 
         // Set a very low maximum file size for deserialization
         // This should panic
-        deserialize_obsolete_accounts(bank_snapshot_dir, 100).unwrap();
+        deserialize_obsolete_accounts(bank_snapshot_dir, 100, &SNAPSHOT_FASTBOOT_VERSION).unwrap();
     }
 
     #[test]
@@ -2857,5 +2829,65 @@ mod tests {
 
         // scenario 9: all good
         assert!(is_bank_snapshot_complete(bank_snapshot_dir));
+    }
+
+    #[test]
+    fn test_prune_stale_storages() {
+        let account_path = tempfile::TempDir::new().unwrap();
+        // Files that belong to the snapshot.
+        let append_vec_1_keep = account_path.path().join("101.1");
+        let append_vec_2_prune = account_path.path().join("102.2");
+        let split_3_meta_keep = account_path.path().join("203.3.meta");
+        let split_3_data_keep = account_path.path().join("203.3.data");
+        let split_4_meta_only_keep = account_path.path().join("204.4.meta");
+        let split_4_data_prune = account_path.path().join("204.4.data");
+        let split_5_meta_prune = account_path.path().join("205.5.meta");
+        let split_5_data_prune = account_path.path().join("205.5.data");
+        let non_storage_keep = account_path.path().join("something_else.txt");
+        for path in [
+            &append_vec_1_keep,
+            &append_vec_2_prune,
+            &split_3_meta_keep,
+            &split_3_data_keep,
+            &split_4_meta_only_keep,
+            &split_4_data_prune,
+            &split_5_meta_prune,
+            &split_5_data_prune,
+            &non_storage_keep,
+        ] {
+            fs::write(path, b"x").unwrap();
+        }
+
+        let storages_list = StoragesList {
+            items: vec![
+                StorageListItem::AppendVec { slot: 101, id: 1 },
+                StorageListItem::Split {
+                    slot: 203,
+                    id: 3,
+                    has_data_file: true,
+                },
+                StorageListItem::Split {
+                    slot: 204,
+                    id: 4,
+                    has_data_file: false,
+                },
+            ],
+        };
+        let storages_map = storages_list_to_map(&storages_list);
+        prune_stale_storages(
+            slice::from_ref(&account_path.path().to_path_buf()),
+            &storages_map,
+        )
+        .unwrap();
+
+        assert!(append_vec_1_keep.exists());
+        assert!(!append_vec_2_prune.exists());
+        assert!(split_3_meta_keep.exists());
+        assert!(split_3_data_keep.exists());
+        assert!(split_4_meta_only_keep.exists());
+        assert!(!split_4_data_prune.exists());
+        assert!(!split_5_meta_prune.exists());
+        assert!(!split_5_data_prune.exists());
+        assert!(non_storage_keep.exists());
     }
 }

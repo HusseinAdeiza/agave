@@ -17,6 +17,7 @@ use {
     solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{client_error, response::RpcVoteAccountStatus},
+    solana_vote_interface::state::VoteStateV4,
     std::{
         collections::HashMap,
         error,
@@ -25,6 +26,8 @@ use {
     },
 };
 
+const LEGACY_VAT_TO_BURN_PER_EPOCH: u64 = 1_600_000_000;
+
 struct Config {
     address_labels: HashMap<String, String>,
     ignore_http_bad_gateway: bool,
@@ -32,12 +35,24 @@ struct Config {
     json_rpc_urls: Vec<String>,
     rpc_timeout: Duration,
     minimum_validator_identity_balance: u64,
+    minimum_vote_account_balance: Option<u64>,
     monitor_active_stake: bool,
     active_stake_alert_threshold: u8,
     unhealthy_threshold: usize,
     validator_identity_pubkeys: Vec<Pubkey>,
     name_suffix: String,
     acceptable_slot_range: u64,
+}
+
+/// Accepts exactly what `sol_str_to_lamports` accepts, so a value that passes validation
+/// can never be dropped later at conversion time (e.g. `1e2` parses as an f64 but is not a
+/// valid SOL amount).
+fn is_sol_amount(amount: String) -> Result<(), String> {
+    if sol_str_to_lamports(&amount).is_some() {
+        Ok(())
+    } else {
+        Err(format!("Unable to parse SOL amount, provided: {amount}"))
+    }
 }
 
 fn get_config() -> Config {
@@ -144,8 +159,20 @@ fn get_config() -> Config {
                 .value_name("SOL")
                 .takes_value(true)
                 .default_value("10")
-                .validator(is_parsable::<f64>)
+                .validator(is_sol_amount)
                 .help("Alert when the validator identity balance is less than this amount of SOL"),
+        )
+        .arg(
+            Arg::with_name("minimum_vote_account_balance")
+                .long("minimum-vote-account-balance")
+                .value_name("SOL")
+                .takes_value(true)
+                .validator(is_sol_amount)
+                .help(
+                    "Alert when a monitored validator's vote account balance is less than this \
+                     amount of SOL. Checked in addition to the automatic validator admission \
+                     ticket (VAT) balance check",
+                ),
         )
         .arg(
             // Deprecated parameter, now always enabled
@@ -212,6 +239,9 @@ fn get_config() -> Config {
         .value_of("minimum_validator_identity_balance")
         .and_then(sol_str_to_lamports)
         .unwrap();
+    let minimum_vote_account_balance = matches
+        .value_of("minimum_vote_account_balance")
+        .and_then(sol_str_to_lamports);
     let json_rpc_urls = values_t!(matches, "json_rpc_urls", String).unwrap_or_else(|_| {
         vec![value_t!(matches, "json_rpc_url", String).unwrap_or_else(|_| config.json_rpc_url)]
     });
@@ -238,6 +268,7 @@ fn get_config() -> Config {
         json_rpc_urls,
         rpc_timeout,
         minimum_validator_identity_balance,
+        minimum_vote_account_balance,
         monitor_active_stake,
         active_stake_alert_threshold,
         unhealthy_threshold,
@@ -282,6 +313,81 @@ struct EndpointData {
     rpc_client: RpcClient,
     last_transaction_count: u64,
     last_recent_blockhash: Hash,
+}
+
+fn slot_time_reduction_vat_burns() -> [(Pubkey, u64); 4] {
+    [
+        (
+            agave_feature_set::reduce_slot_time_to_200ms::id(),
+            800_000_000,
+        ),
+        (
+            agave_feature_set::reduce_slot_time_to_250ms::id(),
+            1_000_000_000,
+        ),
+        (
+            agave_feature_set::reduce_slot_time_to_300ms::id(),
+            1_200_000_000,
+        ),
+        (
+            agave_feature_set::reduce_slot_time_to_350ms::id(),
+            1_400_000_000,
+        ),
+    ]
+}
+
+fn is_feature_active_at_slot(
+    rpc_client: &RpcClient,
+    feature_id: &Pubkey,
+    slot: u64,
+) -> client_error::Result<bool> {
+    Ok(matches!(
+        rpc_client.get_feature_activation_slot(feature_id)?,
+        Some(activation_slot) if activation_slot <= slot
+    ))
+}
+
+fn vat_to_burn_per_epoch(rpc_client: &RpcClient, slot: u64) -> client_error::Result<u64> {
+    let epoch_schedule = rpc_client.get_epoch_schedule()?;
+
+    // Keep this table in sync with runtime/src/slot_params.rs. Slot-time
+    // feature gates take effect at the first slot of the epoch after activation.
+    for (feature_id, vat_to_burn_per_epoch) in slot_time_reduction_vat_burns() {
+        let Some(activation_slot) = rpc_client.get_feature_activation_slot(&feature_id)? else {
+            continue;
+        };
+        if activation_slot > slot {
+            continue;
+        }
+
+        let activation_epoch = epoch_schedule.get_epoch(activation_slot);
+        let effective_slot =
+            epoch_schedule.get_first_slot_in_epoch(activation_epoch.saturating_add(1));
+        if effective_slot <= slot {
+            return Ok(vat_to_burn_per_epoch);
+        }
+    }
+
+    Ok(LEGACY_VAT_TO_BURN_PER_EPOCH)
+}
+
+fn get_minimum_vat_vote_account_balance(
+    rpc_client: &RpcClient,
+) -> client_error::Result<Option<u64>> {
+    let slot = rpc_client.get_slot()?;
+
+    let vote_account_rent_exempt_minimum =
+        rpc_client.get_minimum_balance_for_rent_exemption(VoteStateV4::size_of())?;
+    let vat_to_burn_per_epoch =
+        if is_feature_active_at_slot(rpc_client, &agave_feature_set::alpenglow::id(), slot)? {
+            vat_to_burn_per_epoch(rpc_client, slot)?
+        } else {
+            0
+        };
+
+    Ok(Some(
+        vote_account_rent_exempt_minimum + vat_to_burn_per_epoch,
+    ))
 }
 
 fn query_endpoint(
@@ -354,29 +460,90 @@ fn query_endpoint(
             }
 
             let mut validator_errors = vec![];
+            let minimum_vat_vote_account_balance = if config.validator_identity_pubkeys.is_empty() {
+                None
+            } else {
+                get_minimum_vat_vote_account_balance(&endpoint.rpc_client)?
+            };
             for validator_identity in config.validator_identity_pubkeys.iter() {
+                let validator_identity_string = validator_identity.to_string();
                 let formatted_validator_identity =
-                    format_labeled_address(&validator_identity.to_string(), &config.address_labels);
+                    format_labeled_address(&validator_identity_string, &config.address_labels);
                 if vote_accounts
                     .delinquent
                     .iter()
-                    .any(|vai| vai.node_pubkey == *validator_identity.to_string())
+                    .any(|vai| vai.node_pubkey == validator_identity_string.as_str())
                 {
                     validator_errors.push(format!("{formatted_validator_identity} delinquent"));
                 } else if !vote_accounts
                     .current
                     .iter()
-                    .any(|vai| vai.node_pubkey == *validator_identity.to_string())
+                    .any(|vai| vai.node_pubkey == validator_identity_string.as_str())
                 {
                     validator_errors.push(format!("{formatted_validator_identity} missing"));
                 }
 
-                if let Some(balance) = validator_balances.get(validator_identity) {
-                    if *balance < config.minimum_validator_identity_balance {
-                        failures.push((
-                            "balance",
-                            format!("{} has {}", formatted_validator_identity, Sol(*balance)),
-                        ));
+                if let Some(balance) = validator_balances.get(validator_identity)
+                    && *balance < config.minimum_validator_identity_balance
+                {
+                    failures.push((
+                        "balance",
+                        format!("{} has {}", formatted_validator_identity, Sol(*balance)),
+                    ));
+                }
+
+                if minimum_vat_vote_account_balance.is_some()
+                    || config.minimum_vote_account_balance.is_some()
+                {
+                    for vote_account in vote_accounts
+                        .current
+                        .iter()
+                        .chain(vote_accounts.delinquent.iter())
+                        .filter(|vai| vai.node_pubkey == validator_identity_string.as_str())
+                    {
+                        let Ok(vote_pubkey) = vote_account.vote_pubkey.parse::<Pubkey>() else {
+                            failures.push((
+                                "vat-vote-account-balance",
+                                format!(
+                                    "{} vote account {} is not a valid pubkey",
+                                    formatted_validator_identity, vote_account.vote_pubkey
+                                ),
+                            ));
+                            continue;
+                        };
+
+                        let balance = endpoint.rpc_client.get_balance(&vote_pubkey)?;
+                        if let Some(minimum_vat_vote_account_balance) =
+                            minimum_vat_vote_account_balance
+                            && balance < minimum_vat_vote_account_balance
+                        {
+                            failures.push((
+                                "vat-vote-account-balance",
+                                format!(
+                                    "{} vote account {} has {}, below required VAT balance \
+                                     threshold of {}",
+                                    formatted_validator_identity,
+                                    vote_pubkey,
+                                    Sol(balance),
+                                    Sol(minimum_vat_vote_account_balance)
+                                ),
+                            ));
+                        }
+                        if let Some(minimum_vote_account_balance) =
+                            config.minimum_vote_account_balance
+                            && balance < minimum_vote_account_balance
+                        {
+                            failures.push((
+                                "vote-account-balance",
+                                format!(
+                                    "{} vote account {} has {}, below the configured minimum of {}",
+                                    formatted_validator_identity,
+                                    vote_pubkey,
+                                    Sol(balance),
+                                    Sol(minimum_vote_account_balance)
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -392,13 +559,12 @@ fn query_endpoint(
             Ok(failures.into_iter().next()) // Only report the first failure if any
         }
         Err(err) => {
-            if let client_error::ErrorKind::Reqwest(reqwest_err) = err.kind() {
-                if let Some(client_error::reqwest::StatusCode::BAD_GATEWAY) = reqwest_err.status() {
-                    if config.ignore_http_bad_gateway {
-                        warn!("Error suppressed: {err}");
-                        return Ok(None);
-                    }
-                }
+            if let client_error::ErrorKind::Reqwest(reqwest_err) = err.kind()
+                && let Some(client_error::reqwest::StatusCode::BAD_GATEWAY) = reqwest_err.status()
+                && config.ignore_http_bad_gateway
+            {
+                warn!("Error suppressed: {err}");
+                return Ok(None);
             }
             warn!("rpc-error: {err}");
             Err(err)

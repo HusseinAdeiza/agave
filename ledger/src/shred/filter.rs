@@ -3,18 +3,19 @@
 
 use {
     super::{
-        DATA_SHREDS_PER_FEC_BLOCK, Error, Payload, ReedSolomonCache, Shred, ShredFetchStats,
-        ShredFlags, ShredType, ShredVariant, layout, merkle,
+        DATA_SHREDS_PER_FEC_BLOCK, Error, Payload, Shred, ShredFetchStats, ShredFlags, ShredType,
+        ShredVariant, layout,
+        merkle::{self, ErasureBatch},
     },
     crate::blockstore,
-    agave_feature_set::discard_unexpected_data_complete_shreds,
-    assert_matches::debug_assert_matches,
+    agave_feature_set as feature_set,
+    agave_worker_pool::WorkerPool,
+    itertools::Itertools,
     solana_clock::Slot,
     solana_epoch_schedule::EpochSchedule,
-    solana_perf::packet::PacketRef,
+    solana_perf::packet::BytesPacket,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
-    solana_streamer::{evicting_sender::EvictingSender, streamer::ChannelSend},
     std::{
         sync::{
             Arc,
@@ -163,7 +164,6 @@ pub struct ShredFilterContext {
     // Fields for slot range filtering updated via the root bank
     root: Slot,
     max_slot: Slot,
-    epoch_schedule: EpochSchedule,
 
     // Static from startup, filter out shreds of invalid version
     shred_version: u16,
@@ -174,12 +174,17 @@ pub struct ShredFilterContext {
     // atomic load for each packet. This is recached during `maybe_update`
     cached_turbine_mode: TurbineModeKind,
 
-    // Whether to discard shreds that are not end of FEC set
-    // but specify DATA_COMPLETE
-    discard_unexpected_data_complete_shreds_feature_slot: Option<Slot>,
-
     // The shred limits per slot, derived from the root bank for each shred slot.
     shred_limit_context: ShredLimitContext,
+
+    // Earliest shred slot for which `enforce_correct_proof_size` is effective,
+    // or None while the feature is inactive. Derived from the root bank, so it
+    // is refreshed together with `shred_limit_context`.
+    enforce_correct_proof_size_from: Option<Slot>,
+
+    // Earliest shred slot for which SIMD-0504 `stricter_shred_validation` is
+    // effective, or None while the feature is inactive.
+    stricter_shred_validation_from: Option<Slot>,
 
     pub stats: ShredFetchStats,
 }
@@ -196,9 +201,6 @@ impl ShredFilterContext {
     ) -> Self {
         let root = root_bank.slot();
         let max_slot = max_shred_slot(root, root_bank.get_slots_in_epoch(root_bank.epoch()));
-        let discard_unexpected_data_complete_shreds_feature_slot = root_bank
-            .feature_set
-            .activated_slot(&discard_unexpected_data_complete_shreds::id());
         let cached_turbine_mode = turbine_mode
             .as_ref()
             .map(TurbineMode::get)
@@ -208,11 +210,17 @@ impl ShredFilterContext {
             last_updated: Instant::now(),
             root,
             max_slot,
-            epoch_schedule: root_bank.epoch_schedule().clone(),
             shred_version,
             turbine_mode,
             cached_turbine_mode,
-            discard_unexpected_data_complete_shreds_feature_slot,
+            enforce_correct_proof_size_from: feature_first_effective_slot(
+                &feature_set::enforce_correct_proof_size::id(),
+                &root_bank,
+            ),
+            stricter_shred_validation_from: feature_first_effective_slot(
+                &feature_set::stricter_shred_validation::id(),
+                &root_bank,
+            ),
             shred_limit_context: ShredLimitContext::new(root_bank),
             stats: ShredFetchStats::default(),
         }
@@ -233,12 +241,23 @@ impl ShredFilterContext {
                 max_shred_slot(self.root, root_bank.get_slots_in_epoch(root_bank.epoch()));
             debug_assert!(self.root < self.max_slot);
 
-            self.epoch_schedule = root_bank.epoch_schedule().clone();
-            self.discard_unexpected_data_complete_shreds_feature_slot = root_bank
-                .feature_set
-                .activated_slot(&discard_unexpected_data_complete_shreds::id());
+            self.enforce_correct_proof_size_from = feature_first_effective_slot(
+                &feature_set::enforce_correct_proof_size::id(),
+                &root_bank,
+            );
+            self.stricter_shred_validation_from = feature_first_effective_slot(
+                &feature_set::stricter_shred_validation::id(),
+                &root_bank,
+            );
             self.shred_limit_context = ShredLimitContext::new(root_bank);
         }
+    }
+
+    /// Returns true if SIMD-0504 `stricter_shred_validation` is effective for
+    /// shreds of the given slot.
+    pub(crate) fn is_stricter_shred_validation_active(&self, slot: Slot) -> bool {
+        self.stricter_shred_validation_from
+            .is_some_and(|first_slot| slot >= first_slot)
     }
 
     fn shred_limits(&self, slot: Slot) -> ShredLimits {
@@ -255,11 +274,7 @@ impl ShredFilterContext {
     }
 
     #[must_use]
-    pub fn should_discard_packet<'a, P>(&mut self, packet: P) -> bool
-    where
-        P: Into<PacketRef<'a>>,
-    {
-        let packet = packet.into();
+    pub fn should_discard_packet(&mut self, packet: &BytesPacket) -> bool {
         if self
             .cached_turbine_mode
             .should_discard_packet(packet.meta().repair())
@@ -312,8 +327,17 @@ impl ShredFilterContext {
             self.stats.fec_set_index_bad_deserialize += 1;
             return true;
         };
+        // SIMD317: A fixed 32:32 erasure set must have 64 Merkle leaves.
+        let enforce_correct_proof_size = self
+            .enforce_correct_proof_size_from
+            .is_some_and(|first_slot| slot >= first_slot);
+        if !shred_variant.has_correct_proof_size() {
+            self.stats.invalid_proof_size += 1;
+            if enforce_correct_proof_size {
+                return true;
+            }
+        }
         let shred_limits = self.shred_limits(slot);
-
         match ShredType::from(shred_variant) {
             ShredType::Code => {
                 if !shred_limits.is_code_index_in_bounds(index) {
@@ -333,6 +357,19 @@ impl ShredFilterContext {
                 if !erasure_config.is_fixed() {
                     self.stats.misaligned_erasure_config += 1;
                     return true;
+                }
+
+                // SIMD-0504: coding shred indices start at fec_set_index, so
+                // the position in the coding batch is fixed by the index.
+                let Ok(position) = layout::get_position(shred) else {
+                    self.stats.erasure_config_bad_deserialize += 1;
+                    return true;
+                };
+                if index.checked_sub(fec_set_index) != Some(u32::from(position)) {
+                    self.stats.misaligned_coding_position += 1;
+                    if self.is_stricter_shred_validation_active(slot) {
+                        return true;
+                    }
                 }
             }
             ShredType::Data => {
@@ -354,9 +391,13 @@ impl ShredFilterContext {
                 }
 
                 let Ok(shred_flags) = layout::get_flags(shred) else {
-                    self.stats.shred_flags_bad_deserialize += 1;
+                    self.stats.invalid_shred_flags += 1;
                     return true;
                 };
+                if !shred_flags.is_valid() {
+                    self.stats.invalid_shred_flags += 1;
+                    return true;
+                }
 
                 let expected_data_complete_index = fec_set_index
                     .checked_add(DATA_SHREDS_PER_FEC_BLOCK as u32)
@@ -365,14 +406,7 @@ impl ShredFilterContext {
                     && (expected_data_complete_index != Some(index))
                 {
                     self.stats.unexpected_data_complete_shred += 1;
-
-                    if check_feature_activation(
-                        self.discard_unexpected_data_complete_shreds_feature_slot,
-                        slot,
-                        &self.epoch_schedule,
-                    ) {
-                        return true;
-                    }
+                    return true;
                 }
 
                 if shred_flags.contains(ShredFlags::LAST_SHRED_IN_SLOT)
@@ -380,6 +414,14 @@ impl ShredFilterContext {
                 {
                     self.stats.misaligned_last_data_index += 1;
                     return true;
+                }
+                // Forces data_size to match merkle size.
+                // This is enforced at ingest already, but now also for retransmit.
+                if layout::get_data(shred).is_err() {
+                    self.stats.invalid_data_size += 1;
+                    if enforce_correct_proof_size {
+                        return true;
+                    }
                 }
             }
         }
@@ -429,10 +471,32 @@ pub fn check_feature_activation(
     let Some(feature_slot) = feature_slot else {
         return false;
     };
+    shred_slot >= first_effective_shred_slot(feature_slot, epoch_schedule)
+}
 
+/// Returns the first shred slot for which the feature is effective, or None if it
+/// is not activated in `root_bank`.
+/// Note: unlike normal feature flags, shred feature flags take effect 1 epoch after
+/// activation.
+#[must_use]
+fn feature_first_effective_slot(feature: &Pubkey, root_bank: &Bank) -> Option<Slot> {
+    let feature_slot = root_bank.feature_set.activated_slot(feature)?;
+    Some(first_effective_shred_slot(
+        feature_slot,
+        root_bank.epoch_schedule(),
+    ))
+}
+
+/// The first shred slot for which a feature activated at `feature_slot` is effective
+/// for shred handling specifically.
+///
+/// Shred feature flags take effect 1 epoch after activation. This function computes the
+/// necessary offset. Offset exists to ensure that we do not change shred validity rules
+/// while some nodes have not been able to transition the epochs yet.
+#[must_use]
+fn first_effective_shred_slot(feature_slot: Slot, epoch_schedule: &EpochSchedule) -> Slot {
     let feature_epoch = epoch_schedule.get_epoch(feature_slot);
-    let shred_epoch = epoch_schedule.get_epoch(shred_slot);
-    feature_epoch < shred_epoch
+    epoch_schedule.get_first_slot_in_epoch(feature_epoch.saturating_add(1))
 }
 
 /// The maximum shred slot we allow for ingest given a current `root` slot.
@@ -443,8 +507,8 @@ fn max_shred_slot(root: Slot, slots_per_epoch: Slot) -> Slot {
     // while being small enough to keep the overhead small on deduper, blockstore,
     // etc.
     const MAX_SHRED_DISTANCE_MINIMUM: Slot = 500;
-    // Allow shreds up to 2 epochs into the future to support catching up to the tip of the cluster.
-    root.saturating_add(MAX_SHRED_DISTANCE_MINIMUM.max(2 * slots_per_epoch))
+    // Allow shreds up to half an epoch into the future to support catching up to the tip of the cluster.
+    root.saturating_add(MAX_SHRED_DISTANCE_MINIMUM.max(slots_per_epoch / 2))
 }
 
 /// Returns true if `index` and `fec_set_index` are valid under the assumption that
@@ -466,33 +530,53 @@ fn check_fixed_fec_set(index: u32, fec_set_index: u32) -> bool {
 /// - `index + 1` must be a multiple of `DATA_SHREDS_PER_FEC_BLOCK`
 ///
 /// Note: this check is critical to verify that the last fec set is sufficiently sized.
-/// This is checked during shred ingest with `enforce_fixed_fec_set` active.
+/// This is checked during shred ingest.
 fn check_last_data_shred_index(index: u32) -> bool {
     (index + 1).is_multiple_of(DATA_SHREDS_PER_FEC_BLOCK as u32)
 }
 
 /// Holds the context to perform filtering on shred recovery
 pub struct ShredRecoveryContext {
-    /// Used to perform RS erasure code recovery
-    pub reed_solomon_cache: ReedSolomonCache,
     /// Sender to retransmit the recovered shreds
-    retransmit_sender: EvictingSender<Vec<Payload>>,
+    retransmit_sender: RetransmitSender,
     /// Used for filtering recovered shreds
     shred_filter_ctx: ShredFilterContext,
+    /// Scratch space for the parity check of erasure batches, reused across
+    /// recoveries.
+    parity_buffer: Vec<u8>,
+}
+
+/// Maximum number of shreds sent to retransmit workers in one job.
+///
+/// Heavy-load measurements showed sigverify at ~5us/shred and retransmit at
+/// ~18us/shred. Splitting the typical 64-shred sigverify output into four
+/// retransmit jobs gives the worker pool enough parallelism to keep up.
+pub const RETRANSMIT_SHRED_BATCH_SIZE: usize = 16;
+
+pub type ShredBatch = Vec<Payload>;
+/// Shared retransmit pool. Its last owner drains queued jobs and joins the workers.
+pub type RetransmitSender = Arc<WorkerPool<ShredBatch>>;
+
+/// Creates a retransmit sender whose single worker discards submitted shreds.
+#[cfg(feature = "dev-context-only-utils")]
+pub fn new_dummy_retransmit_sender() -> RetransmitSender {
+    use {agave_worker_pool::WorkerPoolConfig, std::num::NonZeroUsize};
+
+    let config = WorkerPoolConfig::new("solTestRetrans", NonZeroUsize::MIN);
+    Arc::new(WorkerPool::spawn(config, |_| |_| {}).unwrap())
 }
 
 impl ShredRecoveryContext {
     pub fn new(
-        reed_solomon_cache: ReedSolomonCache,
-        retransmit_sender: EvictingSender<Vec<Payload>>,
+        retransmit_sender: RetransmitSender,
         root_bank: Arc<Bank>,
         shred_version: u16,
     ) -> Self {
         let shred_filter_ctx = ShredFilterContext::new(root_bank, shred_version);
         Self {
-            reed_solomon_cache,
             retransmit_sender,
             shred_filter_ctx,
+            parity_buffer: Vec::new(),
         }
     }
 
@@ -503,6 +587,19 @@ impl ShredRecoveryContext {
         self.shred_filter_ctx.maybe_update(root_bank);
     }
 
+    /// Returns true if SIMD-0504 `stricter_shred_validation` is effective for
+    /// shreds of the given slot.
+    pub(crate) fn is_stricter_shred_validation_active(&self, slot: Slot) -> bool {
+        self.shred_filter_ctx
+            .is_stricter_shred_validation_active(slot)
+    }
+
+    /// Returns the first slot for which SIMD-0504 `stricter_shred_validation`
+    /// is effective.
+    pub(crate) fn stricter_shred_validation_from(&self) -> Option<Slot> {
+        self.shred_filter_ctx.stricter_shred_validation_from
+    }
+
     /// Submit stats at most every two seconds
     pub fn maybe_submit_stats(&mut self) {
         self.shred_filter_ctx
@@ -510,72 +607,110 @@ impl ShredRecoveryContext {
     }
 
     /// Recover shreds and apply filtering to the recovered shreds
+    #[cfg(feature = "dev-context-only-utils")]
     pub fn recover<T: IntoIterator<Item = Shred>>(
         &mut self,
         shreds: T,
         recovered_shreds: &mut Vec<Payload>,
         recovered_data_shreds: &mut Vec<Shred>,
     ) -> Result<(), Error> {
-        let shreds = shreds
-            .into_iter()
-            .filter(|shred| !self.shred_filter_ctx.should_discard_shred(shred.payload()))
-            .map(|shred| {
-                debug_assert_matches!(
-                    shred.common_header().shred_variant,
-                    ShredVariant::MerkleCode { .. } | ShredVariant::MerkleData { .. }
-                );
-                merkle::Shred::try_from(shred)
-            })
-            .collect::<Result<_, _>>()?;
-
-        // With Merkle shreds, leader signs the Merkle root of the erasure batch
-        // and all shreds within the same erasure batch have the same signature.
-        // For recovered shreds, the (unique) signature is copied from shreds which
-        // were received from turbine (or repair) and are already sig-verified.
-        // The same signature also verifies for recovered shreds because when
-        // reconstructing the Merkle tree for the erasure batch, we will obtain the
-        // same Merkle root.
-        let shreds = merkle::recover(shreds, &self.reed_solomon_cache)?;
-        shreds
-            .filter_map(|shred| shred.ok().map(Shred::from))
-            .filter(|shred| !self.should_discard_shred(shred))
-            .for_each(|shred| {
-                // All shreds should be retransmitted, but because there are no
-                // more missing data shreds in the erasure batch, coding shreds
-                // are not stored in blockstore.
-                match shred.shred_type() {
-                    ShredType::Code => {
-                        // Don't need Arc overhead here!
-                        recovered_shreds.push(shred.into_payload());
-                    }
-                    ShredType::Data => {
-                        // Verify that the cloning is cheap here.
-                        recovered_shreds.push(shred.payload().clone());
-                        recovered_data_shreds.push(shred);
-                    }
-                }
-            });
+        let batch = self.rebuild_erasure_batch(shreds)?;
+        let shreds = self.check_recovered_shreds(batch);
+        Self::collect_recovered_shreds(shreds, recovered_shreds, recovered_data_shreds);
         Ok(())
     }
+
+    /// Rebuild the whole erasure batch from the given shreds, after applying
+    /// filtering to them.
+    ///
+    /// The leader signs the Merkle root of the erasure batch, so the same signature
+    /// is valid for every shred. For recovered shreds the signature is copied from shreds
+    /// which were received from turbine (or repair) and are already sig-verified. It
+    /// verifies for recovered shreds too, because rebuilding checks that the Merkle tree
+    /// of the erasure batch yields the same Merkle root.
+    ///
+    /// Once SIMD-0504 is active, received shreds may carry different signatures
+    /// over the same Merkle root.
+    pub(crate) fn rebuild_erasure_batch<T: IntoIterator<Item = Shred>>(
+        &mut self,
+        shreds: T,
+    ) -> Result<ErasureBatch, Error> {
+        let shreds: Vec<_> = shreds
+            .into_iter()
+            .filter(|shred| !self.shred_filter_ctx.should_discard_shred(shred.payload()))
+            .collect();
+        let must_match_signatures = !shreds
+            .first()
+            .is_some_and(|shred| self.is_stricter_shred_validation_active(shred.slot()));
+
+        merkle::rebuild_erasure_batch_with_buffer(
+            shreds,
+            must_match_signatures,
+            &mut self.parity_buffer,
+        )
+    }
+
+    /// Checks the reconstructed shreds of the erasure batch.
+    ///
+    /// Yields `Err(())` in place of each reconstructed shred which fails filtering.
+    pub(crate) fn check_recovered_shreds(
+        &mut self,
+        batch: ErasureBatch,
+    ) -> impl Iterator<Item = Result<Shred, ()>> + '_ {
+        batch.into_recovered().map(|shred| {
+            if self.should_discard_shred(&shred) {
+                Err(())
+            } else {
+                Ok(shred)
+            }
+        })
+    }
+
+    /// Collect checked reconstructed shreds for retransmit and blockstore
+    /// insertion, skipping the ones which failed the checks.
+    ///
+    /// Returns true if any of the shreds failed the checks.
+    pub(crate) fn collect_recovered_shreds(
+        shreds: impl IntoIterator<Item = Result<Shred, ()>>,
+        recovered_shreds: &mut Vec<Payload>,
+        recovered_data_shreds: &mut Vec<Shred>,
+    ) -> bool {
+        let mut invalid_shreds_found = false;
+        for shred in shreds {
+            let Ok(shred) = shred else {
+                invalid_shreds_found = true;
+                continue;
+            };
+            // All shreds should be retransmitted, but because there are no
+            // more missing data shreds in the erasure batch, coding shreds
+            // are not stored in blockstore.
+            match shred.shred_type() {
+                ShredType::Code => {
+                    // Don't need Arc overhead here!
+                    recovered_shreds.push(shred.into_payload());
+                }
+                ShredType::Data => {
+                    // Verify that the cloning is cheap here.
+                    recovered_shreds.push(shred.payload().clone());
+                    recovered_data_shreds.push(shred);
+                }
+            }
+        }
+        invalid_shreds_found
+    }
+
     /// Send recovered shreds for retransmit
     pub fn try_retransmit_shreds(&self, recovered_shreds: Vec<Payload>) {
-        if !recovered_shreds.is_empty() {
-            let _ = self.retransmit_sender.try_send(recovered_shreds);
+        for shreds in &recovered_shreds
+            .into_iter()
+            .chunks(RETRANSMIT_SHRED_BATCH_SIZE)
+        {
+            let _ = self.retransmit_sender.try_send(shreds.collect());
         }
     }
 
-    /// If SIMD-0337 is active, apply filtering rules to recovered shreds
+    /// Apply filtering rules to recovered shreds.
     pub fn should_discard_shred(&mut self, shred: &Shred) -> bool {
-        if !check_feature_activation(
-            self.shred_filter_ctx
-                .discard_unexpected_data_complete_shreds_feature_slot,
-            shred.slot(),
-            &self.shred_filter_ctx.epoch_schedule,
-        ) {
-            // Only apply filtering rules to recovered shreds when SIMD-0337 is active
-            return false;
-        }
-
         self.shred_filter_ctx.should_discard_shred(shred.payload())
     }
 }
@@ -584,19 +719,32 @@ impl ShredRecoveryContext {
 mod tests {
     use {
         super::{
-            super::{Shred, make_merkle_shreds_for_tests},
+            super::{
+                CODING_SHREDS_PER_FEC_BLOCK, PROOF_ENTRIES_FOR_32_32_BATCH, Shred,
+                make_merkle_shreds_for_tests, override_proof_size,
+            },
             *,
         },
         crate::{
             genesis_utils::create_genesis_config,
             shred::{MAX_CODE_SHREDS_PER_SLOT, tests::*},
         },
-        assert_matches::assert_matches,
+        agave_shred_wire_format::constants::{
+            OFFSET_OF_DATA_SIZE, OFFSET_OF_FEC_SET_INDEX, OFFSET_OF_FLAGS, OFFSET_OF_INDEX,
+            OFFSET_OF_NUM_DATA_SHREDS, OFFSET_OF_VARIANT,
+        },
         itertools::Itertools,
+        solana_clock::DEFAULT_NS_PER_TICK_400_MS,
+        solana_keypair::Keypair,
         solana_leader_schedule::SlotLeader,
-        solana_perf::packet::{Packet, PacketFlags},
-        solana_runtime::bank::Bank,
+        solana_perf::packet::{BytesPacket, PacketFlags},
+        solana_runtime::{
+            bank::Bank,
+            slot_params::{slot_time_feature_gates, slot_time_feature_ids},
+        },
+        solana_signer::Signer,
         std::{
+            assert_matches,
             io::{Cursor, Seek, SeekFrom, Write},
             sync::Arc,
             time::Duration,
@@ -604,20 +752,66 @@ mod tests {
         test_case::test_case,
     };
 
-    fn new_test_bank(slot: Slot, discard_unexpected_data_complete_shreds: bool) -> Arc<Bank> {
+    fn to_packet(payload: &[u8]) -> BytesPacket {
+        BytesPacket::from_bytes(None, payload.to_vec())
+    }
+
+    fn new_test_bank(slot: Slot) -> Arc<Bank> {
         let genesis_config = create_genesis_config(1).genesis_config;
-        let mut bank = Bank::new_for_tests(&genesis_config);
-        let feature_id = agave_feature_set::discard_unexpected_data_complete_shreds::id();
-        bank.deactivate_feature(&feature_id);
-        if discard_unexpected_data_complete_shreds {
-            bank.activate_feature(&feature_id);
-        }
+        let bank = Bank::new_for_tests(&genesis_config);
         let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
         if slot == 0 {
             bank
         } else {
             Bank::new_from_parent_with_bank_forks(&bank_forks, bank, SlotLeader::default(), slot)
         }
+    }
+
+    fn deactivate_slot_time_features(bank: &mut Bank) {
+        for feature_id in slot_time_feature_ids() {
+            bank.deactivate_feature(&feature_id);
+        }
+    }
+
+    /// Returns a root bank with the slot-time gates deactivated, then applies
+    /// `activate` and `deactivate` sets on top. The activated gates activate in
+    /// the epoch the returned bank is in.
+    ///
+    /// Test genesis enables every feature, so a gate that has to be off for a
+    /// test must be named in `deactivate`.
+    fn root_bank_for_tests(
+        activate: impl IntoIterator<Item = Pubkey>,
+        deactivate: impl IntoIterator<Item = Pubkey>,
+    ) -> Arc<Bank> {
+        let mut genesis_config = create_genesis_config(1).genesis_config;
+        genesis_config.poh_config.target_tick_duration =
+            Duration::from_nanos(DEFAULT_NS_PER_TICK_400_MS);
+        let mut root_bank = Bank::new_for_tests(&genesis_config);
+        deactivate_slot_time_features(&mut root_bank);
+        for feature_id in activate {
+            root_bank.activate_feature(&feature_id);
+        }
+        for feature_id in deactivate {
+            root_bank.deactivate_feature(&feature_id);
+        }
+        let (root_bank, _) = root_bank.wrap_with_bank_forks_for_tests();
+        root_bank
+    }
+
+    /// First slot for which a gate activated in `root_bank`'s epoch is effective.
+    /// Shred feature gates take effect 1 epoch after activation.
+    fn first_gated_slot(root_bank: &Bank) -> Slot {
+        root_bank
+            .epoch_schedule()
+            .get_first_slot_in_epoch(root_bank.epoch() + 1)
+    }
+
+    fn shred_filter_for_tests(
+        feature_ids: impl IntoIterator<Item = Pubkey>,
+    ) -> (ShredFilterContext, Slot) {
+        let root_bank = root_bank_for_tests(feature_ids, []);
+        let effective_slot = first_gated_slot(&root_bank);
+        (ShredFilterContext::new(root_bank, 0), effective_slot)
     }
 
     #[test_case(true ; "last_in_slot")]
@@ -633,143 +827,133 @@ mod tests {
             is_last_in_slot,
         )
         .unwrap();
-        let shreds: Vec<_> = shreds.into_iter().map(Shred::from).collect();
         assert_eq!(shreds.iter().map(Shred::fec_set_index).dedup().count(), 1);
 
         assert_matches!(shreds[0].shred_type(), ShredType::Data);
         let parent_slot = shreds[0].parent().unwrap();
         let shred_version = shreds[0].common_header().version;
 
-        let root_bank = new_test_bank(0, false);
-        let parent_exceeded_root_bank = new_test_bank(parent_slot + 1, false);
-        let slot_root_bank = new_test_bank(slot, false);
-        let mut packet = Packet::default();
+        let root_bank = new_test_bank(0);
+        let parent_exceeded_root_bank = new_test_bank(parent_slot + 1);
+        let slot_root_bank = new_test_bank(slot);
+        let mut payload = shreds[0].payload().to_vec();
 
         {
-            let shred = shreds.first().unwrap();
-            assert_eq!(shred.shred_type(), ShredType::Data);
-            shred.copy_to_packet(&mut packet);
+            assert_eq!(shreds[0].shred_type(), ShredType::Data);
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(!shred_filter_context.should_discard_packet(&packet));
+            assert!(!shred_filter_context.should_discard_packet(&to_packet(&payload)));
         }
         {
-            let mut packet = packet.clone();
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            packet.meta_mut().size = OFFSET_OF_SHRED_VARIANT;
+            let packet = to_packet(&payload[..OFFSET_OF_VARIANT]);
             assert!(shred_filter_context.should_discard_packet(&packet));
             assert_eq!(shred_filter_context.stats.index_overrun, 1);
 
-            packet.meta_mut().size = OFFSET_OF_SHRED_INDEX;
+            let packet = to_packet(&payload[..OFFSET_OF_INDEX]);
             assert!(shred_filter_context.should_discard_packet(&packet));
             assert_eq!(shred_filter_context.stats.index_overrun, 2);
 
-            packet.meta_mut().size = OFFSET_OF_SHRED_INDEX + 1;
+            let packet = to_packet(&payload[..OFFSET_OF_INDEX + 1]);
             assert!(shred_filter_context.should_discard_packet(&packet));
             assert_eq!(shred_filter_context.stats.index_overrun, 3);
 
-            packet.meta_mut().size = OFFSET_OF_SHRED_INDEX + SIZE_OF_SHRED_INDEX - 1;
+            let packet = to_packet(&payload[..OFFSET_OF_INDEX + SIZE_OF_SHRED_INDEX - 1]);
             assert!(shred_filter_context.should_discard_packet(&packet));
             assert_eq!(shred_filter_context.stats.index_overrun, 4);
 
-            packet.meta_mut().size = OFFSET_OF_SHRED_INDEX + SIZE_OF_SHRED_INDEX + 2;
+            let packet = to_packet(&payload[..OFFSET_OF_INDEX + SIZE_OF_SHRED_INDEX + 2]);
             assert!(shred_filter_context.should_discard_packet(&packet));
             assert_eq!(shred_filter_context.stats.index_overrun, 5);
         }
         {
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version.wrapping_add(1));
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.shred_version_mismatch, 1);
         }
         {
             let mut shred_filter_context =
                 ShredFilterContext::new(parent_exceeded_root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.slot_out_of_range, 1);
         }
         {
             let parent_offset = 0u16;
             {
-                let mut cursor = Cursor::new(packet.buffer_mut());
+                let mut cursor = Cursor::new(&mut payload[..]);
                 cursor.seek(SeekFrom::Start(83)).unwrap();
                 cursor.write_all(&parent_offset.to_le_bytes()).unwrap();
             }
-            assert_eq!(
-                layout::get_parent_offset(packet.data(..).unwrap()),
-                Some(parent_offset)
-            );
+            assert_eq!(layout::get_parent_offset(&payload), Some(parent_offset));
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.slot_out_of_range, 1);
         }
         {
             let parent_offset = u16::try_from(slot + 1).unwrap();
             {
-                let mut cursor = Cursor::new(packet.buffer_mut());
+                let mut cursor = Cursor::new(&mut payload[..]);
                 cursor.seek(SeekFrom::Start(83)).unwrap();
                 cursor.write_all(&parent_offset.to_le_bytes()).unwrap();
             }
-            assert_eq!(
-                layout::get_parent_offset(packet.data(..).unwrap()),
-                Some(parent_offset)
-            );
+            assert_eq!(layout::get_parent_offset(&payload), Some(parent_offset));
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.bad_parent_offset, 1);
         }
         {
             let index = u32::MAX - 10;
             {
-                let mut cursor = Cursor::new(packet.buffer_mut());
+                let mut cursor = Cursor::new(&mut payload[..]);
                 cursor
-                    .seek(SeekFrom::Start(OFFSET_OF_SHRED_INDEX as u64))
+                    .seek(SeekFrom::Start(OFFSET_OF_INDEX as u64))
                     .unwrap();
                 cursor.write_all(&index.to_le_bytes()).unwrap();
             }
-            assert_eq!(layout::get_index(packet.data(..).unwrap()), Some(index));
+            assert_eq!(layout::get_index(&payload), Some(index));
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.index_out_of_bounds, 1);
         }
 
         {
             let shred = shreds.last().unwrap();
             assert_eq!(shred.shred_type(), ShredType::Code);
-            shreds.last().unwrap().copy_to_packet(&mut packet);
+            payload = shred.payload().to_vec();
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(!shred_filter_context.should_discard_packet(&packet));
+            assert!(!shred_filter_context.should_discard_packet(&to_packet(&payload)));
         }
         {
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version.wrapping_add(1));
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.shred_version_mismatch, 1);
         }
         {
             let mut shred_filter_context =
                 ShredFilterContext::new(slot_root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.slot_out_of_range, 1);
         }
         {
             let index = u32::try_from(MAX_CODE_SHREDS_PER_SLOT).unwrap();
             {
-                let mut cursor = Cursor::new(packet.buffer_mut());
+                let mut cursor = Cursor::new(&mut payload[..]);
                 cursor
-                    .seek(SeekFrom::Start(OFFSET_OF_SHRED_INDEX as u64))
+                    .seek(SeekFrom::Start(OFFSET_OF_INDEX as u64))
                     .unwrap();
                 cursor.write_all(&index.to_le_bytes()).unwrap();
             }
-            assert_eq!(layout::get_index(packet.data(..).unwrap()), Some(index));
+            assert_eq!(layout::get_index(&payload), Some(index));
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.index_out_of_bounds, 1);
         }
     }
@@ -786,7 +970,6 @@ mod tests {
             false,    // is_last_in_slot
         )
         .unwrap();
-        let shreds: Vec<_> = shreds.into_iter().map(Shred::from).collect();
         let coding_shreds: Vec<_> = shreds
             .into_iter()
             .filter(|shred| shred.shred_type() == ShredType::Code)
@@ -796,13 +979,10 @@ mod tests {
         // Feed recovery only coding shreds. Without the custom limit below, this
         // is enough parity to recover the missing data shreds.
         let max_code_shreds_per_slot = coding_shreds[0].index();
-        let (dummy_retransmit_sender, _) = EvictingSender::new_bounded(0);
-        let mut shred_recovery_context = ShredRecoveryContext::new(
-            ReedSolomonCache::default(),
-            dummy_retransmit_sender,
-            new_test_bank(0, false),
-            shred_version,
-        );
+        let dummy_retransmit_sender = new_dummy_retransmit_sender();
+        let mut shred_recovery_context =
+            ShredRecoveryContext::new(dummy_retransmit_sender, new_test_bank(0), shred_version);
+
         shred_recovery_context
             .shred_filter_ctx
             .set_shred_limits_for_tests(ShredLimits::new(
@@ -814,7 +994,7 @@ mod tests {
         let mut recovered_shreds = Vec::new();
         let mut recovered_data_shreds = Vec::new();
 
-        // Recovery sees insufficient parity shreds and cannot recover the FEC.
+        // Recovery sees insufficient shreds and cannot recover the FEC.
         assert_matches!(
             shred_recovery_context.recover(
                 coding_shreds,
@@ -822,18 +1002,89 @@ mod tests {
                 &mut recovered_data_shreds,
             ),
             Err(Error::Erasure(
-                reed_solomon_erasure::Error::TooFewParityShards
+                reed_solomon_erasure::Error::TooFewShardsPresent
             ))
         );
         assert!(recovered_shreds.is_empty());
         assert!(recovered_data_shreds.is_empty());
     }
 
+    /// SIMD-0504 allows shreds of a FEC set to carry different signatures over the same Merkle
+    /// root. Recovery must reject such FEC sets until the feature is active for the shred
+    /// slot, and allow after.
+    #[test]
+    fn test_rebuild_erasure_batch_mixed_signatures_feature_gate() {
+        let mut rng = rand::rng();
+        let feature_gate_id = feature_set::stricter_shred_validation::id();
+        let root_bank = root_bank_for_tests([feature_gate_id], []);
+        let root_epoch = root_bank.epoch();
+        let first_slot = first_gated_slot(&root_bank);
+        assert_eq!(
+            first_slot,
+            root_bank.slot()
+                + root_bank
+                    .epoch_schedule()
+                    .get_last_slot_in_epoch(root_epoch)
+                + 1
+        );
+        let stub_retransmit_sender = new_dummy_retransmit_sender();
+
+        let mut rebuild_mixed_signatures = |slot: Slot| {
+            let data_size = 1200 * 5;
+            let is_last_in_slot = true;
+            let shreds =
+                make_merkle_shreds_for_tests(&mut rng, slot, data_size, is_last_in_slot).unwrap();
+            let shred_version = shreds[0].common_header().version;
+            let (data_shreds, coding_shreds): (Vec<_>, Vec<_>) = shreds
+                .into_iter()
+                .partition(|shred| shred.shred_type() == ShredType::Data);
+            // Drop some data shreds, so the coding shred takes part in the rebuild.
+            let mut subset: Vec<Shred> = data_shreds[..DATA_SHREDS_PER_FEC_BLOCK - 2]
+                .iter()
+                .chain(coding_shreds[0..2].iter())
+                .cloned()
+                .collect();
+            let merkle_root = subset[0].merkle_root().unwrap();
+            // overwrite the signature of one data and one code shred
+            subset[0].set_signature(Keypair::new().sign_message(merkle_root.as_ref()));
+            subset[DATA_SHREDS_PER_FEC_BLOCK - 1]
+                .set_signature(Keypair::new().sign_message(merkle_root.as_ref()));
+
+            let mut shred_recovery_context = ShredRecoveryContext::new(
+                stub_retransmit_sender.clone(),
+                root_bank.clone(),
+                shred_version,
+            );
+            (
+                shred_recovery_context.is_stricter_shred_validation_active(slot),
+                shred_recovery_context.rebuild_erasure_batch(subset),
+            )
+        };
+
+        let (feature_active, result) = rebuild_mixed_signatures(first_slot - 1);
+        assert!(
+            !feature_active,
+            "the feature should not be active in the activation epoch (because turbine)"
+        );
+        assert_matches!(
+            result.err(),
+            Some(Error::InvalidMerkleRoot),
+            "mixed signatures should be rejected until SIMD-0504 is active"
+        );
+
+        let (gate_active, result) = rebuild_mixed_signatures(first_slot);
+        assert!(gate_active, "the feature should be active at this time");
+        assert!(
+            result.is_ok(),
+            "mixed signatures over the same Merkle root should rebuild once SIMD-0504 is active"
+        );
+    }
+
     #[test]
     fn test_should_discard_packet_with_turbine_mode() {
         agave_logger::setup();
         let mut rng = rand::rng();
-        let root_bank = new_test_bank(0, false);
+        let root_bank = new_test_bank(0);
         let shreds = make_merkle_shreds_for_tests(
             &mut rng,
             42,
@@ -841,11 +1092,10 @@ mod tests {
             false,    // is_last_in_slot
         )
         .unwrap();
-        let shred = Shred::from(shreds[0].clone());
+        let shred = shreds[0].clone();
         let shred_version = shred.common_header().version;
         let turbine_mode = TurbineMode::new(TurbineModeKind::TurbineDisabled);
-        let mut packet = Packet::default();
-        shred.copy_to_packet(&mut packet);
+        let mut packet = shred.payload().to_bytes_packet(None);
 
         let mut shred_filter_context = ShredFilterContext::new_with_turbine_mode(
             root_bank.clone(),
@@ -881,20 +1131,18 @@ mod tests {
             false,    // is_last_in_slot
         )
         .unwrap();
-        let shreds: Vec<_> = shreds.into_iter().map(Shred::from).collect();
         assert_eq!(shreds.iter().map(Shred::fec_set_index).dedup().count(), 1);
 
         assert_matches!(shreds[0].shred_type(), ShredType::Data);
         let shred_version = shreds[0].common_header().version;
-        let root_bank = new_test_bank(0, false);
+        let root_bank = new_test_bank(0);
 
         {
-            let mut packet = Packet::default();
-            shreds[0].copy_to_packet(&mut packet);
+            let mut payload = shreds[0].payload().to_vec();
 
             let bad_fec_set_index = 5u32;
             {
-                let mut cursor = Cursor::new(packet.buffer_mut());
+                let mut cursor = Cursor::new(&mut payload[..]);
                 cursor
                     .seek(SeekFrom::Start(OFFSET_OF_FEC_SET_INDEX as u64))
                     .unwrap();
@@ -903,20 +1151,19 @@ mod tests {
 
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.misaligned_fec_set, 1);
         }
 
         {
-            let mut packet = Packet::default();
-            shreds[0].copy_to_packet(&mut packet);
+            let mut payload = shreds[0].payload().to_vec();
 
             let fec_set_index = 64u32;
             let bad_index = 100u32;
             {
-                let mut cursor = Cursor::new(packet.buffer_mut());
+                let mut cursor = Cursor::new(&mut payload[..]);
                 cursor
-                    .seek(SeekFrom::Start(OFFSET_OF_SHRED_INDEX as u64))
+                    .seek(SeekFrom::Start(OFFSET_OF_INDEX as u64))
                     .unwrap();
                 cursor.write_all(&bad_index.to_le_bytes()).unwrap();
                 cursor
@@ -927,7 +1174,7 @@ mod tests {
 
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.misaligned_fec_set, 1);
         }
 
@@ -936,21 +1183,20 @@ mod tests {
                 .iter()
                 .find(|s| s.shred_type() == ShredType::Code)
                 .unwrap();
-            let mut packet = Packet::default();
-            code_shred.copy_to_packet(&mut packet);
+            let mut payload = code_shred.payload().to_vec();
 
             let bad_num_data = 16u16;
             {
-                let mut cursor = Cursor::new(packet.buffer_mut());
+                let mut cursor = Cursor::new(&mut payload[..]);
                 cursor
-                    .seek(SeekFrom::Start(OFFSET_OF_NUM_DATA as u64))
+                    .seek(SeekFrom::Start(OFFSET_OF_NUM_DATA_SHREDS as u64))
                     .unwrap();
                 cursor.write_all(&bad_num_data.to_le_bytes()).unwrap();
             }
 
             let mut shred_filter_context =
                 ShredFilterContext::new(root_bank.clone(), shred_version);
-            assert!(shred_filter_context.should_discard_packet(&packet));
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
             assert_eq!(shred_filter_context.stats.misaligned_erasure_config, 1);
         }
 
@@ -961,7 +1207,6 @@ mod tests {
             true,     // is_last_in_slot
         )
         .unwrap();
-        let shreds: Vec<_> = shreds.into_iter().map(Shred::from).collect();
         let shred_version = shreds[0].common_header().version;
         let data_shreds: Vec<_> = shreds
             .iter()
@@ -969,15 +1214,15 @@ mod tests {
             .collect();
         let last_data_shred = data_shreds.last().unwrap();
         assert!(last_data_shred.last_in_slot());
-        let mut packet = Packet::default();
-        last_data_shred.copy_to_packet(&mut packet);
+        let mut payload = last_data_shred.payload().to_vec();
 
-        let bad_last_index = 30u32;
-        let fec_set_index = 0u32;
+        // Keep DATA_COMPLETE placement valid so this isolates LAST_SHRED_IN_SLOT alignment.
+        let fec_set_index = 1u32;
+        let bad_last_index = fec_set_index + DATA_SHREDS_PER_FEC_BLOCK as u32 - 1;
         {
-            let mut cursor = Cursor::new(packet.buffer_mut());
+            let mut cursor = Cursor::new(&mut payload[..]);
             cursor
-                .seek(SeekFrom::Start(OFFSET_OF_SHRED_INDEX as u64))
+                .seek(SeekFrom::Start(OFFSET_OF_INDEX as u64))
                 .unwrap();
             cursor.write_all(&bad_last_index.to_le_bytes()).unwrap();
             cursor
@@ -987,8 +1232,246 @@ mod tests {
         }
 
         let mut shred_filter_context = ShredFilterContext::new(root_bank.clone(), shred_version);
-        assert!(shred_filter_context.should_discard_packet(&packet));
+        assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
         assert_eq!(shred_filter_context.stats.misaligned_last_data_index, 1);
+    }
+
+    // Returns a root bank with `enforce_correct_proof_size` activated or deactivated.
+    fn proof_size_test_bank(enforce: bool) -> Arc<Bank> {
+        let feature_id = feature_set::enforce_correct_proof_size::id();
+        if enforce {
+            root_bank_for_tests([feature_id], [])
+        } else {
+            root_bank_for_tests([], [feature_id])
+        }
+    }
+
+    // Shred feature flags take effect 1 epoch after activation, so the boundary
+    // sits on the first slot of the epoch following the one the feature activated in.
+    #[test_case(true ; "activated")]
+    #[test_case(false ; "not_activated")]
+    fn test_feature_effective_slot_boundary(enforce: bool) {
+        let feature_id = feature_set::enforce_correct_proof_size::id();
+        let root_bank = proof_size_test_bank(enforce);
+        let expected_slot = first_gated_slot(&root_bank);
+        assert!(expected_slot > root_bank.slot());
+        let effective_slot = feature_first_effective_slot(&feature_id, &root_bank);
+        assert_eq!(
+            effective_slot.is_some(),
+            enforce,
+            "first effective slot is known exactly when the feature is activated"
+        );
+        let Some(effective_slot) = effective_slot else {
+            assert!(
+                !check_feature_activation_from_bank(&feature_id, expected_slot, &root_bank),
+                "feature should not be activated if effective slot is not known"
+            );
+            return;
+        };
+        assert_eq!(
+            effective_slot, expected_slot,
+            "feature takes effect on the first slot of the epoch following activation"
+        );
+        assert!(
+            !check_feature_activation_from_bank(&feature_id, effective_slot - 1, &root_bank),
+            "feature is not effective on the slot preceding the boundary"
+        );
+        assert!(
+            check_feature_activation_from_bank(&feature_id, effective_slot, &root_bank),
+            "feature is effective on the boundary slot"
+        );
+    }
+
+    /// 100-slot epochs, no warmup. Epoch boundaries at 100, 200, 300.
+    fn uniform_epochs() -> EpochSchedule {
+        EpochSchedule::custom(100, 100, false)
+    }
+
+    /// 100-slot epochs with warmup, so epoch 0 spans 32 slots and epoch 1 spans 64 before
+    /// epochs reach full length. Epoch boundaries at 32, 96, 196, 296.
+    fn warmup_epochs() -> EpochSchedule {
+        EpochSchedule::custom(100, 100, true)
+    }
+
+    // Shred related feature gates activate 1 epoch later than normal.
+    //
+    // Activation slots below are the ones the runtime can actually record: features activate at
+    // an epoch boundary, so `activated_slot` is the first slot of an epoch, or the first slot
+    // after it that was not skipped.
+    #[test_case(uniform_epochs(), None, 100 => false ; "inactive feature")]
+    #[test_case(uniform_epochs(), Some(0), 99 => false ; "genesis activation, end of epoch 0")]
+    #[test_case(uniform_epochs(), Some(0), 100 => true ; "genesis activation, start of epoch 1")]
+    #[test_case(uniform_epochs(), Some(100), 199 => false ; "boundary activation, end of activation epoch")]
+    #[test_case(uniform_epochs(), Some(100), 200 => true ; "boundary activation, start of next epoch")]
+    #[test_case(uniform_epochs(), Some(103), 199 => false ; "skipped boundary slot, end of activation epoch")]
+    #[test_case(uniform_epochs(), Some(103), 200 => true ; "skipped boundary slot, start of next epoch")]
+    #[test_case(uniform_epochs(), Some(100), 99 => false ; "shred older than activation")]
+    #[test_case(warmup_epochs(), Some(0), 31 => false ; "warmup, end of short epoch 0")]
+    #[test_case(warmup_epochs(), Some(0), 32 => true ; "warmup, start of epoch 1")]
+    #[test_case(warmup_epochs(), Some(32), 95 => false ; "warmup, end of epoch 1")]
+    #[test_case(warmup_epochs(), Some(32), 96 => true ; "warmup, start of first full epoch")]
+    #[test_case(warmup_epochs(), Some(96), 195 => false ; "warmup, end of first full epoch")]
+    #[test_case(warmup_epochs(), Some(96), 196 => true ; "warmup, start of epoch 3")]
+    fn test_feature_activation_slot_formula(
+        epoch_schedule: EpochSchedule,
+        feature_slot: Option<Slot>,
+        shred_slot: Slot,
+    ) -> bool {
+        check_feature_activation(feature_slot, shred_slot, &epoch_schedule)
+    }
+
+    /// SIMD-0504 requires `position == index - fec_set_index` for coding shreds.
+    /// A coding shred violating it is counted, and discarded once the feature is
+    /// effective.
+    #[test]
+    fn test_should_discard_shred_misaligned_coding_position() {
+        agave_logger::setup();
+        let mut rng = rand::rng();
+        let feature_id = feature_set::stricter_shred_validation::id();
+        let enforcing_bank = root_bank_for_tests([feature_id], []);
+        let permissive_bank = root_bank_for_tests([], [feature_id]);
+        let slot = first_gated_slot(&enforcing_bank);
+        let data_size = 1200 * 5;
+        let is_last_in_slot = false;
+        let shreds =
+            make_merkle_shreds_for_tests(&mut rng, slot, data_size, is_last_in_slot).unwrap();
+        let shred_version = shreds[0].common_header().version;
+        let shred = shreds
+            .iter()
+            .find(|shred| shred.shred_type() == ShredType::Code)
+            .expect("shredder should produce coding shreds");
+        let mut payload = shred.payload().to_vec();
+        let position = layout::get_position(&payload).expect("coding shred should have a position");
+        let bad_position = (position + 1) % CODING_SHREDS_PER_FEC_BLOCK as u16;
+        payload[87..87 + 2].copy_from_slice(&bad_position.to_le_bytes());
+        assert_eq!(layout::get_position(&payload).unwrap(), bad_position);
+
+        for (root_bank, expect_discard) in [(permissive_bank, false), (enforcing_bank, true)] {
+            let mut shred_filter_context = ShredFilterContext::new(root_bank, shred_version);
+            for shred in &shreds {
+                assert!(!shred_filter_context.should_discard_packet(&to_packet(shred.payload())));
+            }
+            assert_eq!(
+                shred_filter_context.stats.misaligned_coding_position, 0,
+                "shredder output should have aligned coding positions"
+            );
+            assert_eq!(
+                shred_filter_context.should_discard_packet(&to_packet(&payload)),
+                expect_discard,
+                "misaligned coding position is discarded only under the feature gate"
+            );
+            assert_eq!(shred_filter_context.stats.misaligned_coding_position, 1);
+        }
+    }
+
+    // Shreds produced by the shredder must pass the new checks, otherwise
+    // activating the feature would stall the cluster.
+    #[test_case(true ; "last_in_slot")]
+    #[test_case(false ; "not_last_in_slot")]
+    fn test_correct_proof_size_accepts_well_formed_shreds(is_last_in_slot: bool) {
+        agave_logger::setup();
+        let mut rng = rand::rng();
+        let root_bank = proof_size_test_bank(/*enforce:*/ true);
+        let slot = first_gated_slot(&root_bank);
+        let shreds = make_merkle_shreds_for_tests(
+            &mut rng,
+            slot,
+            1200 * 5, // data_size
+            is_last_in_slot,
+        )
+        .unwrap();
+        let shred_version = shreds[0].common_header().version;
+        let mut shred_filter_context = ShredFilterContext::new(root_bank, shred_version);
+        for shred in &shreds {
+            let packet = shred.payload().to_bytes_packet(None);
+            assert!(!shred_filter_context.should_discard_packet(&packet));
+        }
+    }
+
+    // The filter works on the wire payload, so proof heights on either side of
+    // the one a 32:32 erasure set implies are reachable here, including heights
+    // whose shred would no longer deserialize.
+    #[test_case(0 ; "proof_size_0")]
+    #[test_case(PROOF_ENTRIES_FOR_32_32_BATCH - 1 ; "proof_size_5")]
+    #[test_case(PROOF_ENTRIES_FOR_32_32_BATCH + 1 ; "proof_size_7")]
+    #[test_case(0x0F ; "proof_size_15")]
+    fn test_should_discard_shred_bad_proof_size(bad_proof_size: u8) {
+        agave_logger::setup();
+        let mut rng = rand::rng();
+        let enforcing_bank = proof_size_test_bank(/*enforce:*/ true);
+        let permissive_bank = proof_size_test_bank(/*enforce:*/ false);
+        let slot = first_gated_slot(&enforcing_bank);
+        let shreds = make_merkle_shreds_for_tests(
+            &mut rng,
+            slot,
+            1200 * 5, // data_size
+            false,    // is_last_in_slot
+        )
+        .unwrap();
+        let shred_version = shreds[0].common_header().version;
+
+        for shred_type in [ShredType::Data, ShredType::Code] {
+            let shred = shreds
+                .iter()
+                .find(|shred| shred.shred_type() == shred_type)
+                .unwrap();
+            let mut payload = shred.payload().to_vec();
+            assert_eq!(
+                shred.common_header().shred_variant.proof_size(),
+                PROOF_ENTRIES_FOR_32_32_BATCH
+            );
+            override_proof_size(&mut payload, bad_proof_size);
+
+            let mut shred_filter_context =
+                ShredFilterContext::new(permissive_bank.clone(), shred_version);
+            assert!(!shred_filter_context.should_discard_packet(&to_packet(&payload)));
+
+            let mut shred_filter_context =
+                ShredFilterContext::new(enforcing_bank.clone(), shred_version);
+            assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
+            assert_eq!(shred_filter_context.stats.invalid_proof_size, 1);
+        }
+    }
+
+    #[test]
+    fn test_should_discard_shred_bad_data_size() {
+        agave_logger::setup();
+        let mut rng = rand::rng();
+        let enforcing_bank = proof_size_test_bank(/*enforce:*/ true);
+        let permissive_bank = proof_size_test_bank(/*enforce:*/ false);
+        let slot = first_gated_slot(&enforcing_bank);
+        let shreds = make_merkle_shreds_for_tests(
+            &mut rng,
+            slot,
+            1200 * 5, // data_size
+            false,    // is_last_in_slot
+        )
+        .unwrap();
+        let shred_version = shreds[0].common_header().version;
+
+        let shred = shreds
+            .iter()
+            .find(|shred| shred.shred_type() == ShredType::Data)
+            .unwrap();
+        let mut payload = shred.payload().to_vec();
+        // Larger than the data buffer of a shred in a 32:32 erasure set.
+        let bad_size = u16::MAX;
+        payload[OFFSET_OF_DATA_SIZE..][..2].copy_from_slice(&bad_size.to_le_bytes());
+
+        // Rejecting a shred the rest of the cluster still accepts would fork it,
+        // so the bound only applies once the feature is active.
+        for (root_bank, expect_discard) in [(permissive_bank, false), (enforcing_bank, true)] {
+            let mut shred_filter_context = ShredFilterContext::new(root_bank, shred_version);
+            assert_eq!(
+                shred_filter_context.should_discard_packet(&to_packet(&payload)),
+                expect_discard,
+                "bad data size is discarded only under the feature gate"
+            );
+            assert_eq!(
+                shred_filter_context.stats.invalid_data_size, 1,
+                "bad data size is counted whether or not the feature gate discards it"
+            );
+        }
     }
 
     #[test]
@@ -1003,9 +1486,8 @@ mod tests {
             false,    // is_last_in_slot
         )
         .unwrap();
-        let shreds: Vec<_> = shreds.into_iter().map(Shred::from).collect();
         let shred_version = shreds[0].common_header().version;
-        let root_bank = new_test_bank(0, false);
+        let root_bank = new_test_bank(0);
 
         for shred_type in [ShredType::Data, ShredType::Code] {
             let shred = shreds
@@ -1047,10 +1529,40 @@ mod tests {
     }
 
     #[test]
+    fn test_shred_limit_for_slot_times() {
+        for (features, shred_limits) in std::iter::once((vec![], ShredLimits::DEFAULT)).chain(
+            slot_time_feature_gates().map(|(feature_id, params)| {
+                (
+                    vec![feature_id],
+                    ShredLimits::new(
+                        params.max_data_shreds_per_slot(),
+                        params.max_code_shreds_per_slot(),
+                    ),
+                )
+            }),
+        ) {
+            let (shred_filter, effective_slot) = shred_filter_for_tests(features);
+            assert_eq!(
+                shred_filter.shred_limits(effective_slot.saturating_sub(1)),
+                ShredLimits::DEFAULT
+            );
+            assert_eq!(shred_filter.shred_limits(effective_slot), shred_limits);
+        }
+
+        let [reduce_to_350ms, _, _, reduce_to_200ms] = slot_time_feature_ids();
+        let (shred_filter, effective_slot) =
+            shred_filter_for_tests([reduce_to_350ms, reduce_to_200ms]);
+        assert_eq!(
+            shred_filter.shred_limits(effective_slot),
+            ShredLimits::new(16_384, 16_384)
+        );
+    }
+
+    #[test]
     fn test_data_complete_shred_index_validation() {
         agave_logger::setup();
         let mut rng = rand::rng();
-        let root_bank = new_test_bank(0, true);
+        let root_bank = new_test_bank(0);
         let slot = root_bank.get_slots_in_epoch(root_bank.epoch());
         let shreds = make_merkle_shreds_for_tests(
             &mut rng,
@@ -1059,7 +1571,6 @@ mod tests {
             false,    // is_last_in_slot
         )
         .unwrap();
-        let shreds: Vec<_> = shreds.into_iter().map(Shred::from).collect();
 
         let data_shred = shreds
             .iter()
@@ -1068,16 +1579,15 @@ mod tests {
 
         let shred_version = data_shred.common_header().version;
 
-        let mut packet = Packet::default();
-        data_shred.copy_to_packet(&mut packet);
+        let mut payload = data_shred.payload().to_vec();
 
         let fec_set_index = 64u32;
         let wrong_index = fec_set_index + 10;
 
         {
-            let mut cursor = Cursor::new(packet.buffer_mut());
+            let mut cursor = Cursor::new(&mut payload[..]);
             cursor
-                .seek(SeekFrom::Start(OFFSET_OF_SHRED_INDEX as u64))
+                .seek(SeekFrom::Start(OFFSET_OF_INDEX as u64))
                 .unwrap();
             cursor.write_all(&wrong_index.to_le_bytes()).unwrap();
             cursor
@@ -1085,7 +1595,7 @@ mod tests {
                 .unwrap();
             cursor.write_all(&fec_set_index.to_le_bytes()).unwrap();
             cursor
-                .seek(SeekFrom::Start(OFFSET_OF_SHRED_FLAGS as u64))
+                .seek(SeekFrom::Start(OFFSET_OF_FLAGS as u64))
                 .unwrap();
             cursor
                 .write_all(&[ShredFlags::DATA_COMPLETE_SHRED.bits()])
@@ -1093,20 +1603,20 @@ mod tests {
         }
 
         let mut shred_filter_context = ShredFilterContext::new(root_bank.clone(), shred_version);
-        assert!(shred_filter_context.should_discard_packet(&packet));
+        assert!(shred_filter_context.should_discard_packet(&to_packet(&payload)));
         assert_eq!(shred_filter_context.stats.unexpected_data_complete_shred, 1);
 
         let correct_index = fec_set_index + DATA_SHREDS_PER_FEC_BLOCK as u32 - 1;
         {
-            let mut cursor = Cursor::new(packet.buffer_mut());
+            let mut cursor = Cursor::new(&mut payload[..]);
             cursor
-                .seek(SeekFrom::Start(OFFSET_OF_SHRED_INDEX as u64))
+                .seek(SeekFrom::Start(OFFSET_OF_INDEX as u64))
                 .unwrap();
             cursor.write_all(&correct_index.to_le_bytes()).unwrap();
         }
 
         let mut shred_filter_context = ShredFilterContext::new(root_bank, shred_version);
-        assert!(!shred_filter_context.should_discard_packet(&packet));
+        assert!(!shred_filter_context.should_discard_packet(&to_packet(&payload)));
         assert_eq!(shred_filter_context.stats.unexpected_data_complete_shred, 0);
     }
 }

@@ -4,9 +4,9 @@ use {
         withdraw_nonce_account,
     },
     log::*,
-    solana_bincode::limited_deserialize,
-    solana_instruction::error::InstructionError,
+    solana_instruction_error::InstructionError,
     solana_nonce as nonce,
+    solana_packet::PACKET_DATA_WINCODE_CONFIG,
     solana_program_runtime::{
         declare_process_instruction, invoke_context::InvokeContext,
         sysvar_cache::get_sysvar_with_account_check,
@@ -199,16 +199,16 @@ fn create_account_allow_prefund(
         let mut to = instruction_context.try_borrow_instruction_account(to_account_index)?;
         allocate_and_assign(&mut to, to_address, space, owner, signers, invoke_context)?;
     }
-    if let Some((from_account_index, lamports)) = from_and_lamports {
-        if lamports > 0 {
-            transfer(
-                from_account_index,
-                to_account_index,
-                lamports,
-                invoke_context,
-                instruction_context,
-            )?;
-        }
+    if let Some((from_account_index, lamports)) = from_and_lamports
+        && lamports > 0
+    {
+        transfer(
+            from_account_index,
+            to_account_index,
+            lamports,
+            invoke_context,
+            instruction_context,
+        )?;
     }
     Ok(())
 }
@@ -320,8 +320,9 @@ declare_process_instruction!(Entrypoint, DEFAULT_COMPUTE_UNITS, |invoke_context|
     let transaction_context = &invoke_context.transaction_context;
     let instruction_context = transaction_context.get_current_instruction_context()?;
     let instruction_data = instruction_context.get_instruction_data();
-    let instruction =
-        limited_deserialize(instruction_data, solana_packet::PACKET_DATA_SIZE as u64)?;
+    let instruction: SystemInstruction =
+        wincode::config::deserialize(instruction_data, PACKET_DATA_WINCODE_CONFIG)
+            .map_err(|_| InstructionError::InvalidInstructionData)?;
 
     trace!("process_instruction: {instruction:?}");
 
@@ -568,23 +569,23 @@ declare_process_instruction!(Entrypoint, DEFAULT_COMPUTE_UNITS, |invoke_context|
 mod tests {
     use {
         super::*,
-        bincode::serialize,
         solana_nonce_account::{SystemAccountKind, get_system_account_kind},
         solana_program_runtime::{
             invoke_context::mock_process_instruction,
             solana_sbpf::program::BuiltinFunctionDefinition, with_mock_invoke_context,
         },
         std::collections::BinaryHeap,
+        wincode::serialize,
     };
     #[allow(deprecated)]
     use {
         solana_account::{
-            self as account, Account, AccountSharedData, DUMMY_INHERITABLE_ACCOUNT_FIELDS,
-            ReadableAccount, create_account_shared_data_with_fields, to_account,
+            Account, AccountSharedData, ReadableAccount, state_traits::StateMutWincode as _,
         },
         solana_fee_calculator::FeeCalculator,
         solana_hash::Hash,
-        solana_instruction::{AccountMeta, Instruction, error::InstructionError},
+        solana_instruction::{AccountMeta, Instruction},
+        solana_instruction_error::InstructionError,
         solana_nonce::{
             self as nonce,
             state::{Data as NonceData, DurableNonce, State as NonceState},
@@ -598,7 +599,31 @@ mod tests {
             recent_blockhashes::{IntoIterSorted, IterItem, MAX_ENTRIES, RecentBlockhashes},
             rent::Rent,
         },
+        solana_sysvar_id::SysvarId,
     };
+
+    fn create_sysvar_account<T>(value: &T) -> AccountSharedData
+    where
+        T: wincode::SchemaWrite<solana_account::WincodeConfig, Src = T>
+            + for<'de> wincode::SchemaRead<'de, solana_account::WincodeConfig, Dst = T>
+            + SysvarId,
+    {
+        let serialized_len = wincode::config::serialized_size(value, solana_account::WINCODE_CONFIG)
+            .unwrap() as usize;
+        let canonical_data_len = match T::id() {
+            sysvar::recent_blockhashes::ID => sysvar::recent_blockhashes::SIZE,
+            sysvar::rent::ID => solana_rent::SIZE,
+            id => panic!("unsupported sysvar: {id}"),
+        };
+        let required_data_len = canonical_data_len.max(serialized_len);
+        AccountSharedData::new_data_with_space(
+            1,
+            value,
+            required_data_len,
+            &solana_sdk_ids::sysvar::id(),
+        )
+        .unwrap()
+    }
 
     impl From<Pubkey> for Address {
         fn from(address: Pubkey) -> Self {
@@ -628,7 +653,7 @@ mod tests {
     }
 
     fn create_default_account() -> AccountSharedData {
-        AccountSharedData::new(0, 0, &Pubkey::new_unique())
+        AccountSharedData::empty(0, &Pubkey::new_unique())
     }
     #[allow(deprecated)]
     fn create_recent_blockhashes_account_for_test<'a, I>(
@@ -637,16 +662,11 @@ mod tests {
     where
         I: IntoIterator<Item = IterItem<'a>>,
     {
-        let mut account = create_account_shared_data_with_fields::<RecentBlockhashes>(
-            &RecentBlockhashes::default(),
-            DUMMY_INHERITABLE_ACCOUNT_FIELDS,
-        );
         let sorted = BinaryHeap::from_iter(recent_blockhash_iter);
         let sorted_iter = IntoIterSorted::new(sorted);
         let recent_blockhash_iter = sorted_iter.take(MAX_ENTRIES);
         let recent_blockhashes: RecentBlockhashes = recent_blockhash_iter.collect();
-        to_account(&recent_blockhashes, &mut account);
-        account
+        create_sysvar_account(&recent_blockhashes)
     }
     fn create_default_recent_blockhashes_account() -> AccountSharedData {
         #[allow(deprecated)]
@@ -656,7 +676,7 @@ mod tests {
         ])
     }
     fn create_default_rent_account() -> AccountSharedData {
-        account::create_account_shared_data_for_test(&Rent::free())
+        create_sysvar_account(&Rent::free())
     }
 
     #[test]
@@ -664,11 +684,11 @@ mod tests {
         let new_owner = Pubkey::from([9; 32]);
         let from = Pubkey::new_unique();
         let to = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
-        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
+        let to_account = AccountSharedData::empty(0, &Pubkey::default());
 
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -701,11 +721,11 @@ mod tests {
         let from = Pubkey::new_unique();
         let seed = "shiny pepper";
         let to = Pubkey::create_with_seed(&from, seed, &new_owner).unwrap();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
-        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
+        let to_account = AccountSharedData::empty(0, &Pubkey::default());
 
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccountWithSeed {
+            &wincode::serialize(&SystemInstruction::CreateAccountWithSeed {
                 base: from,
                 seed: seed.to_string(),
                 lamports: 50,
@@ -741,12 +761,12 @@ mod tests {
         let base = Pubkey::new_unique();
         let seed = "shiny pepper";
         let to = Pubkey::create_with_seed(&base, seed, &new_owner).unwrap();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
-        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
-        let base_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
+        let to_account = AccountSharedData::empty(0, &Pubkey::default());
+        let base_account = AccountSharedData::empty(0, &Pubkey::default());
 
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccountWithSeed {
+            &wincode::serialize(&SystemInstruction::CreateAccountWithSeed {
                 base,
                 seed: seed.to_string(),
                 lamports: 50,
@@ -800,11 +820,11 @@ mod tests {
         let from = Pubkey::new_unique();
         let seed = "dull boy";
         let to = Pubkey::create_with_seed(&from, seed, &new_owner).unwrap();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
-        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
+        let to_account = AccountSharedData::empty(0, &Pubkey::default());
 
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -834,12 +854,12 @@ mod tests {
         // create account with zero lamports transferred
         let new_owner = Pubkey::from([9; 32]);
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &Pubkey::new_unique()); // not from system account
+        let from_account = AccountSharedData::empty(100, &Pubkey::new_unique()); // not from system account
         let to = Pubkey::new_unique();
-        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let to_account = AccountSharedData::empty(0, &Pubkey::default());
 
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 0,
                 space: 2,
                 owner: new_owner,
@@ -871,12 +891,12 @@ mod tests {
         // Attempt to create account with more lamports than from_account has
         let new_owner = Pubkey::from([9; 32]);
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &Pubkey::new_unique());
+        let from_account = AccountSharedData::empty(100, &Pubkey::new_unique());
         let to = Pubkey::new_unique();
-        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let to_account = AccountSharedData::empty(0, &Pubkey::default());
 
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 150,
                 space: 2,
                 owner: new_owner,
@@ -902,9 +922,9 @@ mod tests {
     #[test]
     fn test_request_more_than_allowed_data_length() {
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let to = Pubkey::new_unique();
-        let to_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let to_account = AccountSharedData::empty(0, &Pubkey::default());
         let instruction_accounts = vec![
             AccountMeta {
                 pubkey: from,
@@ -920,7 +940,7 @@ mod tests {
 
         // Trying to request more data length than permitted will result in failure
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: MAX_PERMITTED_DATA_LENGTH + 1,
                 owner: system_program::id(),
@@ -933,7 +953,7 @@ mod tests {
 
         // Trying to request equal or less data length than permitted will be successful
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: MAX_PERMITTED_DATA_LENGTH,
                 owner: system_program::id(),
@@ -951,15 +971,15 @@ mod tests {
     fn test_create_already_in_use() {
         let new_owner = Pubkey::from([9; 32]);
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let owned_key = Pubkey::new_unique();
 
         // Attempt to create system account in account already owned by another program
         let original_program_owner = Pubkey::from([5; 32]);
-        let owned_account = AccountSharedData::new(0, 0, &original_program_owner);
+        let owned_account = AccountSharedData::empty(0, &original_program_owner);
         let unchanged_account = owned_account.clone();
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -984,10 +1004,10 @@ mod tests {
         assert_eq!(accounts[1], unchanged_account);
 
         // Attempt to create system account in account that already has data
-        let owned_account = AccountSharedData::new(0, 1, &Pubkey::default());
+        let owned_account = AccountSharedData::new_with_data(0, vec![0; 1], &Pubkey::default());
         let unchanged_account = owned_account.clone();
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -1012,10 +1032,10 @@ mod tests {
         assert_eq!(accounts[1], unchanged_account);
 
         // Attempt to create an account that already has lamports
-        let owned_account = AccountSharedData::new(1, 0, &Pubkey::default());
+        let owned_account = AccountSharedData::empty(1, &Pubkey::default());
         let unchanged_account = owned_account.clone();
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -1045,13 +1065,13 @@ mod tests {
         // Attempt to create an account without signing the transfer
         let new_owner = Pubkey::from([9; 32]);
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let owned_key = Pubkey::new_unique();
-        let owned_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let owned_account = AccountSharedData::empty(0, &Pubkey::default());
 
         // Haven't signed from account
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -1078,7 +1098,7 @@ mod tests {
 
         // Haven't signed to account
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -1101,9 +1121,9 @@ mod tests {
         );
 
         // Don't support unsigned creation with zero lamports (ephemeral account)
-        let owned_account = AccountSharedData::new(0, 0, &Pubkey::default());
+        let owned_account = AccountSharedData::empty(0, &Pubkey::default());
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -1130,13 +1150,13 @@ mod tests {
     fn test_create_sysvar_invalid_id_with_feature() {
         // Attempt to create system account in account already owned by another program
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let to = Pubkey::new_unique();
-        let to_account = AccountSharedData::new(0, 0, &system_program::id());
+        let to_account = AccountSharedData::empty(0, &system_program::id());
 
         // fail to create a sysvar::id() owned account
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: solana_sdk_ids::sysvar::id(),
@@ -1164,7 +1184,7 @@ mod tests {
         // Attempt to create system account in account with populated data
         let new_owner = Pubkey::from([9; 32]);
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let populated_key = Pubkey::new_unique();
         let populated_account = AccountSharedData::from(Account {
             data: vec![0, 1, 2, 3],
@@ -1172,7 +1192,7 @@ mod tests {
         });
 
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
@@ -1207,10 +1227,10 @@ mod tests {
         )
         .unwrap();
         let new = Pubkey::new_unique();
-        let new_account = AccountSharedData::new(0, 0, &system_program::id());
+        let new_account = AccountSharedData::empty(0, &system_program::id());
 
         process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccount {
+            &wincode::serialize(&SystemInstruction::CreateAccount {
                 lamports: 42,
                 space: 0,
                 owner: Pubkey::new_unique(),
@@ -1237,11 +1257,11 @@ mod tests {
     fn test_assign() {
         let new_owner = Pubkey::from([9; 32]);
         let pubkey = Pubkey::new_unique();
-        let account = AccountSharedData::new(100, 0, &system_program::id());
+        let account = AccountSharedData::empty(100, &system_program::id());
 
         // owner does not change, no signature needed
         process_instruction(
-            &bincode::serialize(&SystemInstruction::Assign {
+            &wincode::serialize(&SystemInstruction::Assign {
                 owner: system_program::id(),
             })
             .unwrap(),
@@ -1256,7 +1276,7 @@ mod tests {
 
         // owner does change, signature needed
         process_instruction(
-            &bincode::serialize(&SystemInstruction::Assign { owner: new_owner }).unwrap(),
+            &wincode::serialize(&SystemInstruction::Assign { owner: new_owner }).unwrap(),
             vec![(pubkey, account.clone())],
             vec![AccountMeta {
                 pubkey,
@@ -1267,7 +1287,7 @@ mod tests {
         );
 
         process_instruction(
-            &bincode::serialize(&SystemInstruction::Assign { owner: new_owner }).unwrap(),
+            &wincode::serialize(&SystemInstruction::Assign { owner: new_owner }).unwrap(),
             vec![(pubkey, account.clone())],
             vec![AccountMeta {
                 pubkey,
@@ -1279,7 +1299,7 @@ mod tests {
 
         // assign to sysvar instead of system_program
         process_instruction(
-            &bincode::serialize(&SystemInstruction::Assign {
+            &wincode::serialize(&SystemInstruction::Assign {
                 owner: solana_sdk_ids::sysvar::id(),
             })
             .unwrap(),
@@ -1309,7 +1329,7 @@ mod tests {
 
         // Attempt to transfer with no destination
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let instruction = SystemInstruction::Transfer { lamports: 0 };
         let data = serialize(&instruction).unwrap();
         process_instruction(
@@ -1327,9 +1347,9 @@ mod tests {
     #[test]
     fn test_transfer_lamports() {
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let to = Pubkey::from([3; 32]);
-        let to_account = AccountSharedData::new(1, 0, &to); // account owner should not matter
+        let to_account = AccountSharedData::empty(1, &to); // account owner should not matter
         let transaction_accounts = vec![(from, from_account), (to, to_account)];
         let instruction_accounts = vec![
             AccountMeta {
@@ -1346,7 +1366,7 @@ mod tests {
 
         // Success case
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::Transfer { lamports: 50 }).unwrap(),
+            &wincode::serialize(&SystemInstruction::Transfer { lamports: 50 }).unwrap(),
             transaction_accounts.clone(),
             instruction_accounts.clone(),
             Ok(()),
@@ -1356,7 +1376,7 @@ mod tests {
 
         // Attempt to move more lamports than from_account has
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::Transfer { lamports: 101 }).unwrap(),
+            &wincode::serialize(&SystemInstruction::Transfer { lamports: 101 }).unwrap(),
             transaction_accounts.clone(),
             instruction_accounts.clone(),
             Err(SystemError::ResultWithNegativeLamports.into()),
@@ -1366,7 +1386,7 @@ mod tests {
 
         // test signed transfer of zero
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::Transfer { lamports: 0 }).unwrap(),
+            &wincode::serialize(&SystemInstruction::Transfer { lamports: 0 }).unwrap(),
             transaction_accounts.clone(),
             instruction_accounts,
             Ok(()),
@@ -1376,7 +1396,7 @@ mod tests {
 
         // test unsigned transfer of zero
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::Transfer { lamports: 0 }).unwrap(),
+            &wincode::serialize(&SystemInstruction::Transfer { lamports: 0 }).unwrap(),
             transaction_accounts,
             vec![
                 AccountMeta {
@@ -1399,13 +1419,13 @@ mod tests {
     #[test]
     fn test_transfer_with_seed() {
         let base = Pubkey::new_unique();
-        let base_account = AccountSharedData::new(100, 0, &Pubkey::from([2; 32])); // account owner should not matter
+        let base_account = AccountSharedData::empty(100, &Pubkey::from([2; 32])); // account owner should not matter
         let from_seed = "42".to_string();
         let from_owner = system_program::id();
         let from = Pubkey::create_with_seed(&base, from_seed.as_str(), &from_owner).unwrap();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
+        let from_account = AccountSharedData::empty(100, &system_program::id());
         let to = Pubkey::from([3; 32]);
-        let to_account = AccountSharedData::new(1, 0, &to); // account owner should not matter
+        let to_account = AccountSharedData::empty(1, &to); // account owner should not matter
         let transaction_accounts =
             vec![(from, from_account), (base, base_account), (to, to_account)];
         let instruction_accounts = vec![
@@ -1428,7 +1448,7 @@ mod tests {
 
         // Success case
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::TransferWithSeed {
+            &wincode::serialize(&SystemInstruction::TransferWithSeed {
                 lamports: 50,
                 from_seed: from_seed.clone(),
                 from_owner,
@@ -1443,7 +1463,7 @@ mod tests {
 
         // Attempt to move more lamports than from_account has
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::TransferWithSeed {
+            &wincode::serialize(&SystemInstruction::TransferWithSeed {
                 lamports: 101,
                 from_seed: from_seed.clone(),
                 from_owner,
@@ -1458,7 +1478,7 @@ mod tests {
 
         // Test unsigned transfer of zero
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::TransferWithSeed {
+            &wincode::serialize(&SystemInstruction::TransferWithSeed {
                 lamports: 0,
                 from_seed,
                 from_owner,
@@ -1489,10 +1509,10 @@ mod tests {
             Some(SystemAccountKind::Nonce)
         );
         let to = Pubkey::from([3; 32]);
-        let to_account = AccountSharedData::new(1, 0, &to); // account owner should not matter
+        let to_account = AccountSharedData::empty(1, &to); // account owner should not matter
 
         process_instruction(
-            &bincode::serialize(&SystemInstruction::Transfer { lamports: 50 }).unwrap(),
+            &wincode::serialize(&SystemInstruction::Transfer { lamports: 50 }).unwrap(),
             vec![(from, from_account), (to, to_account)],
             vec![
                 AccountMeta {
@@ -1524,7 +1544,7 @@ mod tests {
                     if sysvar::recent_blockhashes::check_id(&meta.pubkey) {
                         create_default_recent_blockhashes_account()
                     } else if sysvar::rent::check_id(&meta.pubkey) {
-                        account::create_account_shared_data_for_test(&Rent::free())
+                        create_sysvar_account(&Rent::free())
                     } else {
                         AccountSharedData::new(0, 0, &Pubkey::new_unique())
                     },
@@ -1965,10 +1985,8 @@ mod tests {
             &system_program::id(), // owner
         )
         .unwrap();
-        assert_eq!(
-            nonce_account.deserialize_data::<NonceVersions>().unwrap(),
-            versions
-        );
+        let stored: NonceVersions = nonce_account.state().unwrap();
+        assert_eq!(stored, versions);
         nonce_account
     }
 
@@ -2046,10 +2064,8 @@ mod tests {
         };
         let upgraded_nonce_account =
             NonceVersions::Current(Box::new(NonceState::Initialized(data)));
-        assert_eq!(
-            nonce_account.deserialize_data::<NonceVersions>().unwrap(),
-            upgraded_nonce_account
-        );
+        let stored: NonceVersions = nonce_account.state().unwrap();
+        assert_eq!(stored, upgraded_nonce_account);
         let accounts = process_instruction(
             &serialize(&SystemInstruction::UpgradeNonceAccount).unwrap(),
             vec![(nonce_address, nonce_account)],
@@ -2061,19 +2077,18 @@ mod tests {
             Err(InstructionError::InvalidArgument),
         );
         assert_eq!(accounts.len(), 1);
-        assert_eq!(
-            accounts[0].deserialize_data::<NonceVersions>().unwrap(),
-            upgraded_nonce_account
-        );
+        let stored: NonceVersions = accounts[0].state().unwrap();
+        assert_eq!(stored, upgraded_nonce_account);
     }
 
     #[test]
     fn test_assign_native_loader_and_transfer() {
         for size in [0, 10] {
             let pubkey = Pubkey::new_unique();
-            let account = AccountSharedData::new(100, size, &system_program::id());
+            let account =
+                AccountSharedData::new_with_data(100, vec![0; size], &system_program::id());
             let accounts = process_instruction(
-                &bincode::serialize(&SystemInstruction::Assign {
+                &wincode::serialize(&SystemInstruction::Assign {
                     owner: solana_sdk_ids::native_loader::id(),
                 })
                 .unwrap(),
@@ -2090,11 +2105,11 @@ mod tests {
 
             let pubkey2 = Pubkey::new_unique();
             let accounts = process_instruction(
-                &bincode::serialize(&SystemInstruction::Transfer { lamports: 50 }).unwrap(),
+                &wincode::serialize(&SystemInstruction::Transfer { lamports: 50 }).unwrap(),
                 vec![
                     (
                         pubkey2,
-                        AccountSharedData::new(100, 0, &system_program::id()),
+                        AccountSharedData::empty(100, &system_program::id()),
                     ),
                     (pubkey, accounts[0].clone()),
                 ],
@@ -2126,15 +2141,15 @@ mod tests {
 
         // With nonzero lamports (payer transfers additional funds)
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
+            &wincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
                 lamports: 50,
                 space: 2,
                 owner: new_owner,
             })
             .unwrap(),
             vec![
-                (to, AccountSharedData::new(100, 0, &Pubkey::default())),
-                (from, AccountSharedData::new(100, 0, &system_program::id())),
+                (to, AccountSharedData::empty(100, &Pubkey::default())),
+                (from, AccountSharedData::empty(100, &system_program::id())),
             ],
             ix_accounts,
             Ok(()),
@@ -2146,13 +2161,13 @@ mod tests {
 
         // With zero lamports (account prefunded), no payer needed
         let accounts = process_instruction(
-            &bincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
+            &wincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
                 lamports: 0,
                 space: 2,
                 owner: new_owner,
             })
             .unwrap(),
-            vec![(to, AccountSharedData::new(100, 0, &Pubkey::default()))],
+            vec![(to, AccountSharedData::empty(100, &Pubkey::default()))],
             vec![AccountMeta::new(to, true)],
             Ok(()),
         );
@@ -2164,15 +2179,15 @@ mod tests {
         use solana_program_runtime::invoke_context::mock_process_instruction_with_feature_set;
         mock_process_instruction_with_feature_set(
             &system_program::id(),
-            &bincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
+            &wincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
                 lamports: 50,
                 space: 0,
                 owner: new_owner,
             })
             .unwrap(),
             vec![
-                (to, AccountSharedData::new(0, 0, &Pubkey::default())),
-                (from, AccountSharedData::new(100, 0, &system_program::id())),
+                (to, AccountSharedData::empty(0, &Pubkey::default())),
+                (from, AccountSharedData::empty(100, &system_program::id())),
             ],
             vec![AccountMeta::new(to, true), AccountMeta::new(from, true)],
             Err(InstructionError::InvalidInstructionData),
@@ -2188,8 +2203,8 @@ mod tests {
         let new_owner = Pubkey::from([9; 32]);
         let to = Pubkey::new_unique();
         let from = Pubkey::new_unique();
-        let from_account = AccountSharedData::new(100, 0, &system_program::id());
-        let ix_data = bincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
+        let from_account = AccountSharedData::empty(100, &system_program::id());
+        let ix_data = wincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
             lamports: 50,
             space: 2,
             owner: new_owner,
@@ -2201,7 +2216,10 @@ mod tests {
         process_instruction(
             &ix_data,
             vec![
-                (to, AccountSharedData::new(0, 1, &Pubkey::default())),
+                (
+                    to,
+                    AccountSharedData::new_with_data(0, vec![0; 1], &Pubkey::default()),
+                ),
                 (from, from_account.clone()),
             ],
             ix_accounts.clone(),
@@ -2212,7 +2230,7 @@ mod tests {
         process_instruction(
             &ix_data,
             vec![
-                (to, AccountSharedData::new(0, 0, &Pubkey::from([5; 32]))),
+                (to, AccountSharedData::empty(0, &Pubkey::from([5; 32]))),
                 (from, from_account),
             ],
             ix_accounts,
@@ -2226,10 +2244,10 @@ mod tests {
         let to = Pubkey::new_unique();
         let from = Pubkey::new_unique();
         let tx_accounts = vec![
-            (to, AccountSharedData::new(0, 0, &Pubkey::default())),
-            (from, AccountSharedData::new(100, 0, &system_program::id())),
+            (to, AccountSharedData::empty(0, &Pubkey::default())),
+            (from, AccountSharedData::empty(100, &system_program::id())),
         ];
-        let ix_data = bincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
+        let ix_data = wincode::serialize(&SystemInstruction::CreateAccountAllowPrefund {
             lamports: 50,
             space: 2,
             owner: new_owner,

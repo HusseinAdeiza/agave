@@ -2,14 +2,14 @@
 
 use {
     bencher::{Bencher, TDynBenchFn, TestDesc, TestDescAndFn, TestFn, benchmark_main},
-    crossbeam_channel::unbounded,
+    crossbeam_channel::bounded,
     log::*,
     rand::{
         Rng,
         distr::{Distribution, Uniform},
         rng,
     },
-    solana_core::{banking_trace::BankingTracer, sigverify_stage::SigVerifyStage},
+    solana_core::{banking_channels, sigverify_stage::SigVerifyStage},
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_measure::measure::Measure,
@@ -74,20 +74,17 @@ fn bench_sigverify_stage(bencher: &mut Bencher, use_same_tx: bool) {
     let (_bank, bank_forks) =
         Bank::new_with_bank_forks_for_tests(&create_genesis_config(1).genesis_config);
     let sharable_banks = bank_forks.read().unwrap().sharable_banks();
-    let (packet_s, packet_r) = unbounded();
-    let (vote_packet_s, vote_packet_r) = unbounded();
-    let (verified_s, verified_r) = BankingTracer::channel_for_test();
-    let (tpu_vote_s, _tpu_vote_r) = BankingTracer::channel_for_test();
-    let (forward_stage_s, _forward_stage_r) = unbounded();
-    let (stage, gossip_sigverify_handle) = SigVerifyStage::new(
+    let (packet_s, packet_r) = agave_wake_channel::bounded(1024);
+    let (verified_s, verified_r) = banking_channels::channel_for_test();
+    let (forward_stage_s, _forward_stage_r) = bounded(1024);
+    let stage = SigVerifyStage::new(
         packet_r,
-        vote_packet_r,
         verified_s,
-        tpu_vote_s,
         forward_stage_s,
         NonZeroUsize::new(sigverify::threadpool_for_benches().current_num_threads()).unwrap(),
         false,
         sharable_banks,
+        None,
     );
     let packet_s = packet_s;
     let packet_s_for_bench = packet_s.clone();
@@ -115,20 +112,13 @@ fn bench_sigverify_stage(bencher: &mut Bencher, use_same_tx: bool) {
                 .recv()
                 .unwrap()
                 .iter()
-                .map(|batch| {
-                    batch
-                        .iter()
-                        .filter(|packet| !packet.meta().discard())
-                        .count()
-                })
-                .sum::<usize>();
+                .filter(|packet| !packet.meta().discard())
+                .count();
         }
         trace!("received: {verified}");
     });
     // This will wait for all packets to make it through sigverify.
     drop(packet_s);
-    drop(vote_packet_s);
-    drop(gossip_sigverify_handle);
     stage.join().unwrap();
 }
 
@@ -157,7 +147,7 @@ fn prepare_batches(discard_factor: i32) -> (Vec<PacketBatch>, usize) {
 
     let mut c = 0;
     batches.iter_mut().for_each(|batch| {
-        batch.iter_mut().for_each(|mut p| {
+        batch.iter_mut().for_each(|p| {
             let throw = die.sample(&mut rng);
             if throw < discard_factor {
                 p.meta_mut().set_discard(true);
@@ -179,7 +169,7 @@ fn bench_shrink_sigverify_stage_core(bencher: &mut Bencher, discard_factor: i32)
         let mut batches = batches0.clone();
 
         let mut verify_time = Measure::start("sigverify_batch_time");
-        sigverify::ed25519_verify(&threadpool, &mut batches, false, num_valid_packets, false);
+        sigverify::ed25519_verify(&threadpool, &mut batches, false, num_valid_packets);
         verify_time.stop();
         black_box(sigverify::count_valid_packets(&batches));
 

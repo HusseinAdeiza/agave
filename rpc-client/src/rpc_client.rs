@@ -17,18 +17,20 @@ use {
         nonblocking::{self, rpc_client::get_rpc_request_str},
         rpc_sender::*,
     },
-    serde::Serialize,
+    agave_votor_messages::wire::WireBlockCertMessage,
     serde_json::Value,
-    solana_account::{Account, ReadableAccount},
-    solana_account_decoder::UiAccount,
-    solana_account_decoder_client_types::token::{UiTokenAccount, UiTokenAmount},
+    solana_account::{Account, state_traits::StateMutWincode as _},
+    solana_account_decoder_client_types::{
+        UiAccount,
+        token::{UiTokenAccount, UiTokenAmount},
+    },
     solana_clock::{Epoch, Slot, UnixTimestamp},
     solana_commitment_config::CommitmentConfig,
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_feature_gate_interface::Feature,
     solana_hash::Hash,
-    solana_message::{Message as LegacyMessage, v0},
+    solana_message::{Message as LegacyMessage, VersionedMessage, v0, v1},
     solana_pubkey::Pubkey,
     solana_rpc_client_api::{
         client_error::{Error as ClientError, ErrorKind, Result as ClientResult},
@@ -45,6 +47,7 @@ use {
     },
     solana_vote_interface::state::MAX_LOCKOUT_HISTORY,
     std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration},
+    wincode::{SchemaWrite, config::DefaultConfig},
 };
 
 #[derive(Default)]
@@ -78,15 +81,24 @@ impl RpcClientConfig {
 
 /// Trait used to add support for versioned messages to RPC APIs while
 /// retaining backwards compatibility
+#[deprecated(since = "4.5.0", note = "Use VersionedMessage instead")]
 pub trait SerializableMessage {
     fn serialize(&self) -> Vec<u8>;
 }
+#[allow(deprecated)]
 impl SerializableMessage for LegacyMessage {
     fn serialize(&self) -> Vec<u8> {
         self.serialize()
     }
 }
+#[allow(deprecated)]
 impl SerializableMessage for v0::Message {
+    fn serialize(&self) -> Vec<u8> {
+        self.serialize()
+    }
+}
+#[allow(deprecated)]
+impl SerializableMessage for v1::Message {
     fn serialize(&self) -> Vec<u8> {
         self.serialize()
     }
@@ -94,7 +106,7 @@ impl SerializableMessage for v0::Message {
 
 /// Trait used to add support for versioned transactions to RPC APIs while
 /// retaining backwards compatibility
-pub trait SerializableTransaction: Serialize {
+pub trait SerializableTransaction: SchemaWrite<DefaultConfig, Src = Self> {
     fn get_signature(&self) -> &Signature;
     fn get_recent_blockhash(&self) -> &Hash;
     fn uses_durable_nonce(&self) -> bool;
@@ -1494,6 +1506,21 @@ impl RpcClient {
         self.invoke((self.rpc_client.as_ref()).get_signature_statuses_with_history(signatures))
     }
 
+    /// Gets the statuses of a list of transaction signatures with the given
+    /// [`RpcSignatureStatusConfig`], which can select a commitment level and a
+    /// minimum context slot.
+    ///
+    /// [`RpcSignatureStatusConfig`]: solana_rpc_client_api::config::RpcSignatureStatusConfig
+    pub fn get_signature_statuses_with_config(
+        &self,
+        signatures: &[Signature],
+        config: RpcSignatureStatusConfig,
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        self.invoke(
+            (self.rpc_client.as_ref()).get_signature_statuses_with_config(signatures, config),
+        )
+    }
+
     /// Check if a transaction has been processed with the given [commitment level][cl].
     ///
     /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
@@ -1826,6 +1853,89 @@ impl RpcClient {
     /// ```
     pub fn get_slot_leaders(&self, start_slot: Slot, limit: u64) -> ClientResult<Vec<Pubkey>> {
         self.invoke((self.rpc_client.as_ref()).get_slot_leaders(start_slot, limit))
+    }
+
+    /// Returns Alpenglow's genesis certificate.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getAgGenesisCert`] RPC method.
+    ///
+    /// [`getAgGenesisCert`]: https://solana.com/docs/rpc/http/getaggenesiscert
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::client_error::Error;
+    /// # use solana_rpc_client::rpc_client::RpcClient;
+    /// # let rpc_client = RpcClient::new_mock("succeeds".to_string());
+    /// let cert = rpc_client.get_ag_genesis_cert()?;
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn get_ag_genesis_cert(&self) -> ClientResult<Option<WireBlockCertMessage>> {
+        self.invoke((self.rpc_client.as_ref()).get_ag_genesis_cert())
+    }
+
+    /// Returns the Validator Admission Ticket (VAT) active-set rank map for the epoch
+    /// containing `slot`, with an optional identity filter.
+    ///
+    /// Always queries finalized state, regardless of the client's default commitment.
+    /// Returns `None` if the epoch is unavailable.
+    ///
+    /// The filter preserves the validator's rank and the full map's total stake.
+    /// An unknown identity returns an empty validator list when the map is available.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getVatActiveSetRankMap`] RPC method.
+    ///
+    /// [`getVatActiveSetRankMap`]: https://solana.com/docs/rpc/http/getvatactivesetrankmap
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::{client_error::Error, config::RpcVatActiveSetRankMapConfig};
+    /// # use solana_rpc_client::rpc_client::RpcClient;
+    /// # let rpc_client = RpcClient::new_mock("succeeds".to_string());
+    /// let certificate_slot = 100;
+    /// let response = rpc_client.get_vat_active_set_rank_map(
+    ///     certificate_slot,
+    ///     RpcVatActiveSetRankMapConfig::default(),
+    /// )?;
+    /// if let Some(rank_map) = response.value {
+    ///     for validator in rank_map.validators {
+    ///         println!("rank {}: {}", validator.rank, validator.node_pubkey);
+    ///     }
+    /// }
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::{client_error::Error, config::RpcVatActiveSetRankMapConfig};
+    /// # use solana_rpc_client::rpc_client::RpcClient;
+    /// # let rpc_client = RpcClient::new_mock("succeeds".to_string());
+    /// let certificate_slot = 100;
+    /// let identity = "67omRD8GkXTi8daWceprtQABkDeEm3SZYHUCrthQGB9D";
+    /// let response = rpc_client.get_vat_active_set_rank_map(
+    ///     certificate_slot,
+    ///     RpcVatActiveSetRankMapConfig {
+    ///         identity: Some(identity.to_string()),
+    ///         ..RpcVatActiveSetRankMapConfig::default()
+    ///     },
+    /// )?;
+    /// if let Some(rank_map) = response.value {
+    ///     if let Some(validator) = rank_map.validators.first() {
+    ///         println!("rank {}: {}", validator.rank, validator.node_pubkey);
+    ///     }
+    /// }
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn get_vat_active_set_rank_map(
+        &self,
+        slot: Slot,
+        config: RpcVatActiveSetRankMapConfig,
+    ) -> RpcResult<Option<RpcVatActiveSetRankMap>> {
+        self.invoke((self.rpc_client.as_ref()).get_vat_active_set_rank_map(slot, config))
     }
 
     /// Get block production for the current epoch.
@@ -2582,6 +2692,7 @@ impl RpcClient {
     ///     encoding: Some(UiTransactionEncoding::Json),
     ///     commitment: Some(CommitmentConfig::confirmed()),
     ///     max_supported_transaction_version: Some(0),
+    ///     min_context_slot: None,
     /// };
     /// let transaction = rpc_client.get_transaction_with_config(
     ///     &signature,
@@ -2761,6 +2872,7 @@ impl RpcClient {
     /// let config = RpcLeaderScheduleConfig {
     ///     identity: Some(validator_pubkey_str),
     ///     commitment: Some(CommitmentConfig::processed()),
+    ///     ..RpcLeaderScheduleConfig::default()
     /// };
     /// let leader_schedule = rpc_client.get_leader_schedule_with_config(
     ///     Some(slot),
@@ -4211,6 +4323,25 @@ impl RpcClient {
         self.invoke((self.rpc_client.as_ref()).get_latest_blockhash_with_commitment(commitment))
     }
 
+    /// Returns the most recent blockhash and last valid block height along with the response
+    /// context, which includes the slot at which the node observed the blockhash.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getLatestBlockhash`] RPC method and uses the
+    /// provided [commitment level][cl].
+    ///
+    /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
+    /// [`getLatestBlockhash`]: https://solana.com/docs/rpc/http/getlatestblockhash
+    pub fn get_latest_blockhash_with_commitment_and_context(
+        &self,
+        commitment: CommitmentConfig,
+    ) -> RpcResult<(Hash, u64)> {
+        self.invoke(
+            (self.rpc_client.as_ref()).get_latest_blockhash_with_commitment_and_context(commitment),
+        )
+    }
+
     /// Checks whether a blockhash is still valid for submitting transactions.
     ///
     /// # RPC Reference
@@ -4233,8 +4364,23 @@ impl RpcClient {
     /// This method corresponds directly to the [`getFeeForMessage`] RPC method.
     ///
     /// [`getFeeForMessage`]: https://solana.com/docs/rpc/http/getfeeformessage
+    #[deprecated(since = "4.5.0", note = "Use get_fee_for_versioned_message instead")]
+    #[allow(deprecated)]
     pub fn get_fee_for_message(&self, message: &impl SerializableMessage) -> ClientResult<u64> {
         self.invoke((self.rpc_client.as_ref()).get_fee_for_message(message))
+    }
+
+    /// Returns the fee that the cluster would charge to process the provided message.
+    ///
+    /// Supports legacy, v0, and v1 messages through [`VersionedMessage`].
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getFeeForMessage`] RPC method.
+    ///
+    /// [`getFeeForMessage`]: https://solana.com/docs/rpc/http/getfeeformessage
+    pub fn get_fee_for_versioned_message(&self, message: &VersionedMessage) -> ClientResult<u64> {
+        self.invoke((self.rpc_client.as_ref()).get_fee_for_versioned_message(message))
     }
 
     /// Fetches a fresh latest blockhash, retrying until it differs from the provided value.
@@ -4262,7 +4408,7 @@ impl RpcClient {
                 maybe_feature_account
                     .value
                     .map(|feature_account| {
-                        bincode::deserialize(feature_account.data()).map_err(|_| {
+                        feature_account.state().map_err(|_| {
                             ClientError::from(ErrorKind::Custom(
                                 "Failed to deserialize feature account".to_string(),
                             ))
@@ -4320,23 +4466,22 @@ mod tests {
     use {
         super::*,
         crate::mock_sender::PUBKEY,
-        assert_matches::assert_matches,
         base64::{Engine, prelude::BASE64_STANDARD},
-        crossbeam_channel::unbounded,
+        crossbeam_channel::bounded,
         jsonrpc_core::{Error, IoHandler, Params, futures::prelude::*},
         jsonrpc_http_server::{AccessControlAllowOrigin, DomainsValidation, ServerBuilder},
         serde_json::{Number, json},
-        solana_account_decoder::{UiAccountData, encode_ui_account},
-        solana_account_decoder_client_types::UiAccountEncoding,
+        solana_account_decoder_client_types::{UiAccount, UiAccountEncoding},
         solana_hash::Hash,
-        solana_instruction::error::InstructionError,
+        solana_instruction_error::InstructionError,
         solana_keypair::Keypair,
         solana_message::{MessageHeader, compiled_instruction::CompiledInstruction},
-        solana_rpc_client_api::client_error::ErrorKind,
+        solana_rpc_client_api::{client_error::ErrorKind, request::RpcError},
         solana_signer::Signer,
+        solana_system_interface::instruction as system_instruction,
         solana_system_transaction as system_transaction,
         solana_transaction_error::TransactionError,
-        std::{io, thread},
+        std::{assert_matches, io, thread},
         test_case::test_case,
     };
 
@@ -4357,7 +4502,7 @@ mod tests {
     }
 
     fn _test_send() {
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(1024);
         thread::spawn(move || {
             let rpc_addr = "0.0.0.0:0".parse().unwrap();
             let mut io = IoHandler::default();
@@ -4578,6 +4723,98 @@ mod tests {
     }
 
     #[test]
+    fn test_get_vat_active_set_rank_map() {
+        let rpc_client = RpcClient::new_mock("succeeds".to_string());
+
+        let response = rpc_client
+            .get_vat_active_set_rank_map(0, RpcVatActiveSetRankMapConfig::default())
+            .unwrap();
+        assert_eq!(response.context.slot, 1);
+        assert!(response.value.is_none());
+
+        let response = rpc_client
+            .get_vat_active_set_rank_map(
+                0,
+                RpcVatActiveSetRankMapConfig {
+                    identity: None,
+                    min_context_slot: Some(1),
+                },
+            )
+            .unwrap();
+        assert_eq!(response.context.slot, 1);
+        assert!(response.value.is_none());
+    }
+
+    #[test]
+    fn test_get_vat_active_set_rank_map_http() {
+        let identity = Pubkey::new_unique().to_string();
+        let config = RpcVatActiveSetRankMapConfig {
+            identity: Some(identity.clone()),
+            min_context_slot: Some(42),
+        };
+        let expected = Response {
+            context: RpcResponseContext::new(42),
+            value: Some(RpcVatActiveSetRankMap {
+                epoch: 3,
+                total_stake: 100.try_into().unwrap(),
+                validators: vec![RpcVatActiveSetRankMapEntry {
+                    rank: 7,
+                    vote_pubkey: Pubkey::new_unique().to_string(),
+                    node_pubkey: identity,
+                    bls_pubkey_compressed: "bls".to_string(),
+                    stake: 10.try_into().unwrap(),
+                }],
+            }),
+        };
+        let expected_json = serde_json::to_value(&expected).unwrap();
+        let expected_config = serde_json::to_value(&config).unwrap();
+        let mut io = IoHandler::default();
+        io.add_sync_method("getVatActiveSetRankMap", move |params: Params| {
+            let params: Vec<Value> = params.parse()?;
+            assert_eq!(params.len(), 2);
+            match params[0].as_u64().unwrap() {
+                100 => {
+                    assert_eq!(params[1], expected_config);
+                    Ok(expected_json.clone())
+                }
+                200 => {
+                    assert_eq!(params[1], json!({"identity": null, "minContextSlot": null}));
+                    Ok(json!({"context": {"slot": 42}, "value": null}))
+                }
+                _ => Err(Error::invalid_params("unexpected slot")),
+            }
+        });
+        let server = ServerBuilder::new(io)
+            .start_http(&"127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        // A processed default commitment must not be added to this finalized-only request.
+        let rpc_client = RpcClient::new_with_commitment(
+            format!("http://{}", server.address()),
+            CommitmentConfig::processed(),
+        );
+        assert_eq!(
+            rpc_client.get_vat_active_set_rank_map(100, config).unwrap(),
+            expected,
+        );
+        let unavailable = rpc_client
+            .get_vat_active_set_rank_map(200, RpcVatActiveSetRankMapConfig::default())
+            .unwrap();
+        assert_eq!(unavailable.context.slot, 42);
+        assert!(unavailable.value.is_none());
+
+        let error = rpc_client
+            .get_vat_active_set_rank_map(300, RpcVatActiveSetRankMapConfig::default())
+            .unwrap_err();
+        assert_eq!(error.request(), Some(&RpcRequest::GetVatActiveSetRankMap));
+        assert_matches!(
+            error.kind(),
+            ErrorKind::RpcError(RpcError::RpcResponseError { code, message, .. })
+                if *code == -32602 && message == "unexpected slot"
+        );
+        server.close();
+    }
+
+    #[test]
     fn test_get_block_commitment() {
         let rpc_client = RpcClient::new_mock("succeeds".to_string());
         let commitment = rpc_client.get_block_commitment(5).unwrap();
@@ -4585,6 +4822,35 @@ mod tests {
         assert_eq!(commitment.total_stake, 42);
         let slots = commitment.commitment.expect("commitment available");
         assert_eq!(slots.len(), MAX_LOCKOUT_HISTORY + 1);
+    }
+
+    #[test]
+    fn test_get_signature_statuses_with_config() {
+        let signature = Signature::default();
+        let config = RpcSignatureStatusConfig {
+            search_transaction_history: false,
+            commitment: Some(CommitmentConfig::confirmed()),
+            min_context_slot: Some(1),
+        };
+
+        // The "succeeds" mock answers with one finalized status per signature.
+        let rpc_client = RpcClient::new_mock("succeeds".to_string());
+        let statuses = rpc_client
+            .get_signature_statuses_with_config(&[signature], config)
+            .unwrap()
+            .value;
+        assert_eq!(statuses.len(), 1);
+        let status = statuses[0].as_ref().unwrap();
+        assert_eq!(status.slot, 1);
+        assert!(status.err.is_none());
+
+        // The "sig_not_found" mock answers with None per signature.
+        let rpc_client = RpcClient::new_mock("sig_not_found".to_string());
+        let statuses = rpc_client
+            .get_signature_statuses_with_config(&[signature], config)
+            .unwrap()
+            .value;
+        assert_eq!(statuses, vec![None]);
     }
 
     #[test]
@@ -4600,7 +4866,17 @@ mod tests {
         };
         let keyed_account = RpcKeyedAccount {
             pubkey: pubkey.to_string(),
-            account: encode_ui_account(&pubkey, &account, UiAccountEncoding::Base64, None, None),
+            account: UiAccount {
+                lamports: account.lamports,
+                data: UiAccountData::Binary(
+                    BASE64_STANDARD.encode(&account.data),
+                    UiAccountEncoding::Base64,
+                ),
+                owner: account.owner.to_string(),
+                executable: account.executable,
+                rent_epoch: account.rent_epoch,
+                space: Some(account.data.len() as u64),
+            },
         };
         let expected_result = vec![(pubkey, keyed_account.account.clone())];
         // Test: without context
@@ -5044,7 +5320,7 @@ mod tests {
         }
     }
 
-    #[test_case(LegacyMessage {
+    #[test_case(VersionedMessage::Legacy(LegacyMessage {
         header: MessageHeader {
             num_required_signatures: 1,
             num_readonly_signed_accounts: 0,
@@ -5057,8 +5333,8 @@ mod tests {
             accounts: vec![0],
             data: vec![],
         }],
-    }; "legacy message")]
-    #[test_case(v0::Message {
+    }); "legacy message")]
+    #[test_case(VersionedMessage::V0(v0::Message {
             header: MessageHeader {
                 num_required_signatures: 1,
                 num_readonly_signed_accounts: 0,
@@ -5072,15 +5348,22 @@ mod tests {
                 data: vec![],
             }],
             address_table_lookups: vec![],
-        }; "v0 message")]
-    fn test_get_fee_for_message_sends_properly_serialized_v0_transaction<M>(message: M)
-    where
-        M: SerializableMessage,
-    {
+        }); "v0 message")]
+    #[test_case(VersionedMessage::V1(
+        v1::Message::try_compile_with_config(
+            &Pubkey::new_unique(),
+            &[],
+            Hash::new_unique(),
+            v1::TransactionConfig::empty(),
+        ).unwrap()
+    ); "v1 message")]
+    fn test_get_fee_for_versioned_message_sends_properly_serialized_message(
+        message: VersionedMessage,
+    ) {
         let serialized_message = message.serialize();
         let serialized_message_base64 = BASE64_STANDARD.encode(serialized_message);
 
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(1024);
         thread::spawn(move || {
             let rpc_addr = "0.0.0.0:0".parse().unwrap();
             let mut io = IoHandler::default();
@@ -5121,7 +5404,85 @@ mod tests {
         let rpc_addr = receiver.recv().unwrap();
         let rpc_client = RpcClient::new_socket(rpc_addr);
 
-        let fee: u64 = rpc_client.get_fee_for_message(&message).unwrap();
+        let fee: u64 = rpc_client.get_fee_for_versioned_message(&message).unwrap();
         assert_eq!(fee, 42);
+    }
+
+    #[test_case(Some(0); "zero fee")]
+    #[test_case(None; "invalid blockhash")]
+    fn test_get_fee_for_versioned_message_response(fee: Option<u64>) {
+        let mocks = Mocks::from([(
+            RpcRequest::GetFeeForMessage,
+            json!(Response {
+                context: RpcResponseContext {
+                    slot: 1,
+                    api_version: None
+                },
+                value: fee,
+            }),
+        )]);
+        let rpc_client = RpcClient::new_mock_with_mocks("succeeds".to_string(), mocks);
+        let message = VersionedMessage::Legacy(LegacyMessage::default());
+        let result = rpc_client.get_fee_for_versioned_message(&message);
+        match fee {
+            Some(fee) => assert_eq!(result.unwrap(), fee),
+            None => assert_matches!(
+                result.unwrap_err().kind(),
+                ErrorKind::Custom(message) if message == "Invalid blockhash"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_get_latest_blockhash_with_commitment_and_context() {
+        let rpc_client = RpcClient::new_mock("succeeds".to_string());
+        let expected_blockhash: Hash = PUBKEY.parse().unwrap();
+
+        let response = rpc_client
+            .get_latest_blockhash_with_commitment_and_context(CommitmentConfig::default())
+            .unwrap();
+        assert_eq!(response.context.slot, 1);
+        assert_eq!(response.value, (expected_blockhash, 1234));
+
+        let value = rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::default())
+            .unwrap();
+        assert_eq!(value, response.value);
+    }
+
+    #[test]
+    fn test_send_transaction_v1() {
+        let rpc_client = RpcClient::new_mock("succeeds".to_string());
+
+        let key = Keypair::new();
+        let to = Pubkey::new_unique();
+        let blockhash = Hash::default();
+        let ix = system_instruction::transfer(&key.pubkey(), &to, 50);
+        let tx = VersionedTransaction::try_new(
+            VersionedMessage::V1(
+                v1::Message::try_compile_with_config(
+                    &key.pubkey(),
+                    &[ix],
+                    blockhash,
+                    v1::TransactionConfig::empty(),
+                )
+                .unwrap(),
+            ),
+            &[key],
+        )
+        .unwrap();
+
+        let signature = rpc_client.send_transaction(&tx);
+        assert_eq!(signature.unwrap(), tx.signatures[0]);
+
+        let rpc_client = RpcClient::new_mock("fails".to_string());
+
+        let signature = rpc_client.send_transaction(&tx);
+        assert!(signature.is_err());
+
+        // Test bad signature returned from rpc node
+        let rpc_client = RpcClient::new_mock("malicious".to_string());
+        let signature = rpc_client.send_transaction(&tx);
+        assert!(signature.is_err());
     }
 }

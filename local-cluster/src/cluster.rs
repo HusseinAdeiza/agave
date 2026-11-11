@@ -3,15 +3,11 @@ use {
     solana_core::validator::{Validator, ValidatorConfig},
     solana_gossip::{contact_info::ContactInfo, node::Node},
     solana_keypair::Keypair,
-    solana_ledger::shred::Shred,
     solana_net_utils::SocketAddrSpace,
     solana_pubkey::Pubkey,
-    solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool},
-    solana_tpu_client::tpu_client::TpuClient,
+    solana_rpc_client::rpc_client::RpcClient,
     std::{io::Result, path::PathBuf, sync::Arc},
 };
-
-pub type QuicTpuClient = TpuClient<QuicPool, QuicConnectionManager, QuicConfig>;
 
 pub struct ValidatorInfo {
     pub keypair: Arc<Keypair>,
@@ -42,12 +38,14 @@ impl ClusterValidatorInfo {
 
 pub trait Cluster {
     fn get_node_pubkeys(&self) -> Vec<Pubkey>;
-    fn build_validator_tpu_quic_client(&self, pubkey: &Pubkey) -> Result<QuicTpuClient>;
-    fn build_validator_tpu_quic_client_with_commitment(
+    /// Build an RPC client connected to the validator identified by `pubkey`.
+    fn build_rpc_client(&self, pubkey: &Pubkey) -> Result<Arc<RpcClient>>;
+    /// Build an RPC client with a specific commitment for the validator identified by `pubkey`.
+    fn build_rpc_client_with_commitment(
         &self,
         pubkey: &Pubkey,
         commitment_config: CommitmentConfig,
-    ) -> Result<QuicTpuClient>;
+    ) -> Result<Arc<RpcClient>>;
     fn get_contact_info(&self, pubkey: &Pubkey) -> Option<&ContactInfo>;
     fn exit_node(&mut self, pubkey: &Pubkey) -> ClusterValidatorInfo;
     fn restart_node(
@@ -73,6 +71,4 @@ pub trait Cluster {
         config: ValidatorConfig,
         socket_addr_space: SocketAddrSpace,
     );
-    fn set_entry_point(&mut self, entry_point_info: ContactInfo);
-    fn send_shreds_to_validator(&self, dup_shreds: Vec<&Shred>, validator_key: &Pubkey);
 }

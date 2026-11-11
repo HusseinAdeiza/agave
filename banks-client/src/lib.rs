@@ -1,10 +1,10 @@
 #![cfg(feature = "agave-unstable-api")]
 //! A client for the ledger state, from the perspective of an arbitrary validator.
 //!
-//! Use start_tcp_client() to create a client and then import BanksClientExt to
-//! access its methods. Additional "*_with_context" methods are also available,
-//! but they are undocumented, may change over time, and are generally more
-//! cumbersome to use.
+//! Use start_client() with a transport, such as the one returned by
+//! solana_banks_server::banks_server::start_local_server(), to create a client.
+//! Additional "*_with_context" methods are also available, but they are
+//! undocumented, may change over time, and are generally more cumbersome to use.
 
 pub use {
     crate::error::BanksClientError,
@@ -13,7 +13,7 @@ pub use {
 use {
     borsh::BorshDeserialize,
     futures::future::join_all,
-    solana_account::{Account, from_account},
+    solana_account::Account,
     solana_banks_interface::{
         BanksRequest, BanksResponse, BanksTransactionResultWithMetadata,
         BanksTransactionResultWithSimulation,
@@ -26,16 +26,13 @@ use {
     solana_pubkey::Pubkey,
     solana_rent::Rent,
     solana_signature::Signature,
-    solana_sysvar::SysvarSerialize,
+    solana_sysvar_id::SysvarId,
     solana_transaction::versioned::VersionedTransaction,
     tarpc::{
         ClientMessage, Response, Transport,
         client::{self, NewClient, RequestDispatch},
         context::{self, Context},
-        serde_transport::tcp,
     },
-    tokio::net::ToSocketAddrs,
-    tokio_serde::formats::Bincode,
 };
 
 mod error;
@@ -183,14 +180,16 @@ impl BanksClient {
     }
 
     /// Return the cluster Sysvar
-    pub async fn get_sysvar<T: SysvarSerialize>(&self) -> Result<T, BanksClientError> {
+    pub async fn get_sysvar<T>(&self) -> Result<T, BanksClientError>
+    where
+        T: wincode::DeserializeOwned<Dst = T> + SysvarId,
+    {
         let sysvar = self
             .get_account(T::id())
             .await?
             .ok_or(BanksClientError::ClientError("Sysvar not present"))?;
-        from_account::<T, _>(&sysvar).ok_or(BanksClientError::ClientError(
-            "Failed to deserialize sysvar",
-        ))
+        wincode::deserialize(&sysvar.data)
+            .map_err(|_| BanksClientError::ClientError("Failed to deserialize sysvar"))
     }
 
     /// Return the cluster rent
@@ -517,13 +516,6 @@ pub async fn start_client<C>(transport: C) -> Result<BanksClient, BanksClientErr
 where
     C: Transport<ClientMessage<BanksRequest>, Response<BanksResponse>> + Send + 'static,
 {
-    Ok(BanksClient {
-        inner: TarpcClient::new(client::Config::default(), transport).spawn(),
-    })
-}
-
-pub async fn start_tcp_client<T: ToSocketAddrs>(addr: T) -> Result<BanksClient, BanksClientError> {
-    let transport = tcp::connect(addr, Bincode::default).await?;
     Ok(BanksClient {
         inner: TarpcClient::new(client::Config::default(), transport).spawn(),
     })

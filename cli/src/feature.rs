@@ -3,7 +3,10 @@ use {
         cli::{
             CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult,
             log_instruction_custom_error, log_instruction_custom_error_to_str,
+            message_into_signed_transaction,
         },
+        compute_budget::ComputeUnitConfig,
+        message_builder::MessageBuilder,
         spend_utils::{SpendAmount, resolve_spend_tx_and_check_account_balance},
     },
     agave_feature_set::FEATURE_NAMES,
@@ -15,7 +18,9 @@ use {
         compute_budget::ComputeUnitLimit, fee_payer::*, hidden_unless_forced, input_parsers::*,
         input_validators::*, keypair::*,
     },
-    solana_cli_output::{QuietDisplay, VerboseDisplay, cli_version::CliVersion},
+    solana_cli_output::{
+        QuietDisplay, VerboseDisplay, cli_version::CliVersion, stdout::writeln_stdout,
+    },
     solana_clock::{Epoch, Slot},
     solana_cluster_type::ClusterType,
     solana_epoch_schedule::EpochSchedule,
@@ -23,7 +28,6 @@ use {
         Feature, activate_with_lamports, error::FeatureGateError, from_account,
         instruction::revoke_pending_activation,
     },
-    solana_message::Message,
     solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
@@ -32,7 +36,6 @@ use {
         response::RpcVoteAccountInfo,
     },
     solana_system_interface::error::SystemError,
-    solana_transaction::Transaction,
     std::{cmp::Ordering, collections::HashMap, fmt, rc::Rc, str::FromStr},
 };
 
@@ -139,7 +142,7 @@ impl fmt::Display for CliFeatures {
                 f,
                 "{}",
                 style(format!(
-                    "{:<44} | {:<23} | {} | {}",
+                    "{:<44} | {:<24} | {} | {}",
                     "Feature", "Status", "Activation Slot", "Description"
                 ))
                 .bold()
@@ -148,7 +151,7 @@ impl fmt::Display for CliFeatures {
         for feature in &self.features {
             writeln!(
                 f,
-                "{:<44} | {:<23} | {:<15} | {}",
+                "{:<44} | {:<24} | {:<15} | {}",
                 feature.id,
                 match feature.status {
                     CliFeatureStatus::Inactive => style("inactive".to_string()).red(),
@@ -996,10 +999,10 @@ async fn process_activate(
         .next()
         .unwrap();
 
-    if let Some(account) = account {
-        if from_account(&account).is_some() {
-            return Err(format!("{feature_id} has already been activated").into());
-        }
+    if let Some(account) = account
+        && from_account(&account).is_some()
+    {
+        return Err(format!("{feature_id} has already been activated").into());
     }
 
     if !feature_activation_allowed(rpc_client, false).await?.0 {
@@ -1011,7 +1014,7 @@ async fn process_activate(
                         .into(),
                 );
             }
-            ForceActivation::Yes => println!("FEATURE ACTIVATION FORCED"),
+            ForceActivation::Yes => writeln_stdout(format_args!("FEATURE ACTIVATION FORCED"))?,
             ForceActivation::No => {
                 return Err("Feature activation is not allowed at this time".into());
             }
@@ -1029,24 +1032,28 @@ async fn process_activate(
         SpendAmount::Some(rent),
         &blockhash,
         &fee_payer.pubkey(),
-        ComputeUnitLimit::Default,
+        &ComputeUnitConfig {
+            compute_unit_limit: ComputeUnitLimit::Default,
+            compute_unit_price: None,
+        },
         |lamports| {
-            Message::new(
-                &activate_with_lamports(&feature_id, &fee_payer.pubkey(), lamports),
-                Some(&fee_payer.pubkey()),
-            )
+            MessageBuilder::new(activate_with_lamports(
+                &feature_id,
+                &fee_payer.pubkey(),
+                lamports,
+            ))
+            .build(&fee_payer.pubkey())
         },
         config.commitment,
     )
     .await?;
-    let mut transaction = Transaction::new_unsigned(message);
-    transaction.try_sign(&config.signers, blockhash)?;
+    let transaction = message_into_signed_transaction(message, &config.signers, blockhash, false)?;
 
-    println!(
+    writeln_stdout(format_args!(
         "Activating {} ({})",
         FEATURE_NAMES.get(&feature_id).unwrap(),
         feature_id
-    );
+    ))?;
     let result = rpc_client
         .send_and_confirm_transaction_with_spinner_and_config(
             &transaction,
@@ -1086,24 +1093,24 @@ async fn process_revoke(
         SpendAmount::Some(0),
         &blockhash,
         &fee_payer.pubkey(),
-        ComputeUnitLimit::Default,
+        &ComputeUnitConfig {
+            compute_unit_limit: ComputeUnitLimit::Default,
+            compute_unit_price: None,
+        },
         |_lamports| {
-            Message::new(
-                &[revoke_pending_activation(&feature_id)],
-                Some(&fee_payer.pubkey()),
-            )
+            MessageBuilder::new(vec![revoke_pending_activation(&feature_id)])
+                .build(&fee_payer.pubkey())
         },
         config.commitment,
     )
     .await?;
-    let mut transaction = Transaction::new_unsigned(message);
-    transaction.try_sign(&config.signers, blockhash)?;
+    let transaction = message_into_signed_transaction(message, &config.signers, blockhash, false)?;
 
-    println!(
+    writeln_stdout(format_args!(
         "Revoking {} ({})",
         FEATURE_NAMES.get(&feature_id).unwrap(),
         feature_id
-    );
+    ))?;
     let result = rpc_client
         .send_and_confirm_transaction_with_spinner_and_config(
             &transaction,

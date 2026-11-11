@@ -5,7 +5,7 @@ use {
     crate::{FileInfo, FileSize, io_setup::IoSetupState},
     std::{
         fs::{self, File, OpenOptions},
-        io::{self, BufWriter, Seek, Write},
+        io::{self, BufWriter, IoSliceMut, Seek, Write},
         ops::Range,
         path::{Path, PathBuf},
         sync::Arc,
@@ -68,13 +68,13 @@ pub fn read_more_buffer(
 }
 
 #[cfg(unix)]
-fn arch_read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+fn arch_read_at(file: &File, buffer: &mut [u8], offset: FileSize) -> std::io::Result<usize> {
     use std::os::unix::prelude::FileExt;
     file.read_at(buffer, offset)
 }
 
 #[cfg(windows)]
-fn arch_read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+fn arch_read_at(file: &File, buffer: &mut [u8], offset: FileSize) -> std::io::Result<usize> {
     use std::os::windows::fs::FileExt;
     // Note: as opposed to unix `read_at` this call will update the internal file offset,
     // so all callers should consistently use the file only through this module
@@ -82,13 +82,57 @@ fn arch_read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<
 }
 
 #[cfg(unix)]
-fn arch_write_at(file: &File, buffer: &[u8], offset: u64) -> io::Result<usize> {
+fn arch_read_vectored_at(
+    file: &File,
+    buffers: &mut [IoSliceMut<'_>],
+    offset: FileSize,
+) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    // As of Rust 1.99.1, std::os::unix::fs::FileExt::read_vectored_at() is *unstable*
+    // and only available on Rust nightly.  The implementation has been copied here.
+    // Upon stabilization, replace this code with the Rust std version.
+    // https://github.com/rust-lang/rust/issues/89517
+
+    // preadv() can accept up to 1024 buffers
+    debug_assert!(buffers.len() <= 1024);
+
+    // SAFETY: IoSliceMut is ABI-compatible with libc::iovec on Unix. The buffers
+    // are valid, disjoint writable slices and remain borrowed for the call.
+    let result = unsafe {
+        libc::preadv(
+            file.as_raw_fd(),
+            buffers.as_ptr().cast(),
+            buffers.len() as _,
+            offset as _,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+#[cfg(windows)]
+fn arch_read_vectored_at(
+    file: &File,
+    buffers: &mut [IoSliceMut<'_>],
+    offset: FileSize,
+) -> io::Result<usize> {
+    match buffers.iter_mut().find(|buffer| !buffer.is_empty()) {
+        Some(buffer) => arch_read_at(file, buffer, offset),
+        None => Ok(0),
+    }
+}
+
+#[cfg(unix)]
+fn arch_write_at(file: &File, buffer: &[u8], offset: FileSize) -> io::Result<usize> {
     use std::os::unix::prelude::FileExt;
     file.write_at(buffer, offset)
 }
 
 #[cfg(windows)]
-fn arch_write_at(file: &File, buffer: &[u8], offset: u64) -> io::Result<usize> {
+fn arch_write_at(file: &File, buffer: &[u8], offset: FileSize) -> io::Result<usize> {
     use std::os::windows::fs::FileExt;
     // Note: as opposed to unix `write_at` this call will update the internal file offset,
     // so all callers should consistently use the file only through this module
@@ -98,14 +142,18 @@ fn arch_write_at(file: &File, buffer: &[u8], offset: u64) -> io::Result<usize> {
 /// Write, starting at `offset`, the whole buffer to a file irrespective of the file's current length.
 ///
 /// After this operation file size may be extended and the file cursor may be moved (platform-dependent).
-pub fn write_buffer_to_file(file: &File, mut buffer: &[u8], mut offset: u64) -> io::Result<()> {
+pub fn write_buffer_to_file(
+    file: &File,
+    mut buffer: &[u8],
+    mut offset: FileSize,
+) -> io::Result<()> {
     while !buffer.is_empty() {
         let wrote_len = arch_write_at(file, buffer, offset)?;
         if wrote_len == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
         buffer = &buffer[wrote_len..];
-        offset += wrote_len as u64;
+        offset += wrote_len as FileSize;
     }
     Ok(())
 }
@@ -151,6 +199,42 @@ pub fn read_into_buffer(
     Ok(total_bytes_read)
 }
 
+/// Like `read_into_buffer()`, except that it reads into a slice of buffers.
+///
+/// Data is copied to fill each buffer in order.
+/// Thus if `buffers` is larger than the amount of data to read,
+/// the final buffer(s) may be partially (or not) filled.
+///
+/// Returns the number of bytes read.
+pub fn read_into_buffers(
+    file: &File,
+    valid_file_len: FileSize,
+    start_offset: FileSize,
+    mut buffers: &mut [IoSliceMut<'_>],
+) -> io::Result<usize> {
+    let mut offset = start_offset;
+    let mut total_bytes_read = 0;
+    if start_offset >= valid_file_len {
+        return Ok(0);
+    }
+
+    while !buffers.is_empty() && offset < valid_file_len {
+        match arch_read_vectored_at(file, buffers, offset) {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+            Ok(0) => break,
+            Ok(bytes_read_this_time) => {
+                let valid_bytes =
+                    (bytes_read_this_time as FileSize).min(valid_file_len - offset) as usize;
+                total_bytes_read += valid_bytes;
+                offset += valid_bytes as FileSize;
+                IoSliceMut::advance_slices(&mut buffers, bytes_read_this_time);
+            }
+        }
+    }
+    Ok(total_bytes_read)
+}
+
 /// An asynchronous queue for file creation.
 pub trait FileCreator {
     /// Schedule creating a file at `path` with `mode` permissions and bytes read from `contents`.
@@ -166,7 +250,7 @@ pub trait FileCreator {
     ) -> io::Result<()>;
 
     /// Invoke implementation specific logic to handle file creation completion.
-    fn file_complete(&mut self, created_file: File, path: PathBuf, file_size: u64);
+    fn file_complete(&mut self, created_file: File, path: PathBuf, file_size: FileSize);
 
     /// Waits for all operations to be completed
     fn drain(&mut self) -> io::Result<()>;
@@ -185,6 +269,7 @@ pub fn file_creator<'a>(
             let io_uring_creator = IoUringFileCreatorBuilder::new()
                 .use_registered_buffers(io_setup.use_registered_io_uring_buffers)
                 .write_with_direct_io(io_setup.use_direct_io)
+                .huge_pages(io_setup.huge_pages)
                 .shared_sqpoll(io_setup.shared_sqpoll_fd())
                 .build(buf_size, file_complete)?;
             return Ok(Box::new(io_uring_creator));
@@ -258,7 +343,7 @@ impl FileCreator for SyncIoFileCreator<'_> {
         Ok(())
     }
 
-    fn file_complete(&mut self, file: File, path: PathBuf, size: u64) {
+    fn file_complete(&mut self, file: File, path: PathBuf, size: FileSize) {
         (self.file_complete)(FileInfo { file, path, size });
     }
 
@@ -335,6 +420,224 @@ mod tests {
             bytes[start_offset as usize..buffer_len]
         );
         assert_eq!(buffer[num_bytes_read..buffer_len], [0; 8])
+    }
+
+    #[test]
+    fn test_read_into_buffers_ok() {
+        let mut file = tempfile().unwrap();
+        let bytes = b"The quick brown fox jumps over the lazy dog.";
+        file.write_all(bytes).unwrap();
+
+        let mut buf1 = [0; 9];
+        let mut buf2 = [0; 17];
+        let mut buf3 = [0; 100];
+
+        // test case: read it all
+        {
+            let valid_len = bytes.len() as FileSize;
+            let start_offset = 0;
+            let num_bytes_read = read_into_buffers(
+                &file,
+                valid_len,
+                start_offset,
+                &mut [
+                    IoSliceMut::new(&mut []),
+                    IoSliceMut::new(&mut buf1),
+                    IoSliceMut::new(&mut []),
+                    IoSliceMut::new(&mut buf2),
+                    IoSliceMut::new(&mut buf3),
+                    IoSliceMut::new(&mut []),
+                ],
+            )
+            .unwrap();
+            assert_eq!(num_bytes_read, bytes.len());
+            assert_eq!(
+                buf1.into_iter()
+                    .chain(buf2)
+                    .chain(buf3)
+                    .take(num_bytes_read)
+                    .collect::<Vec<_>>(),
+                bytes,
+            );
+        }
+
+        // test case: non-zero start offset
+        {
+            let valid_len = bytes.len() as FileSize;
+            let start_offset = 7;
+            let num_bytes_read = read_into_buffers(
+                &file,
+                valid_len,
+                start_offset,
+                &mut [
+                    IoSliceMut::new(&mut []),
+                    IoSliceMut::new(&mut buf1),
+                    IoSliceMut::new(&mut []),
+                    IoSliceMut::new(&mut buf2),
+                    IoSliceMut::new(&mut buf3),
+                    IoSliceMut::new(&mut []),
+                ],
+            )
+            .unwrap();
+            assert_eq!(num_bytes_read, bytes.len() - start_offset as usize);
+            assert_eq!(
+                buf1.into_iter()
+                    .chain(buf2)
+                    .chain(buf3)
+                    .take(num_bytes_read)
+                    .collect::<Vec<_>>(),
+                bytes[start_offset as usize..],
+            );
+        }
+
+        // test case: limited buffers
+        {
+            let valid_len = bytes.len() as FileSize;
+            let start_offset = 1;
+            let num_bytes_read = read_into_buffers(
+                &file,
+                valid_len,
+                start_offset,
+                &mut [IoSliceMut::new(&mut buf1), IoSliceMut::new(&mut buf2)],
+            )
+            .unwrap();
+            assert_eq!(num_bytes_read, buf1.len() + buf2.len());
+            assert_eq!(
+                buf1.into_iter().chain(buf2).collect::<Vec<_>>(),
+                bytes[start_offset as usize..][..num_bytes_read],
+            );
+        }
+
+        // test case: valid_len is less than file size
+        {
+            let valid_len = bytes.len() as FileSize - 7;
+            let start_offset = 3;
+            let num_bytes_read = read_into_buffers(
+                &file,
+                valid_len,
+                start_offset,
+                &mut [
+                    IoSliceMut::new(&mut buf1),
+                    IoSliceMut::new(&mut buf2),
+                    IoSliceMut::new(&mut []),
+                    IoSliceMut::new(&mut buf3),
+                ],
+            )
+            .unwrap();
+            assert_eq!(num_bytes_read as u64, valid_len - start_offset);
+            assert_eq!(
+                buf1.into_iter()
+                    .chain(buf2)
+                    .chain(buf3)
+                    .take(num_bytes_read)
+                    .collect::<Vec<_>>(),
+                bytes[start_offset as usize..][..num_bytes_read],
+            );
+        }
+
+        // test case: valid_len is greater than file size
+        {
+            let valid_len = bytes.len() as FileSize + 5;
+            let start_offset = 0;
+            let num_bytes_read = read_into_buffers(
+                &file,
+                valid_len,
+                start_offset,
+                &mut [
+                    IoSliceMut::new(&mut []),
+                    IoSliceMut::new(&mut buf1),
+                    IoSliceMut::new(&mut buf2),
+                    IoSliceMut::new(&mut buf3),
+                ],
+            )
+            .unwrap();
+            assert_eq!(num_bytes_read, bytes.len());
+            assert_eq!(
+                buf1.into_iter()
+                    .chain(buf2)
+                    .chain(buf3)
+                    .take(num_bytes_read)
+                    .collect::<Vec<_>>(),
+                bytes,
+            );
+        }
+
+        // test case: start_offset == valid_len
+        {
+            let valid_len = 13;
+            let start_offset = valid_len;
+            let num_bytes_read = read_into_buffers(
+                &file,
+                valid_len,
+                start_offset,
+                &mut [IoSliceMut::new(&mut buf3)],
+            )
+            .unwrap();
+            assert_eq!(num_bytes_read, 0);
+        }
+    }
+
+    #[test]
+    fn test_read_into_buffers_empty_file() {
+        let file = tempfile().unwrap();
+        let file_len = 0;
+        let start_offset = 0;
+        let mut buf = [0; 16];
+        assert_eq!(
+            read_into_buffers(
+                &file,
+                file_len,
+                start_offset,
+                &mut [IoSliceMut::new(&mut buf)],
+            )
+            .unwrap(),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_read_into_buffers_no_buffers() {
+        let mut file = tempfile().unwrap();
+        let bytes = b"hello world";
+        file.write_all(bytes).unwrap();
+
+        let file_len = bytes.len() as FileSize;
+        let start_offset = 0;
+        assert_eq!(
+            read_into_buffers(&file, file_len, start_offset, &mut []).unwrap(),
+            0,
+        );
+        assert_eq!(
+            read_into_buffers(
+                &file,
+                file_len,
+                start_offset,
+                &mut [IoSliceMut::new(&mut [])],
+            )
+            .unwrap(),
+            0,
+        );
+    }
+
+    #[test]
+    fn test_read_into_buffers_past_valid_len() {
+        let mut file = tempfile().unwrap();
+        let bytes = b"hello world";
+        file.write_all(bytes).unwrap();
+
+        let file_len = bytes.len() as FileSize;
+        let start_offset = file_len + 1;
+        let mut buf = [0; 16];
+        assert_eq!(
+            read_into_buffers(
+                &file,
+                file_len,
+                start_offset,
+                &mut [IoSliceMut::new(&mut buf)],
+            )
+            .unwrap(),
+            0,
+        );
     }
 
     #[test]
@@ -487,9 +790,9 @@ mod tests {
         let mut file_info = callback_provided_file_info.unwrap();
         assert_eq!(
             file_info.file.metadata().unwrap().len(),
-            contents.len() as u64
+            contents.len() as FileSize,
         );
-        assert_eq!(file_info.size, contents.len() as u64);
+        assert_eq!(file_info.size, contents.len() as FileSize);
         file_info.file.read_to_string(&mut read_buf).unwrap();
         assert_eq!(&read_buf, contents);
 

@@ -14,7 +14,9 @@
 //! When reading full accounts data whose sizes exceed the small stack buffer, the `BufReaderWithOverflow`
 //! should be used, which supports dynamically allocated buffer for preparing contiguous data slices.
 #[cfg(target_os = "linux")]
-pub use crate::io_uring::sequential_file_reader::SequentialFileReaderBuilder;
+pub use crate::io_uring::sequential_file_reader::{
+    SequentialFileReader, SequentialFileReaderBuilder,
+};
 use {
     crate::{
         FileSize,
@@ -71,7 +73,20 @@ pub trait FileBufRead<'a>: BufRead {
     ///
     /// `read_limit` provides a pre-defined limit on the number of bytes that can be read
     /// from the file (unless EOF is reached).
+    ///
+    /// If the file was previously queued via `add_file_to_prefetch`, the reader
+    /// advances to that file (validating identity / `read_limit`) rather than
+    /// re-queueing it.
     fn set_file(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()>;
+
+    /// Queue `file` for read-ahead (prefetch). Files are processed in FIFO order
+    /// by subsequent `set_file` calls.
+    ///
+    /// This is a hint to keep the read pipeline saturated for readers that
+    /// support concurrent read-ahead. Implementations without read-ahead may
+    /// ignore the call. Callers must still invoke `set_file` to switch the
+    /// active file.
+    fn add_file_to_prefetch(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()>;
 
     /// Returns the current file offset corresponding to the start of the buffer
     /// that will be returned by the next call to `fill_buf`.
@@ -131,7 +146,6 @@ pub struct BufferedReader<'a, const N: usize> {
 }
 
 impl<'a, const N: usize> BufferedReader<'a, N> {
-    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self {
             file_offset_of_next_read: 0,
@@ -155,11 +169,29 @@ impl<'a, const N: usize> BufferedReader<'a, N> {
         self.file_offset_of_next_read = 0;
         self.buf_valid_bytes = 0..0;
     }
+
+    /// Reset to idle state and re-type with a fresh lifetime `'b`.
+    pub fn rebind<'b>(self) -> io::Result<BufferedReader<'b, N>> {
+        Ok(BufferedReader {
+            file_offset_of_next_read: 0,
+            buf: self.buf,
+            buf_valid_bytes: 0..0,
+            file_last_offset: 0,
+            file_len_valid: 0,
+            file: None,
+        })
+    }
 }
 
 impl<'a, const N: usize> FileBufRead<'a> for BufferedReader<'a, N> {
     fn set_file(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
         self.do_set_file(file, read_limit);
+        Ok(())
+    }
+
+    /// `BufferedReader` does not perform read-ahead — the call is a no-op and
+    /// the file becomes active only when `set_file` is later invoked.
+    fn add_file_to_prefetch(&mut self, _file: &'a File, _read_limit: FileSize) -> io::Result<()> {
         Ok(())
     }
 
@@ -309,6 +341,33 @@ impl<R: BufRead> BufReaderWithOverflow<R> {
             overflow_max_capacity,
         }
     }
+
+    fn rebind_with<S: BufRead>(
+        mut self,
+        rebind_fn: impl FnOnce(R) -> io::Result<S>,
+    ) -> io::Result<BufReaderWithOverflow<S>> {
+        let reader = rebind_fn(self.reader)?;
+        self.overflow_buf.clear();
+        Ok(BufReaderWithOverflow {
+            reader,
+            overflow_buf: self.overflow_buf,
+            overflow_min_capacity: self.overflow_min_capacity,
+            overflow_max_capacity: self.overflow_max_capacity,
+        })
+    }
+}
+
+impl<const N: usize> BufReaderWithOverflow<BufferedReader<'_, N>> {
+    pub fn rebind<'b>(self) -> io::Result<BufReaderWithOverflow<BufferedReader<'b, N>>> {
+        self.rebind_with(BufferedReader::rebind)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl BufReaderWithOverflow<SequentialFileReader<'_>> {
+    pub fn rebind<'b>(self) -> io::Result<BufReaderWithOverflow<SequentialFileReader<'b>>> {
+        self.rebind_with(SequentialFileReader::rebind)
+    }
 }
 
 impl<R: BufRead> io::Read for BufReaderWithOverflow<R> {
@@ -358,6 +417,10 @@ impl<'a, R: FileBufRead<'a>> FileBufRead<'a> for BufReaderWithOverflow<R> {
     fn set_file(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
         self.overflow_buf.clear();
         self.reader.set_file(file, read_limit)
+    }
+
+    fn add_file_to_prefetch(&mut self, file: &'a File, read_limit: FileSize) -> io::Result<()> {
+        self.reader.add_file_to_prefetch(file, read_limit)
     }
 
     fn get_file_offset(&self) -> FileSize {
@@ -433,6 +496,7 @@ pub fn large_file_buf_reader(
             .shared_sqpoll(io_setup.shared_sqpoll_fd())
             .use_direct_io(io_setup.use_direct_io)
             .use_registered_buffers(io_setup.use_registered_io_uring_buffers)
+            .huge_pages(io_setup.huge_pages)
             .build(buf_size)?;
         reader.set_path(path)?;
         Ok(reader)
@@ -827,5 +891,41 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn test_overflow_reader_rebind() {
+        let reader = BufReaderWithOverflow::new(BufferedReader::<16>::new(), 64, 128);
+        let (mut reader, allocation, capacity) = {
+            let mut file = tempfile().unwrap();
+            file.write_all(&[1; 96]).unwrap();
+            let mut reader = reader.rebind().unwrap();
+            reader.set_file(&file, 96).unwrap();
+            assert_eq!(reader.fill_buf_required(48).unwrap(), &[1; 48]);
+            let allocation = reader.overflow_buf.as_ptr();
+            let capacity = reader.overflow_buf.capacity();
+            // Rebind with unread overflow bytes, releasing the borrow before the file is dropped.
+            (reader.rebind().unwrap(), allocation, capacity)
+        };
+        assert!(reader.overflow_buf.is_empty());
+        assert_eq!(reader.get_file_offset(), 0);
+        assert_eq!(reader.overflow_buf.as_ptr(), allocation);
+        assert_eq!(reader.overflow_buf.capacity(), capacity);
+        assert_eq!(reader.overflow_min_capacity, 64);
+        assert_eq!(reader.overflow_max_capacity, 128);
+
+        let mut file = tempfile().unwrap();
+        file.write_all(&[2; 96]).unwrap();
+        reader.set_file(&file, 96).unwrap();
+        assert_eq!(reader.fill_buf_required(48).unwrap(), &[2; 48]);
+        assert_eq!(reader.overflow_buf.as_ptr(), allocation);
+        assert_eq!(reader.overflow_buf.capacity(), capacity);
+
+        // Switching files within a batch also clears data without reallocating.
+        reader.set_file(&file, 96).unwrap();
+        assert_eq!(reader.get_file_offset(), 0);
+        assert!(reader.overflow_buf.is_empty());
+        assert_eq!(reader.fill_buf_required(48).unwrap(), &[2; 48]);
+        assert_eq!(reader.overflow_buf.as_ptr(), allocation);
     }
 }

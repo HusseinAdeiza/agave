@@ -17,6 +17,12 @@ pub enum RepairVerifyError {
     TimeSkew,
     #[error("Unsigned")]
     Unsigned,
+    #[error("Unsupported")]
+    Unsupported,
+    #[error("UnmatchedPong")]
+    UnmatchedPong,
+    #[error("PongBudgetExhausted")]
+    PongBudgetExhausted,
 }
 
 #[derive(Debug, Error)]
@@ -30,7 +36,9 @@ pub enum Error {
     #[error("Send Error")]
     SendError,
     #[error(transparent)]
-    Serialize(#[from] std::boxed::Box<bincode::ErrorKind>),
+    Serialize(#[from] wincode::WriteError),
+    #[error(transparent)]
+    Deserialize(#[from] wincode::ReadError),
     #[error(transparent)]
     WeightedIndex(#[from] rand::distr::weighted::Error),
 }

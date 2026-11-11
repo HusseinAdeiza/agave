@@ -15,12 +15,15 @@ mod spl_memo_1_0 {
 mod spl_memo_3_0 {
     solana_pubkey::declare_id!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 }
+mod spl_memo_4_0 {
+    solana_pubkey::declare_id!("Memo4c2pN8afCj432Lb7RMVKi9PbQnnW7ewFFaV3oAH");
+}
 
 static SPL_PROGRAMS: &[(Pubkey, Pubkey, &[u8])] = &[
     (
         spl_generic_token::token::ID,
         solana_sdk_ids::bpf_loader_upgradeable::ID,
-        include_bytes!("programs/spl_p_token-1.0.0-rc.1.so"),
+        include_bytes!("programs/spl_p_token-1.0.0.so"),
     ),
     (
         spl_generic_token::token_2022::ID,
@@ -36,6 +39,11 @@ static SPL_PROGRAMS: &[(Pubkey, Pubkey, &[u8])] = &[
         spl_memo_3_0::ID,
         solana_sdk_ids::bpf_loader::ID,
         include_bytes!("programs/spl_memo-3.0.0.so"),
+    ),
+    (
+        spl_memo_4_0::ID,
+        solana_sdk_ids::bpf_loader_upgradeable::ID,
+        include_bytes!("programs/spl_memo-4.0.0.so"),
     ),
     (
         spl_generic_token::associated_token_account::ID,
@@ -67,7 +75,7 @@ static CORE_BPF_PROGRAMS: &[(Pubkey, Option<Pubkey>, &[u8])] = &[
     (
         solana_sdk_ids::stake::ID,
         None,
-        include_bytes!("programs/core_bpf_stake-4.0.0.so"),
+        include_bytes!("programs/core_bpf_stake-5.1.0.so"),
     ),
     // Add more programs here post-migration...
 ];
@@ -101,13 +109,14 @@ pub fn bpf_loader_program_account(
 pub fn bpf_loader_upgradeable_program_accounts(
     program_id: &Pubkey,
     elf: &[u8],
+    upgrade_authority_address: &Pubkey,
     rent: &Rent,
 ) -> [(Pubkey, Account); 2] {
     let programdata_address = get_program_data_address(program_id);
     let program_account = {
         let space = UpgradeableLoaderState::size_of_program();
         let lamports = rent.minimum_balance(space);
-        let data = bincode::serialize(&UpgradeableLoaderState::Program {
+        let data = wincode::serialize(&UpgradeableLoaderState::Program {
             programdata_address,
         })
         .unwrap();
@@ -122,9 +131,9 @@ pub fn bpf_loader_upgradeable_program_accounts(
     let programdata_account = {
         let space = UpgradeableLoaderState::size_of_programdata_metadata() + elf.len();
         let lamports = rent.minimum_balance(space);
-        let mut data = bincode::serialize(&UpgradeableLoaderState::ProgramData {
+        let mut data = wincode::serialize(&UpgradeableLoaderState::ProgramData {
             slot: 0,
-            upgrade_authority_address: Some(Pubkey::default()),
+            upgrade_authority_address: Some(*upgrade_authority_address),
         })
         .unwrap();
         data.extend_from_slice(elf);
@@ -148,8 +157,12 @@ pub fn spl_programs(rent: &Rent) -> Vec<(Pubkey, AccountSharedData)> {
         .flat_map(|(program_id, loader_id, elf)| {
             let mut accounts = vec![];
             if loader_id.eq(&solana_sdk_ids::bpf_loader_upgradeable::ID) {
-                for (key, account) in bpf_loader_upgradeable_program_accounts(program_id, elf, rent)
-                {
+                for (key, account) in bpf_loader_upgradeable_program_accounts(
+                    program_id,
+                    elf,
+                    &Pubkey::default(),
+                    rent,
+                ) {
                     accounts.push((key, AccountSharedData::from(account)));
                 }
             } else {
@@ -170,8 +183,12 @@ where
         .flat_map(|(program_id, feature_id, elf)| {
             let mut accounts = vec![];
             if feature_id.is_none() || feature_id.is_some_and(|f| is_feature_active(&f)) {
-                for (key, account) in bpf_loader_upgradeable_program_accounts(program_id, elf, rent)
-                {
+                for (key, account) in bpf_loader_upgradeable_program_accounts(
+                    program_id,
+                    elf,
+                    &Pubkey::default(),
+                    rent,
+                ) {
                     accounts.push((key, AccountSharedData::from(account)));
                 }
             }

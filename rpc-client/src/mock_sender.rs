@@ -2,16 +2,22 @@
 
 use {
     crate::rpc_sender::*,
+    agave_votor_messages::{
+        consensus_message::{Block, BlockId},
+        wire::{WireBlockCertMessage, WireCertSignature},
+    },
     async_trait::async_trait,
     base64::{Engine, prelude::BASE64_STANDARD},
     serde_json::{Number, Value, json},
     solana_account_decoder_client_types::{
         UiAccount, UiAccountData, UiAccountEncoding, token::UiTokenAmount,
     },
+    solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Signature as BLSSignature},
     solana_clock::{Slot, UnixTimestamp},
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
-    solana_instruction::{TRANSACTION_LEVEL_STACK_HEIGHT, error::InstructionError},
+    solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
+    solana_instruction_error::InstructionError,
     solana_message::MessageHeader,
     solana_pubkey::Pubkey,
     solana_rpc_client_api::{
@@ -24,11 +30,11 @@ use {
             RpcContactInfo, RpcIdentity, RpcInflationGovernor, RpcInflationRate,
             RpcInflationReward, RpcKeyedAccount, RpcPerfSample, RpcPrioritizationFee,
             RpcResponseContext, RpcSimulateTransactionResult, RpcSnapshotSlotInfo, RpcSupply,
-            RpcVersionInfo, RpcVoteAccountInfo, RpcVoteAccountStatus,
+            RpcVatActiveSetRankMap, RpcVersionInfo, RpcVoteAccountInfo, RpcVoteAccountStatus,
         },
     },
     solana_signature::Signature,
-    solana_transaction::{Transaction, versioned::TransactionVersion},
+    solana_transaction::versioned::{TransactionVersion, VersionedTransaction},
     solana_transaction_error::{TransactionError, TransactionResult},
     solana_transaction_status_client_types::{
         EncodedConfirmedBlock, EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction,
@@ -170,6 +176,25 @@ impl RpcSender for MockSender {
                 absolute_slot: 34,
                 block_height: 34,
                 transaction_count: Some(123),
+            })?,
+            "getAgGenesisCert" => {
+                let cert = WireBlockCertMessage {
+                    block: Block { slot: 0, block_id: BlockId::default() },
+                    signature: WireCertSignature {
+                        signature:  BLSSignature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+                        bitmap: vec![],
+                     }
+                };
+                serde_json::to_value(Some(cert))?
+            }
+            "getVatActiveSetRankMap" => serde_json::to_value(Response::<
+                Option<RpcVatActiveSetRankMap>,
+            > {
+                context: RpcResponseContext {
+                    slot: 1,
+                    api_version: None,
+                },
+                value: None,
             })?,
             "getSignatureStatuses" => {
                 let status: TransactionResult<()> = if self.url == "account_in_use" {
@@ -350,7 +375,7 @@ impl RpcSender for MockSender {
                 } else {
                     let tx_str = params.as_array().unwrap()[0].as_str().unwrap().to_string();
                     let data = BASE64_STANDARD.decode(tx_str).unwrap();
-                    let tx: Transaction = bincode::deserialize(&data).unwrap();
+                    let tx: VersionedTransaction = wincode::deserialize(&data).unwrap();
                     tx.signatures[0].to_string()
                 };
                 Value::String(signature)
@@ -401,7 +426,6 @@ impl RpcSender for MockSender {
                 tpu_quic: Some(SocketAddr::from(([10, 239, 6, 48], 8862))),
                 tpu_forwards: Some(SocketAddr::from(([10, 239, 6, 48], 8857))),
                 tpu_forwards_quic: Some(SocketAddr::from(([10, 239, 6, 48], 8863))),
-                tpu_vote: Some(SocketAddr::from(([10, 239, 6, 48], 8870))),
                 serve_repair: Some(SocketAddr::from(([10, 239, 6, 48], 8880))),
                 rpc: Some(SocketAddr::from(([10, 239, 6, 48], 8899))),
                 pubsub: Some(SocketAddr::from(([10, 239, 6, 48], 8900))),
@@ -483,6 +507,7 @@ impl RpcSender for MockSender {
                     post_balance: 499999442500,
                     commission: None,
                     commission_bps: None,
+                    block_reward_amount: None,
                 })])?,
             "minimumLedgerSlot" => json![123],
             "getMaxRetransmitSlot" => json![123],
@@ -550,24 +575,5 @@ pub(crate) fn mock_encoded_account(pubkey: &Pubkey) -> UiAccount {
         executable: false,
         rent_epoch: 0,
         space: Some(0),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use {super::*, solana_account::Account, solana_account_decoder::encode_ui_account};
-
-    #[test]
-    fn test_mock_encoded_account() {
-        let pubkey = Pubkey::from_str(PUBKEY).unwrap();
-        let account = Account {
-            lamports: 1_000_000,
-            data: vec![],
-            owner: pubkey,
-            executable: false,
-            rent_epoch: 0,
-        };
-        let expected = encode_ui_account(&pubkey, &account, UiAccountEncoding::Base64, None, None);
-        assert_eq!(expected, mock_encoded_account(&pubkey));
     }
 }

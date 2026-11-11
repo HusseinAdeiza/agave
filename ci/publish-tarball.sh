@@ -9,7 +9,7 @@ if [[ -z $CI_BRANCH ]]; then
   CHANNEL=unknown
 fi
 
-eval "$(ci/channel-info.sh)"
+CHANNEL="${CHANNEL:-$(cargo xtask channel-info --json | jq -r '.CHANNEL')}"
 
 TAG=
 if [[ -n "$CI_TAG" ]]; then
@@ -17,6 +17,11 @@ if [[ -n "$CI_TAG" ]]; then
   TAG="$CI_TAG"
 else
   CHANNEL_OR_TAG=$CHANNEL
+fi
+
+if [[ $CHANNEL_OR_TAG == stable || $CHANNEL_OR_TAG == beta ]]; then
+  echo "$CHANNEL_OR_TAG is synced from its latest tag by \`cargo xtask sync-release-channels\`"
+  DO_NOT_PUBLISH_TAR=1
 fi
 
 if [[ -z $CHANNEL_OR_TAG ]]; then
@@ -27,18 +32,6 @@ fi
 source scripts/generate-target-triple.sh
 
 TARGET="$BUILD_TARGET_TRIPLE"
-
-if [[ $TARGET == *windows* ]]; then
-  (
-    set -x
-    git --version
-    git config core.symlinks true
-    find . -type l -delete
-    git reset --hard
-    # patched crossbeam doesn't build on windows
-    sed -i 's/^crossbeam-epoch/#crossbeam-epoch/' Cargo.toml
-  )
-fi
 
 RELEASE_BASENAME="${RELEASE_BASENAME:=solana-release}"
 TARBALL_BASENAME="${TARBALL_BASENAME:="$RELEASE_BASENAME"}"

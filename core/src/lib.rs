@@ -1,5 +1,4 @@
 #![cfg(feature = "agave-unstable-api")]
-#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 #![recursion_limit = "2048"]
 //! The `solana` library implements the Solana high-performance blockchain architecture.
@@ -9,13 +8,9 @@
 //!
 
 pub mod admin_rpc_post_init;
-pub mod banking_simulation;
+pub mod banking_channels;
 pub mod banking_stage;
-pub mod banking_trace;
-mod block_creation_loop;
-pub mod bls_sigverify;
-pub mod cluster_info_vote_listener;
-pub mod cluster_slots_service;
+pub(crate) mod block_creation_loop;
 pub mod commitment_service;
 pub mod completed_data_sets_service;
 pub mod consensus;
@@ -25,8 +20,6 @@ pub mod epoch_specs;
 pub mod fetch_stage;
 pub mod forwarding_stage;
 pub mod gen_keys;
-pub mod next_leader;
-pub mod optimistic_confirmation_verifier;
 pub mod repair;
 pub mod replay_stage;
 pub mod resource_limits;
@@ -45,11 +38,7 @@ pub mod tpu;
 mod tpu_entry_notifier;
 mod transaction_priority;
 pub mod tvu;
-pub mod unfrozen_gossip_verified_vote_hashes;
 pub mod validator;
-pub mod vote_simulator;
-pub mod voting_service;
-pub mod warm_quic_cache_service;
 pub mod window_service;
 
 #[macro_use]
@@ -57,11 +46,3 @@ extern crate log;
 
 #[macro_use]
 extern crate solana_metrics;
-
-#[cfg_attr(feature = "frozen-abi", macro_use)]
-#[cfg(feature = "frozen-abi")]
-extern crate solana_frozen_abi_macro;
-
-#[cfg(test)]
-#[macro_use]
-extern crate assert_matches;

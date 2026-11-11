@@ -8,9 +8,12 @@ repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
+rust-version = { workspace = true }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
 
 [features]
 agave-unstable-api = []
@@ -18,9 +21,11 @@ agave-unstable-api = []
 [dependencies]
 Inflector = { workspace = true }
 agave-reserved-account-keys = { workspace = true }
+agave-votor-messages = { workspace = true }
 base64 = { workspace = true }
+bitvec = { workspace = true }
 chrono = { workspace = true, features = ["default", "serde"] }
-clap = { version = "2.33.0", default-features = false, features = ["suggestions"] }
+clap = { workspace = true }
 console = { workspace = true }
 humantime = { workspace = true }
 indicatif = { workspace = true }
@@ -29,32 +34,36 @@ semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 solana-account = { workspace = true }
-solana-account-decoder = { workspace = true }
-solana-bincode = { workspace = true }
+solana-account-decoder-client-types = { workspace = true }
+solana-bls-signatures = { workspace = true }
 solana-clap-utils = { workspace = true }
 solana-cli-config = { workspace = true }
 solana-clock = { workspace = true }
 solana-epoch-info = { workspace = true, features = ["serde"] }
+solana-epoch-schedule = { workspace = true }
 solana-hash = { workspace = true }
 solana-message = { workspace = true }
-solana-packet = { workspace = true }
+solana-native-token = { workspace = true }
+solana-packet = { workspace = true, features = ["wincode"] }
 solana-pubkey = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-sdk-ids = { workspace = true }
 solana-signature = { workspace = true }
-solana-stake-interface = { workspace = true }
-solana-system-interface = { workspace = true }
+solana-stake-history = { workspace = true }
+solana-stake-interface = { workspace = true, features = ["wincode"] }
+solana-system-interface = { workspace = true, features = ["wincode"] }
 solana-transaction = { workspace = true, features = ["verify"] }
 solana-transaction-status = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }
 solana-vote-program = { workspace = true }
 spl-memo-interface = { workspace = true }
+wincode = { workspace = true }
 
 [dev-dependencies]
 solana-keypair = { workspace = true }
 solana-seed-derivable = { workspace = true }
 solana-signer = { workspace = true }
-solana-transaction-context = { path = "../transaction-context", features = ["agave-unstable-api", "bincode"] }
+solana-transaction-context = { path = "../transaction-context", features = ["agave-unstable-api"] }
 
 [lints]
 workspace = true

@@ -17,6 +17,7 @@ use {
         ThreadAwareAccountLocks, ThreadId, ThreadSet, TryLockError,
     },
     crossbeam_channel::{Receiver, Sender},
+    solana_clock::Slot,
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
     solana_ledger::shred::get_data_shred_bytes_per_batch_typical,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
@@ -82,6 +83,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
     fn schedule<S: StateContainer<Tx>>(
         &mut self,
         container: &mut S,
+        slot: Slot,
         budget: u64,
     ) -> Result<SchedulingSummary, SchedulerError> {
         // Subtract any in-flight compute units from the budget.
@@ -101,8 +103,9 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
 
         let mut schedulable_threads = ThreadSet::any(num_threads);
         for thread_id in 0..num_threads {
-            if self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
-                >= target_cu_per_thread
+            if self.common.consume_work_senders[thread_id].is_full()
+                || self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
+                    >= target_cu_per_thread
             {
                 schedulable_threads.remove(thread_id);
             }
@@ -178,7 +181,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                     if self.common.batches.entry_bytes()[thread_id] + transaction_bytes
                         > self.config.target_entry_bytes_per_batch
                     {
-                        num_sent += self.common.send_batches()?;
+                        num_sent += self.common.send_batches(slot)?;
                     }
 
                     num_scheduled += 1;
@@ -198,14 +201,15 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                         || self.common.batches.entry_bytes()[thread_id]
                             >= self.config.target_entry_bytes_per_batch
                     {
-                        num_sent += self.common.send_batches()?;
+                        num_sent += self.common.send_batches(slot)?;
                     }
 
                     // if the thread is at target_cu_per_thread, remove it from the schedulable threads
                     // if there are no more schedulable threads, stop scheduling.
-                    if self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
-                        + self.common.batches.total_cus()[thread_id]
-                        >= target_cu_per_thread
+                    if self.common.consume_work_senders[thread_id].is_full()
+                        || self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
+                            + self.common.batches.total_cus()[thread_id]
+                            >= target_cu_per_thread
                     {
                         schedulable_threads.remove(thread_id);
                         if schedulable_threads.is_empty() {
@@ -216,7 +220,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
             }
         }
 
-        num_sent += self.common.send_batches()?;
+        num_sent += self.common.send_batches(slot)?;
         let Saturating(num_scheduled) = num_scheduled;
         assert_eq!(
             num_scheduled, num_sent,
@@ -238,6 +242,10 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
     fn scheduling_common_mut(&mut self) -> &mut SchedulingCommon<Tx> {
         &mut self.common
     }
+
+    fn has_in_flight_transactions(&self) -> bool {
+        self.common.in_flight_tracker.has_in_flight_transactions()
+    }
 }
 
 fn try_schedule_transaction<Tx: TransactionWithMeta>(
@@ -249,18 +257,19 @@ fn try_schedule_transaction<Tx: TransactionWithMeta>(
     // Schedule the transaction if it can be.
     let transaction = transaction_state.transaction();
     let account_keys = transaction.account_keys();
-    let write_account_locks = account_keys
+    let transaction_account_locks = account_keys
         .iter()
         .enumerate()
-        .filter_map(|(index, key)| transaction.is_writable(index).then_some(key));
-    let read_account_locks = account_keys
-        .iter()
-        .enumerate()
-        .filter_map(|(index, key)| (!transaction.is_writable(index)).then_some(key));
+        .map(|(index, key)| (key, transaction.is_writable(index)))
+        .chain(
+            transaction
+                .implicit_read_locks()
+                .iter()
+                .map(|key| (key, false)),
+        );
 
     let thread_id = match account_locks.try_lock_accounts(
-        write_account_locks,
-        read_account_locks,
+        transaction_account_locks,
         schedulable_threads,
         thread_selector,
     ) {
@@ -292,19 +301,26 @@ mod test {
             scheduler_messages::{MaxAge, TransactionId},
             transaction_scheduler::transaction_state_container::TransactionStateContainer,
         },
-        crossbeam_channel::unbounded,
+        crossbeam_channel::bounded,
         itertools::Itertools,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
         solana_keypair::Keypair,
         solana_message::{Message, v1::MAX_TRANSACTION_SIZE},
         solana_pubkey::Pubkey,
-        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+        solana_runtime_transaction::{
+            runtime_transaction::RuntimeTransaction,
+            transaction_with_meta::StaticTransactionWithMeta,
+        },
         solana_signer::Signer,
+        solana_svm_transaction::svm_message::SVMMessage,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::{Transaction, sanitized::SanitizedTransaction},
-        std::borrow::Borrow,
+        std::{assert_matches, borrow::Borrow},
+        test_case::test_matrix,
     };
+
+    const TEST_SLOT: Slot = 42;
 
     #[allow(clippy::type_complexity)]
     fn create_test_frame(
@@ -316,8 +332,8 @@ mod test {
         Sender<FinishedConsumeWork<RuntimeTransaction<SanitizedTransaction>>>,
     ) {
         let (consume_work_senders, consume_work_receivers) =
-            (0..num_threads).map(|_| unbounded()).unzip();
-        let (finished_consume_work_sender, finished_consume_work_receiver) = unbounded();
+            (0..num_threads).map(|_| bounded(1024)).unzip();
+        let (finished_consume_work_sender, finished_consume_work_receiver) = bounded(1024);
         let scheduler =
             GreedyScheduler::new(consume_work_senders, finished_consume_work_receiver, config);
         (
@@ -377,6 +393,80 @@ mod test {
         container
     }
 
+    #[test_matrix([None, Some(false), Some(true)])]
+    fn test_programdata_writer_waits_on_other_thread(explicit_writable_programdata: Option<bool>) {
+        let program = Pubkey::new_unique();
+        let programdata = solana_loader_v3_interface::get_program_data_address(&program);
+        // Each transaction costs 5000 CU. Filling worker 0 forces the second transaction
+        // to try worker 1. With no explicit ProgramData, only the implicit read blocks it.
+        let config = GreedySchedulerConfig {
+            target_scheduled_cus: 10_000,
+            ..GreedySchedulerConfig::default()
+        };
+        let (mut scheduler, receivers, finished) = create_test_frame(2, config);
+        let payer = Pubkey::new_unique();
+        let keys = match explicit_writable_programdata {
+            None => vec![payer, program],
+            Some(_) => vec![payer, programdata, program],
+        };
+        let transaction =
+            RuntimeTransaction::from_transaction_for_tests(Transaction::new_unsigned(Message {
+                header: solana_message::MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_unsigned_accounts: if explicit_writable_programdata == Some(false)
+                    {
+                        2
+                    } else {
+                        1
+                    },
+                    ..solana_message::MessageHeader::default()
+                },
+                account_keys: keys,
+                ..Message::default()
+            }));
+        let mut container = create_container([(&Keypair::new(), &[programdata], 1, 1)]);
+        container.insert_new_transaction(transaction, MaxAge::MAX, 2, 5000);
+        let summary = scheduler
+            .schedule(&mut container, TEST_SLOT, u64::MAX)
+            .unwrap();
+        assert_eq!(summary.num_scheduled, 1);
+        assert_eq!(summary.num_unschedulable_threads, 1);
+        let reader = receivers[0].try_recv().unwrap();
+        assert_eq!(reader.ids, vec![1]);
+        assert_eq!(
+            reader.transactions[0]
+                .account_keys()
+                .iter()
+                .any(|key| *key == programdata),
+            explicit_writable_programdata.is_some(),
+        );
+        assert!(receivers[1].try_recv().is_err());
+
+        finished
+            .send(FinishedConsumeWork {
+                work: reader,
+                retryable_indexes: vec![],
+            })
+            .unwrap();
+        assert_eq!(scheduler.receive_completed(&mut container).unwrap(), (1, 0));
+        assert_eq!(
+            scheduler
+                .schedule(&mut container, TEST_SLOT, u64::MAX)
+                .unwrap()
+                .num_scheduled,
+            1
+        );
+        let writer = receivers[0].try_recv().unwrap();
+        assert_eq!(writer.ids, vec![0]);
+        finished
+            .send(FinishedConsumeWork {
+                work: writer,
+                retryable_indexes: vec![],
+            })
+            .unwrap();
+        assert_eq!(scheduler.receive_completed(&mut container).unwrap(), (1, 0));
+    }
+
     fn single_transfer_transaction_size() -> u64 {
         prioritized_tranfers(&Keypair::new(), [Pubkey::new_unique()], 1, 1).serialized_size() as u64
     }
@@ -406,6 +496,7 @@ mod test {
         assert_matches!(
             scheduler.schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             ),
             Err(SchedulerError::DisconnectedSendChannel(_))
@@ -424,6 +515,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();
@@ -444,6 +536,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 0, // zero budget
             )
             .unwrap();
@@ -468,6 +561,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();
@@ -493,6 +587,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();
@@ -518,6 +613,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();
@@ -544,7 +640,9 @@ mod test {
             (&Keypair::new(), &[Pubkey::new_unique()], 3, 3),
         ]);
 
-        let scheduling_summary = scheduler.schedule(&mut container, u64::MAX).unwrap();
+        let scheduling_summary = scheduler
+            .schedule(&mut container, TEST_SLOT, u64::MAX)
+            .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
         assert_eq!(
@@ -574,6 +672,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();
@@ -592,6 +691,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();
@@ -631,6 +731,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();
@@ -666,6 +767,7 @@ mod test {
         let scheduling_summary = scheduler
             .schedule(
                 &mut container,
+                TEST_SLOT,
                 u64::MAX, // no budget
             )
             .unwrap();

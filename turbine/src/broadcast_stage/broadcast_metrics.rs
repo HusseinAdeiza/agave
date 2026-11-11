@@ -19,14 +19,12 @@ pub struct TransmitShredsStats {
     pub transmit_elapsed: u64,
     /// microseconds spent sending UDP packets via mmsg
     pub send_mmsg_elapsed: u64,
-    /// microseconds spent sending packets to xdp endpoint
-    pub send_xdp_elapsed: u64,
-    /// Time spent figuring out which shreds to send where
-    pub shred_select: u64,
     pub num_shreds: usize,
     pub total_packets: usize,
     pub(crate) dropped_packets_udp: usize,
     pub(crate) dropped_packets_xdp: usize,
+    pub(crate) mirrored_packets: usize,
+    pub(crate) dropped_packets_mirrored: usize,
     pub(crate) is_xdp: bool,
 }
 
@@ -35,12 +33,12 @@ impl BroadcastStats for TransmitShredsStats {
         self.is_xdp = new_stats.is_xdp;
         self.transmit_elapsed += new_stats.transmit_elapsed;
         self.send_mmsg_elapsed += new_stats.send_mmsg_elapsed;
-        self.send_xdp_elapsed += new_stats.send_xdp_elapsed;
         self.num_shreds += new_stats.num_shreds;
-        self.shred_select += new_stats.shred_select;
         self.total_packets += new_stats.total_packets;
         self.dropped_packets_udp += new_stats.dropped_packets_udp;
         self.dropped_packets_xdp += new_stats.dropped_packets_xdp;
+        self.mirrored_packets += new_stats.mirrored_packets;
+        self.dropped_packets_mirrored += new_stats.dropped_packets_mirrored;
     }
     fn report_stats(&mut self, slot: Slot, slot_start: Instant, was_interrupted: bool) {
         if was_interrupted {
@@ -50,12 +48,12 @@ impl BroadcastStats for TransmitShredsStats {
                 ("slot", slot as i64, i64),
                 ("transmit_elapsed", self.transmit_elapsed as i64, i64),
                 ("send_mmsg_elapsed", self.send_mmsg_elapsed as i64, i64),
-                ("send_xdp_elapsed", self.send_xdp_elapsed as i64, i64),
                 ("num_shreds", self.num_shreds as i64, i64),
-                ("shred_select", self.shred_select as i64, i64),
                 ("total_packets", self.total_packets as i64, i64),
                 ("dropped_packets_udp", self.dropped_packets_udp as i64, i64),
                 ("dropped_packets_xdp", self.dropped_packets_xdp as i64, i64),
+                ("mirrored_packets", self.mirrored_packets as i64, i64),
+                ("dropped_packets_mirrored", self.dropped_packets_mirrored as i64, i64),
             );
         } else {
             datapoint_info!(
@@ -71,12 +69,12 @@ impl BroadcastStats for TransmitShredsStats {
                 ),
                 ("transmit_elapsed", self.transmit_elapsed as i64, i64),
                 ("send_mmsg_elapsed", self.send_mmsg_elapsed as i64, i64),
-                ("send_xdp_elapsed", self.send_xdp_elapsed as i64, i64),
                 ("num_shreds", self.num_shreds as i64, i64),
-                ("shred_select", self.shred_select as i64, i64),
                 ("total_packets", self.total_packets as i64, i64),
                 ("dropped_packets_udp", self.dropped_packets_udp as i64, i64),
                 ("dropped_packets_xdp", self.dropped_packets_xdp as i64, i64),
+                ("mirrored_packets", self.mirrored_packets as i64, i64),
+                ("dropped_packets_mirrored", self.dropped_packets_mirrored as i64, i64),
             );
         }
     }
@@ -159,9 +157,8 @@ impl<T: BroadcastStats + Default> SlotBroadcastStats<T> {
                 let slot_batch_counter = self.0.entry(batch_info.slot).or_default();
                 slot_batch_counter.broadcast_shred_stats.update(new_stats);
                 // Only count the ones where `broadcast_shred_batch_info`.is_some(), because
-                // there could potentially be other `retransmit` slots inserted into the
-                // transmit pipeline (signaled by ReplayStage) that are not created by the
-                // main shredding/broadcast pipeline
+                // `BroadcastDuplicatesRun` sends shreds without batch info that are not
+                // counted towards any batch
                 slot_batch_counter.num_batches += 1;
                 if let Some(num_expected_batches) = batch_info.num_expected_batches {
                     slot_batch_counter.num_expected_batches = Some(num_expected_batches);
@@ -218,12 +215,12 @@ mod test {
             &TransmitShredsStats {
                 transmit_elapsed: 1,
                 send_mmsg_elapsed: 3,
-                send_xdp_elapsed: 4,
-                shred_select: 5,
                 num_shreds: 6,
                 total_packets: 7,
                 dropped_packets_udp: 8,
                 dropped_packets_xdp: 10,
+                mirrored_packets: 0,
+                dropped_packets_mirrored: 0,
                 is_xdp: false,
             },
             &Some(BroadcastShredBatchInfo {
@@ -240,8 +237,6 @@ mod test {
         assert_eq!(slot_0_stats.num_expected_batches.unwrap(), 2);
         assert_eq!(slot_0_stats.broadcast_shred_stats.transmit_elapsed, 1);
         assert_eq!(slot_0_stats.broadcast_shred_stats.send_mmsg_elapsed, 3);
-        assert_eq!(slot_0_stats.broadcast_shred_stats.send_xdp_elapsed, 4);
-        assert_eq!(slot_0_stats.broadcast_shred_stats.shred_select, 5);
         assert_eq!(slot_0_stats.broadcast_shred_stats.num_shreds, 6);
         assert_eq!(slot_0_stats.broadcast_shred_stats.total_packets, 7);
         assert_eq!(slot_0_stats.broadcast_shred_stats.dropped_packets_udp, 8);
@@ -251,12 +246,12 @@ mod test {
             &TransmitShredsStats {
                 transmit_elapsed: 11,
                 send_mmsg_elapsed: 13,
-                send_xdp_elapsed: 14,
-                shred_select: 15,
                 num_shreds: 16,
                 total_packets: 17,
                 dropped_packets_udp: 18,
                 dropped_packets_xdp: 20,
+                mirrored_packets: 0,
+                dropped_packets_mirrored: 0,
                 is_xdp: false,
             },
             &None,
@@ -268,8 +263,6 @@ mod test {
         assert_eq!(slot_0_stats.num_expected_batches.unwrap(), 2);
         assert_eq!(slot_0_stats.broadcast_shred_stats.transmit_elapsed, 1);
         assert_eq!(slot_0_stats.broadcast_shred_stats.send_mmsg_elapsed, 3);
-        assert_eq!(slot_0_stats.broadcast_shred_stats.send_xdp_elapsed, 4);
-        assert_eq!(slot_0_stats.broadcast_shred_stats.shred_select, 5);
         assert_eq!(slot_0_stats.broadcast_shred_stats.num_shreds, 6);
         assert_eq!(slot_0_stats.broadcast_shred_stats.total_packets, 7);
         assert_eq!(slot_0_stats.broadcast_shred_stats.dropped_packets_udp, 8);
@@ -281,12 +274,12 @@ mod test {
             &TransmitShredsStats {
                 transmit_elapsed: 1,
                 send_mmsg_elapsed: 1,
-                send_xdp_elapsed: 1,
-                shred_select: 1,
                 num_shreds: 1,
                 total_packets: 1,
                 dropped_packets_udp: 1,
                 dropped_packets_xdp: 1,
+                mirrored_packets: 0,
+                dropped_packets_mirrored: 0,
                 is_xdp: false,
             },
             &Some(BroadcastShredBatchInfo {
@@ -307,7 +300,7 @@ mod test {
             let slot_broadcast_stats = Arc::new(Mutex::new(SlotBroadcastStats::default()));
             let num_threads = 5;
             let slot = 0;
-            let (sender, receiver) = unbounded();
+            let (sender, receiver) = bounded(1024);
             let thread_handles: Vec<_> = (0..num_threads)
                 .map(|i| {
                     let slot_broadcast_stats = slot_broadcast_stats.clone();

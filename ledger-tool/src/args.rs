@@ -2,12 +2,17 @@ use {
     crate::LEDGER_TOOL_DIRECTORY,
     clap::{Arg, ArgMatches, value_t, value_t_or_exit, values_t, values_t_or_exit},
     log::*,
-    solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig},
+    solana_account::ReadableAccount,
+    solana_account_decoder::{
+        UiAccountEncoding, UiDataSliceConfig, encode_ui_account,
+        parse_account_data::AccountAdditionalDataV3,
+    },
     solana_accounts_db::{
         accounts_db::{AccountShrinkThreshold, AccountsDbConfig},
+        accounts_file::AccountsFileProvider,
         accounts_index::{
             AccountsIndexConfig, DEFAULT_NUM_ENTRIES_OVERHEAD, DEFAULT_NUM_ENTRIES_TO_EVICT,
-            IndexLimit, IndexLimitThreshold, ScanFilter,
+            IndexLimit, IndexLimitThreshold, MINIMAL_THRESHOLD_NUM_BYTES, ScanFilter,
         },
         partitioned_rewards::PartitionedEpochRewardsConfig,
     },
@@ -16,12 +21,14 @@ use {
         input_parsers::pubkeys_of,
         input_validators::{is_parsable, is_pow2},
     },
-    solana_cli_output::CliAccountNewConfig,
+    solana_cli_output::CliAccount,
     solana_clock::Slot,
     solana_ledger::{
         blockstore_processor::ProcessOptions,
         use_snapshot_archives_at_startup::{self, UseSnapshotArchivesAtStartup},
     },
+    solana_pubkey::Pubkey,
+    solana_rpc_client_api::response::RpcKeyedAccount,
     solana_runtime::runtime_config::RuntimeConfig,
     std::{
         collections::HashSet,
@@ -62,6 +69,11 @@ pub fn accounts_db_args<'a, 'b>() -> Box<[Arg<'a, 'b>]> {
             .validator(is_parsable::<usize>)
             .takes_value(true)
             .help("Pre-allocate the accounts index, assuming this many accounts")
+            .long_help(
+                "Pre-allocate the accounts index, assuming this many accounts. Overrides the \
+                 account count recorded in the local snapshot directory, which is otherwise used \
+                 when starting from local snapshot state rather than a snapshot archive.",
+            )
             .hidden(hidden_unless_forced()),
         Arg::with_name("accounts_index_limit")
             .long("accounts-index-limit")
@@ -85,18 +97,12 @@ pub fn accounts_db_args<'a, 'b>() -> Box<[Arg<'a, 'b>]> {
                  index may use up to 50 GB of memory. The \"unlimited\" option keeps the entire \
                  accounts index in memory. All index entries that are not in memory are kept in \
                  the disk-backed index. The disk-backed index has lower performance; prefer \
-                 higher explicit limits here.",
+                 higher explicit limits here. \"minimal\" is deprecated and behaves as \"25GB\".",
             ),
-        Arg::with_name("accounts_db_skip_shrink")
-            .long("accounts-db-skip-shrink")
+        Arg::with_name("accounts_db_verify_index")
+            .long("accounts-db-verify-index")
             .help(
-                "Enables faster starting of ledger-tool by skipping shrink. This option is for \
-                 use during testing.",
-            ),
-        Arg::with_name("accounts_db_verify_refcounts")
-            .long("accounts-db-verify-refcounts")
-            .help(
-                "Debug option to scan all AppendVecs and verify account index refcounts prior to \
+                "Debug option to scan all storages and verify account index slot lists prior to \
                  clean",
             )
             .hidden(hidden_unless_forced()),
@@ -119,6 +125,13 @@ pub fn accounts_db_args<'a, 'b>() -> Box<[Arg<'a, 'b>]> {
             .long("accounts-db-skip-initial-hash-calculation")
             .help("Do not verify accounts hash at startup.")
             .hidden(hidden_unless_forced()),
+        Arg::with_name("accounts_db_account_storage_file_format")
+            .long("accounts-db-account-storage-file-format")
+            .takes_value(true)
+            .possible_values(&["append-vec", "split"])
+            .default_value("split")
+            .help("Selects the account storage file format")
+            .hidden(hidden_unless_forced()),
         Arg::with_name("accounts_db_ancient_append_vecs")
             .long("accounts-db-ancient-append-vecs")
             .value_name("SLOT-OFFSET")
@@ -129,16 +142,6 @@ pub fn accounts_db_args<'a, 'b>() -> Box<[Arg<'a, 'b>]> {
                  together.",
             )
             .hidden(hidden_unless_forced()),
-        Arg::with_name("accounts_db_access_storages_method")
-            .long("accounts-db-access-storages-method")
-            .value_name("METHOD")
-            .takes_value(true)
-            .possible_values(&["mmap", "file"])
-            .help(
-                "[DEPRECATED] Access account storages using this method. This flag is now a \
-                 no-op: storages are always accessed via file I/O. The flag is preserved for \
-                 backward compatibility and will be removed in a future release.",
-            ),
         Arg::with_name("accounts_db_ancient_storage_ideal_size")
             .long("accounts-db-ancient-storage-ideal-size")
             .value_name("BYTES")
@@ -241,7 +244,6 @@ pub fn parse_process_options(ledger_path: &Path, arg_matches: &ArgMatches<'_>) -
         use_snapshot_archives_at_startup::cli::NAME,
         UseSnapshotArchivesAtStartup
     );
-    let accounts_db_skip_shrink = arg_matches.is_present("accounts_db_skip_shrink");
     let verify_index = arg_matches.is_present("verify_accounts_index");
     let limit_load_slot_count_from_snapshot =
         value_t!(arg_matches, "limit_load_slot_count_from_snapshot", usize).ok();
@@ -251,12 +253,12 @@ pub fn parse_process_options(ledger_path: &Path, arg_matches: &ArgMatches<'_>) -
     let allow_dead_slots = arg_matches.is_present("allow_dead_slots");
     let abort_on_invalid_block = arg_matches.is_present("abort_on_invalid_block");
     let no_block_cost_limits = arg_matches.is_present("no_block_cost_limits");
+    let skip_inter_slot_verification = arg_matches.is_present("skip_inter_slot_verification");
 
     ProcessOptions {
         new_hard_forks,
         runtime_config,
         accounts_db_config,
-        accounts_db_skip_shrink,
         verify_index,
         limit_load_slot_count_from_snapshot,
         run_final_accounts_hash_calc,
@@ -267,6 +269,7 @@ pub fn parse_process_options(ledger_path: &Path, arg_matches: &ArgMatches<'_>) -
         use_snapshot_archives_at_startup,
         abort_on_invalid_block,
         no_block_cost_limits,
+        skip_inter_slot_verification,
         ..ProcessOptions::default()
     }
 }
@@ -288,15 +291,16 @@ pub fn get_accounts_db_config(
         value_t!(arg_matches, "accounts_index_limit", String).unwrap_or_else(|err| err.exit());
     let index_limit = {
         enum CliIndexLimit {
-            // deprecated in v4.1.0
-            Minimal,
             Unlimited,
             Threshold(u64),
         }
         let cli_index_limit = match accounts_index_limit.as_str() {
             "minimal" => {
-                warn!("Using `minimal` for `--accounts-index-limit` is deprecated.");
-                CliIndexLimit::Minimal
+                warn!(
+                    "Using `minimal` for `--accounts-index-limit` is deprecated. Using 25GB \
+                     instead."
+                );
+                CliIndexLimit::Threshold(MINIMAL_THRESHOLD_NUM_BYTES)
             }
             "unlimited" => CliIndexLimit::Unlimited,
             "25GB" => CliIndexLimit::Threshold(25_000_000_000),
@@ -311,7 +315,6 @@ pub fn get_accounts_db_config(
             }
         };
         match cli_index_limit {
-            CliIndexLimit::Minimal => IndexLimit::Minimal,
             CliIndexLimit::Unlimited => IndexLimit::InMemOnly,
             CliIndexLimit::Threshold(num_bytes) => IndexLimit::Threshold(IndexLimitThreshold {
                 num_bytes,
@@ -332,19 +335,6 @@ pub fn get_accounts_db_config(
         ..AccountsIndexConfig::default()
     };
 
-    // The `--accounts-db-access-storages-method` flag is now a no-op. Storages are
-    // always accessed via file I/O. The flag is preserved for backward compatibility,
-    // but the value is ignored with a warning.
-    if arg_matches
-        .value_of("accounts_db_access_storages_method")
-        .is_some()
-    {
-        warn!(
-            "`--accounts-db-access-storages-method` is now a no-op; storages are always accessed \
-             via file I/O."
-        );
-    }
-
     let scan_filter_for_shrinking = arg_matches
         .value_of("accounts_db_scan_filter_for_shrinking")
         .map(|filter| match filter {
@@ -357,6 +347,18 @@ pub fn get_accounts_db_config(
             }
         })
         .unwrap_or_default();
+
+    let accounts_file_provider = arg_matches
+        .value_of("accounts_db_account_storage_file_format")
+        .map(|format| match format {
+            "append-vec" => AccountsFileProvider::AppendVec,
+            "split" => AccountsFileProvider::Split,
+            _ => {
+                // clap will enforce one of the above values is given
+                unreachable!("invalid value given to accounts_db_account_storage_file_format")
+            }
+        })
+        .unwrap();
 
     AccountsDbConfig {
         index: Some(accounts_index_config),
@@ -376,12 +378,13 @@ pub fn get_accounts_db_config(
         )
         .ok(),
         max_ancient_storages: value_t!(arg_matches, "accounts_db_max_ancient_storages", usize).ok(),
-        exhaustively_verify_refcounts: arg_matches.is_present("accounts_db_verify_refcounts"),
+        verify_index: arg_matches.is_present("accounts_db_verify_index"),
         skip_initial_hash_calc: arg_matches.is_present("accounts_db_skip_initial_hash_calculation"),
         partitioned_epoch_rewards_config: PartitionedEpochRewardsConfig::default(),
         scan_filter_for_shrinking,
         num_background_threads: None,
-        num_foreground_threads: None,
+        accounts_file_provider,
+        use_direct_io: !arg_matches.is_present("no_accounts_db_snapshots_direct_io"),
     }
 }
 
@@ -422,6 +425,50 @@ pub fn hardforks_of(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<Slot>> {
         Some(values_t_or_exit!(matches, name, Slot))
     } else {
         None
+    }
+}
+
+pub(crate) struct CliAccountNewConfig {
+    pub data_encoding: UiAccountEncoding,
+    pub additional_data: Option<AccountAdditionalDataV3>,
+    pub data_slice_config: Option<UiDataSliceConfig>,
+    pub use_lamports_unit: bool,
+}
+
+impl Default for CliAccountNewConfig {
+    fn default() -> Self {
+        Self {
+            data_encoding: UiAccountEncoding::Base64,
+            additional_data: None,
+            data_slice_config: None,
+            use_lamports_unit: false,
+        }
+    }
+}
+
+pub fn cli_account_with_config<T: ReadableAccount>(
+    address: &Pubkey,
+    account: &T,
+    config: &CliAccountNewConfig,
+) -> CliAccount {
+    let CliAccountNewConfig {
+        data_encoding,
+        additional_data,
+        data_slice_config,
+        use_lamports_unit,
+    } = *config;
+    CliAccount {
+        keyed_account: RpcKeyedAccount {
+            pubkey: address.to_string(),
+            account: encode_ui_account(
+                address,
+                account,
+                data_encoding,
+                additional_data,
+                data_slice_config,
+            ),
+        },
+        use_lamports_unit,
     }
 }
 

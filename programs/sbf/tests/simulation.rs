@@ -1,20 +1,20 @@
 #![cfg(feature = "sbf_rust")]
 
 use {
-    agave_validator::test_validator::*,
     solana_instruction::{AccountMeta, Instruction},
     solana_message::Message,
     solana_pubkey::Pubkey,
     solana_runtime::{
         bank::{Bank, SlotLeader},
         bank_client::BankClient,
-        genesis_utils::{GenesisConfigInfo, create_genesis_config},
+        genesis_utils::{GenesisConfigInfo, create_genesis_config_with_default_rent},
         loader_utils::create_program,
     },
     solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
     solana_sdk_ids::bpf_loader_upgradeable,
     solana_signer::Signer,
     solana_sysvar::{clock, slot_history},
+    solana_test_validator::TestValidatorGenesis,
     solana_transaction::Transaction,
     std::{thread::sleep, time::Duration},
 };
@@ -27,7 +27,7 @@ fn test_no_panic_banks_client() {
         genesis_config,
         mint_keypair,
         ..
-    } = create_genesis_config(50);
+    } = create_genesis_config_with_default_rent(1_000_000_000_000);
     let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
     let program_id = create_program(
         &bank,
@@ -40,7 +40,7 @@ fn test_no_panic_banks_client() {
         .unwrap();
     bank.freeze();
 
-    let instruction = Instruction::new_with_bincode(
+    let instruction = Instruction::new_with_wincode(
         program_id,
         &[0u8; 0],
         vec![
@@ -61,7 +61,7 @@ fn test_no_panic_rpc_client() {
     agave_logger::setup();
 
     let program_id = Pubkey::new_unique();
-    let (test_validator, payer) = TestValidatorGenesis::default()
+    let (test_validator, payer) = TestValidatorGenesis::default_for_tests()
         .add_program("solana_sbf_rust_simulation", program_id)
         .start();
     let rpc_client = test_validator.get_rpc_client();

@@ -1,7 +1,6 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
-    assert_matches::assert_matches,
-    solana_account::state_traits::StateMut,
+    solana_account::state_traits::StateMutWincode as _,
     solana_cli::{
         check_balance,
         cli::{CliCommand, CliConfig, process_command, request_and_confirm_airdrop},
@@ -31,6 +30,7 @@ use {
         state::{Lockup, StakeAuthorize, StakeStateV2},
     },
     solana_test_validator::{TestValidator, TestValidatorGenesis},
+    std::assert_matches,
     test_case::test_case,
 };
 
@@ -40,7 +40,7 @@ async fn test_stake_delegation_force() {
     let authorized_withdrawer = Keypair::new().pubkey();
     let faucet_addr = run_local_faucet_with_unique_port_for_tests(mint_keypair.insecure_clone());
     let slots_per_epoch = 32;
-    let test_validator = TestValidatorGenesis::default()
+    let test_validator = TestValidatorGenesis::default_for_tests()
         .fee_rate_governor(FeeRateGovernor::new(0, 0))
         .rent(Rent {
             lamports_per_byte: 1,

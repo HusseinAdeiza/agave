@@ -1,12 +1,13 @@
 #![allow(clippy::arithmetic_side_effects)]
 use {
     agave_votor_messages::consensus_message::BLS_KEYPAIR_DERIVE_SEED,
-    bip39::{Mnemonic, MnemonicType, Seed},
+    bip39::{Language, Mnemonic},
     clap::{
         Arg, ArgAction, ArgMatches, Command, builder::ValueParser, crate_description, crate_name,
         value_parser,
     },
-    solana_bls_signatures::{Pubkey as BLSPubkey, keypair::Keypair as BLSKeypair},
+    rand::RngCore,
+    solana_bls_signatures::keypair::Keypair as BLSKeypair,
     solana_clap_v3_utils::{
         DisplayError,
         input_parsers::{
@@ -393,8 +394,9 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
                 ),
         )
         .subcommand(
-            Command::new("bls_pubkey")
-                .about("Display the BLS pubkey derived from given ed25519 keypair file")
+            Command::new("bls-pubkey")
+                .alias("bls_pubkey")
+                .about("Display the compressed BLS pubkey derived from given ed25519 keypair file")
                 .disable_version_flag(true)
                 .arg(
                     Arg::new("keypair")
@@ -470,6 +472,16 @@ fn app<'a>(num_threads: &'a str, crate_version: &'a str) -> Command<'a> {
         )
 }
 
+fn generate_mnemonic(language: Language, word_count: usize) -> Result<Mnemonic, bip39::Error> {
+    if !(12..=24).contains(&word_count) || !word_count.is_multiple_of(3) {
+        return Err(bip39::Error::BadWordCount(word_count));
+    }
+    let mut entropy = [0u8; 32];
+    let entropy = &mut entropy[..word_count / 3 * 4];
+    rand::rng().fill_bytes(entropy);
+    Mnemonic::from_entropy_in(language, entropy)
+}
+
 fn write_pubkey_file(outfile: &str, pubkey: Pubkey) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
@@ -485,13 +497,17 @@ fn write_pubkey_file(outfile: &str, pubkey: Pubkey) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+fn format_bls_pubkey_compressed(bls_pubkey_compressed: &[u8]) -> String {
+    bs58::encode(bls_pubkey_compressed).into_string()
+}
+
 fn write_bls_pubkey_file(
     outfile: &str,
-    bls_pubkey: BLSPubkey,
+    bls_pubkey_compressed: &[u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
-    let printable = format!("{bls_pubkey}");
+    let printable = format_bls_pubkey_compressed(bls_pubkey_compressed);
     let serialized = serde_json::to_string(&printable)?;
 
     if let Some(outdir) = std::path::Path::new(&outfile).parent() {
@@ -535,17 +551,17 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                 println!("{pubkey}");
             }
         }
-        ("bls_pubkey", matches) => {
+        ("bls-pubkey", matches) => {
             let keypair = get_keypair_from_matches(matches, config, &mut wallet_manager)?;
             let bls_keypair = BLSKeypair::derive_from_signer(&keypair, BLS_KEYPAIR_DERIVE_SEED)?;
-            let bls_pubkey: BLSPubkey = bls_keypair.public.into_inner().into();
+            let bls_pubkey_compressed = bls_keypair.public.to_bytes_compressed();
 
             if matches.try_contains_id("outfile")? {
                 let outfile = matches.get_one::<String>("outfile").unwrap();
                 check_for_overwrite(outfile, matches)?;
-                write_bls_pubkey_file(outfile, bls_pubkey)?;
+                write_bls_pubkey_file(outfile, &bls_pubkey_compressed)?;
             } else {
-                println!("{bls_pubkey}");
+                println!("{}", format_bls_pubkey_compressed(&bls_pubkey_compressed));
             }
         }
         ("new", matches) => {
@@ -566,7 +582,6 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             }
 
             let word_count = try_get_word_count(matches)?.unwrap();
-            let mnemonic_type = MnemonicType::for_word_count(word_count)?;
             let language = try_get_language(matches)?.unwrap();
 
             let silent = matches.try_contains_id("silent")?;
@@ -576,14 +591,15 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
 
             let derivation_path = acquire_derivation_path(matches)?;
 
-            let mnemonic = Mnemonic::new(mnemonic_type, language);
+            let mnemonic = generate_mnemonic(language, word_count)
+                .map_err(|e| format!("Unable to generate mnemonic: {e}"))?;
             let (passphrase, passphrase_message) = acquire_passphrase_and_message(matches)
                 .map_err(|err| format!("Unable to acquire passphrase: {err}"))?;
 
-            let seed = Seed::new(&mnemonic, &passphrase);
+            let seed = mnemonic.to_seed(&passphrase);
             let keypair = match derivation_path {
-                Some(_) => keypair_from_seed_and_derivation_path(seed.as_bytes(), derivation_path),
-                None => keypair_from_seed(seed.as_bytes()),
+                Some(_) => keypair_from_seed_and_derivation_path(&seed, derivation_path),
+                None => keypair_from_seed(&seed),
             }?;
 
             if let Some(outfile) = outfile {
@@ -592,17 +608,17 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             }
 
             if !silent {
-                let phrase: &str = mnemonic.phrase();
+                let phrase = mnemonic.to_string();
                 let divider = String::from_utf8(vec![b'='; phrase.len()]).unwrap();
                 println!(
                     "{}\npubkey: {}\n{}\nSave this seed phrase{} to recover your new \
                      keypair:\n{}\n{}",
-                    &divider,
+                    divider,
                     keypair.pubkey(),
-                    &divider,
+                    divider,
                     passphrase_message,
                     phrase,
-                    &divider
+                    divider
                 );
             }
         }
@@ -705,7 +721,6 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
             let derivation_path = acquire_derivation_path(matches)?;
 
             let word_count = try_get_word_count(matches)?.unwrap();
-            let mnemonic_type = MnemonicType::for_word_count(word_count)?;
             let language = try_get_language(matches)?.unwrap();
 
             let (passphrase, passphrase_message) = if use_mnemonic {
@@ -773,17 +788,18 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                                 );
                             }
                             let (keypair, phrase) = if use_mnemonic {
-                                let mnemonic = Mnemonic::new(mnemonic_type, language);
-                                let seed = Seed::new(&mnemonic, &passphrase);
+                                let mnemonic = generate_mnemonic(language, word_count)
+                                    .expect("CLI word count is always a valid BIP39 length");
+                                let seed = mnemonic.to_seed(&passphrase);
                                 let keypair = match derivation_path {
                                     Some(_) => keypair_from_seed_and_derivation_path(
-                                        seed.as_bytes(),
+                                        &seed,
                                         derivation_path.clone(),
                                     ),
-                                    None => keypair_from_seed(seed.as_bytes()),
+                                    None => keypair_from_seed(&seed),
                                 }
                                 .unwrap();
-                                (keypair, mnemonic.phrase().to_string())
+                                (keypair, mnemonic.to_string())
                             } else {
                                 (Keypair::new(), "".to_string())
                             };
@@ -831,23 +847,19 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
                                             format!("{}.json", keypair.pubkey()),
                                         )
                                         .unwrap();
-                                        println!(
-                                            "Wrote keypair to {}",
-                                            &format!("{}.json", keypair.pubkey())
-                                        );
+                                        println!("Wrote keypair to {}.json", keypair.pubkey());
                                     }
                                     if use_mnemonic {
                                         let divider =
                                             String::from_utf8(vec![b'='; phrase.len()]).unwrap();
                                         println!(
                                             "{}\nFound matching key {}",
-                                            &divider,
+                                            divider,
                                             keypair.pubkey()
                                         );
                                         println!(
-                                            "\nSave this seed phrase{} to recover your new \
-                                             keypair:\n{}\n{}",
-                                            passphrase_message, phrase, &divider
+                                            "\nSave this seed phrase{passphrase_message} to \
+                                             recover your new keypair:\n{phrase}\n{divider}"
                                         );
                                     }
                                 }
@@ -867,7 +879,7 @@ fn do_main(matches: &ArgMatches) -> Result<(), Box<dyn error::Error>> {
         ("verify", matches) => {
             let keypair = get_keypair_from_matches(matches, config, &mut wallet_manager)?;
             let simple_message = Message::new(
-                &[Instruction::new_with_bincode(
+                &[Instruction::new_with_wincode(
                     Pubkey::default(),
                     &0,
                     vec![AccountMeta::new(keypair.pubkey(), true)],
@@ -907,12 +919,11 @@ mod tests {
         Ok(Pubkey::from_str(&printable)?)
     }
 
-    fn read_bls_pubkey_file(infile: &str) -> Result<BLSPubkey, Box<dyn std::error::Error>> {
+    fn read_bls_pubkey_file(infile: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let f = std::fs::File::open(infile)?;
         let printable: String = serde_json::from_reader(f)?;
 
-        use std::str::FromStr;
-        Ok(BLSPubkey::from_str(&printable)?)
+        Ok(bs58::decode(printable).into_vec()?)
     }
 
     fn process_test_command(args: &[&str]) -> Result<(), Box<dyn error::Error>> {
@@ -958,6 +969,18 @@ mod tests {
 
         // run clap internal assert statements
         app(&default_num_threads, solana_version).debug_assert();
+    }
+
+    #[test]
+    fn test_generate_mnemonic() {
+        for word_count in [12, 15, 18, 21, 24] {
+            let mnemonic = generate_mnemonic(Language::English, word_count).unwrap();
+            assert_eq!(mnemonic.word_count(), word_count);
+        }
+        assert_ne!(
+            generate_mnemonic(Language::English, 24).unwrap(),
+            generate_mnemonic(Language::English, 24).unwrap(),
+        );
     }
 
     #[test]
@@ -1292,8 +1315,8 @@ mod tests {
     fn test_read_write_bls_pubkey() -> Result<(), std::boxed::Box<dyn std::error::Error>> {
         let filename = "test_bls_pubkey.json";
         let bls_keypair = BLSKeypair::new();
-        let bls_pubkey: BLSPubkey = bls_keypair.public.into_inner().into();
-        write_bls_pubkey_file(filename, bls_pubkey)?;
+        let bls_pubkey = bls_keypair.public.to_bytes_compressed();
+        write_bls_pubkey_file(filename, &bls_pubkey)?;
         let read = read_bls_pubkey_file(filename)?;
         assert_eq!(read, bls_pubkey);
         std::fs::remove_file(filename)?;
@@ -1313,7 +1336,7 @@ mod tests {
 
         process_test_command(&[
             "solana-keygen",
-            "bls_pubkey",
+            "bls-pubkey",
             "--outfile",
             &outfile_path,
             &keypair_file,
@@ -1323,7 +1346,7 @@ mod tests {
         let bls_keypair =
             BLSKeypair::derive_from_signer(&my_keypair, BLS_KEYPAIR_DERIVE_SEED).unwrap();
         let read_bls_pubkey = read_bls_pubkey_file(&outfile_path).unwrap();
-        assert_eq!(read_bls_pubkey, bls_keypair.public.into_inner().into());
+        assert_eq!(read_bls_pubkey, bls_keypair.public.to_bytes_compressed());
     }
 
     #[test]

@@ -2,9 +2,10 @@ use {
     super::*, solana_program_runtime::memory::translate_vm_slice, solana_sbpf::vm::ContextObject,
 };
 
-declare_builtin_function!(
-    /// Log a user's info message
-    SyscallLog,
+/// Log a user's info message
+pub struct SyscallLog {}
+impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallLog {
+    type Error = Error;
     fn rust(
         invoke_context: &mut InvokeContext<'_, '_>,
         addr: u64,
@@ -17,27 +18,22 @@ declare_builtin_function!(
             .get_execution_cost()
             .syscall_base_cost
             .max(len);
-        invoke_context.compute_meter.consume_checked(cost)?;
+        invoke_context.consume_checked(cost)?;
 
-        let check_aligned = invoke_context.get_check_aligned();
+        let abi = invoke_context.abi();
         let memory_mapping = invoke_context.memory_contexts.memory_mapping()?;
-        translate_string_and_do(
-            memory_mapping,
-            addr,
-            len,
-            check_aligned,
-            &mut |string: &str| {
-                stable_log::program_log(&invoke_context.get_log_collector(), string);
-                Ok(0)
-            },
-        )?;
+        translate_string_and_do(memory_mapping, addr, len, abi, &mut |string: &str| {
+            stable_log::program_log(&invoke_context.get_log_collector(), string);
+            Ok(0)
+        })?;
         Ok(0)
     }
-);
+}
 
-declare_builtin_function!(
-    /// Log 5 64-bit values
-    SyscallLogU64,
+/// Log 5 64-bit values
+pub struct SyscallLogU64 {}
+impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallLogU64 {
+    type Error = Error;
     fn rust(
         invoke_context: &mut InvokeContext<'_, '_>,
         arg1: u64,
@@ -47,7 +43,7 @@ declare_builtin_function!(
         arg5: u64,
     ) -> Result<u64, Error> {
         let cost = invoke_context.get_execution_cost().log_64_units;
-        invoke_context.compute_meter.consume_checked(cost)?;
+        invoke_context.consume_checked(cost)?;
 
         stable_log::program_log(
             &invoke_context.get_log_collector(),
@@ -55,11 +51,12 @@ declare_builtin_function!(
         );
         Ok(0)
     }
-);
+}
 
-declare_builtin_function!(
-    /// Log current compute consumption
-    SyscallLogBpfComputeUnits,
+/// Log current compute consumption
+pub struct SyscallLogBpfComputeUnits {}
+impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallLogBpfComputeUnits {
+    type Error = Error;
     fn rust(
         invoke_context: &mut InvokeContext<'_, '_>,
         _arg1: u64,
@@ -69,7 +66,7 @@ declare_builtin_function!(
         _arg5: u64,
     ) -> Result<u64, Error> {
         let cost = invoke_context.get_execution_cost().syscall_base_cost;
-        invoke_context.compute_meter.consume_checked(cost)?;
+        invoke_context.consume_checked(cost)?;
 
         ic_logger_msg!(
             invoke_context.get_log_collector(),
@@ -78,11 +75,12 @@ declare_builtin_function!(
         );
         Ok(0)
     }
-);
+}
 
-declare_builtin_function!(
-    /// Log a [`Pubkey`] as a base58 string
-    SyscallLogPubkey,
+/// Log a [`Pubkey`] as a base58 string
+pub struct SyscallLogPubkey {}
+impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallLogPubkey {
+    type Error = Error;
     fn rust(
         invoke_context: &mut InvokeContext<'_, '_>,
         pubkey_addr: u64,
@@ -92,23 +90,20 @@ declare_builtin_function!(
         _arg5: u64,
     ) -> Result<u64, Error> {
         let cost = invoke_context.get_execution_cost().log_pubkey_units;
-        invoke_context.compute_meter.consume_checked(cost)?;
+        invoke_context.consume_checked(cost)?;
 
-        let check_aligned = invoke_context.get_check_aligned();
+        let abi = invoke_context.abi();
         let memory_mapping = invoke_context.memory_contexts.memory_mapping()?;
-        let pubkey = translate_type::<Pubkey>(
-            memory_mapping,
-            pubkey_addr,
-            check_aligned,
-        )?;
+        let pubkey = translate_type::<Pubkey>(memory_mapping, pubkey_addr, abi)?;
         stable_log::program_log(&invoke_context.get_log_collector(), &pubkey.to_string());
         Ok(0)
     }
-);
+}
 
-declare_builtin_function!(
-    /// Log data handling
-    SyscallLogData,
+/// Log data handling
+pub struct SyscallLogData {}
+impl BuiltinFunctionDefinition<InvokeContext<'_, '_>> for SyscallLogData {
+    type Error = Error;
     fn rust(
         invoke_context: &mut InvokeContext<'_, '_>,
         addr: u64,
@@ -119,30 +114,25 @@ declare_builtin_function!(
     ) -> Result<u64, Error> {
         let execution_cost = invoke_context.get_execution_cost();
 
-        invoke_context.compute_meter.consume_checked(execution_cost.syscall_base_cost)?;
+        invoke_context.consume_checked(execution_cost.syscall_base_cost)?;
 
-        let check_aligned = invoke_context.get_check_aligned();
+        let abi = invoke_context.abi();
         let memory_mapping = invoke_context.memory_contexts.memory_mapping()?;
-        let untranslated_fields = translate_slice::<VmSlice<u8>>(
-            memory_mapping,
-            addr,
-            len,
-            check_aligned,
-        )?;
+        let untranslated_fields = translate_slice::<VmSlice<u8>>(memory_mapping, addr, len, abi)?;
 
         let cost = execution_cost
             .syscall_base_cost
             .saturating_mul(untranslated_fields.len() as u64);
-        invoke_context.compute_meter.consume_checked(cost)?;
+        invoke_context.consume_checked(cost)?;
         let cost = untranslated_fields
             .iter()
             .fold(0u64, |total, e| total.saturating_add(e.len()));
-        invoke_context.compute_meter.consume_checked(cost)?;
+        invoke_context.consume_checked(cost)?;
 
         let mut fields = Vec::with_capacity(untranslated_fields.len());
 
         for untranslated_field in untranslated_fields {
-            fields.push(translate_vm_slice(untranslated_field, memory_mapping, check_aligned)?);
+            fields.push(translate_vm_slice(untranslated_field, memory_mapping, abi)?);
         }
 
         let log_collector = invoke_context.get_log_collector();
@@ -151,4 +141,4 @@ declare_builtin_function!(
 
         Ok(0)
     }
-);
+}

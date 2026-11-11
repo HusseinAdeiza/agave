@@ -1,9 +1,10 @@
 use {
-    crate::blockstore_options::LedgerColumnOptions,
+    crate::{blockstore_meta::BlockLocation, blockstore_options::LedgerColumnOptions},
     rocksdb::{
         PerfContext,
         perf::{PerfMetric, PerfStatsLevel, set_perf_stats},
     },
+    solana_clock::Slot,
     solana_metrics::datapoint_info,
     solana_time_utils::timestamp,
     std::{
@@ -27,11 +28,22 @@ pub struct BlockstoreInsertionMetrics {
     pub num_shreds: usize,
     pub num_inserted: u64,
     pub num_repair: u64,
-    pub num_recovered: usize,
+    /// Recovered data shreds submitted for retransmit.
+    pub num_recovered_data_shreds: usize,
+    /// Recovered coding shreds submitted for retransmit.
+    pub num_recovered_coding_shreds: usize,
+    /// Number of nonempty recovered-shred batches submitted for retransmit.
+    pub num_recovered_retransmit_batches: usize,
     pub num_recovered_blockstore_error: usize,
     pub num_recovered_inserted: usize,
     pub num_recovered_failed_invalid: usize,
     pub num_recovered_exists: usize,
+    pub num_fec_set_checks_passed: usize,
+    /// FEC sets failing SIMD-0504 checks, including rebuild failures.
+    pub num_fec_set_checks_failed: usize,
+    /// Subset of `num_fec_set_checks_failed`: FEC sets that could not be
+    /// rebuilt despite enough shreds being available.
+    pub num_fec_set_checks_rebuild_failed: usize,
     pub num_repaired_data_shreds_exists: usize,
     pub num_turbine_data_shreds_exists: usize,
     pub num_data_shreds_invalid: usize,
@@ -41,6 +53,30 @@ pub struct BlockstoreInsertionMetrics {
     pub num_coding_shreds_invalid_erasure_config: usize,
     pub num_coding_shreds_blockstore_error: usize,
     pub num_coding_shreds_inserted: usize,
+}
+
+#[derive(Default)]
+pub struct BlockstoreSwitchBankMetrics {
+    pub total_elapsed_us: u64,
+    pub lock_elapsed_us: u64,
+    pub backup_elapsed_us: u64,
+    pub purge_elapsed_us: u64,
+    pub copy_elapsed_us: u64,
+}
+
+impl BlockstoreSwitchBankMetrics {
+    pub fn report_metrics(self, slot: Slot, from_location: BlockLocation) {
+        datapoint_info!(
+            "blockstore_switch_bank",
+            "from_location" => from_location.to_string(),
+            ("slot", slot as i64, i64),
+            ("total_elapsed_us", self.total_elapsed_us as i64, i64),
+            ("lock_elapsed_us", self.lock_elapsed_us as i64, i64),
+            ("backup_elapsed_us", self.backup_elapsed_us as i64, i64),
+            ("purge_elapsed_us", self.purge_elapsed_us as i64, i64),
+            ("copy_elapsed_us", self.copy_elapsed_us as i64, i64),
+        );
+    }
 }
 
 impl BlockstoreInsertionMetrics {
@@ -79,7 +115,21 @@ impl BlockstoreInsertionMetrics {
             ),
             ("num_inserted", self.num_inserted as i64, i64),
             ("num_repair", self.num_repair as i64, i64),
-            ("num_recovered", self.num_recovered as i64, i64),
+            (
+                "num_recovered_data_shreds",
+                self.num_recovered_data_shreds as i64,
+                i64
+            ),
+            (
+                "num_recovered_coding_shreds",
+                self.num_recovered_coding_shreds as i64,
+                i64
+            ),
+            (
+                "num_recovered_retransmit_batches",
+                self.num_recovered_retransmit_batches as i64,
+                i64
+            ),
             (
                 "num_recovered_inserted",
                 self.num_recovered_inserted as i64,
@@ -98,6 +148,21 @@ impl BlockstoreInsertionMetrics {
             (
                 "num_recovered_blockstore_error",
                 self.num_recovered_blockstore_error,
+                i64
+            ),
+            (
+                "num_fec_set_checks_passed",
+                self.num_fec_set_checks_passed,
+                i64
+            ),
+            (
+                "num_fec_set_checks_failed",
+                self.num_fec_set_checks_failed,
+                i64
+            ),
+            (
+                "num_fec_set_checks_rebuild_failed",
+                self.num_fec_set_checks_rebuild_failed,
                 i64
             ),
             (

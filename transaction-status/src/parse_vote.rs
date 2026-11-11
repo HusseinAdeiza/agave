@@ -3,7 +3,6 @@ use {
         ParsableProgram, ParseInstructionError, ParsedInstructionEnum, check_num_accounts,
     },
     base64::{Engine, prelude::BASE64_STANDARD},
-    bincode::deserialize,
     serde_json::json,
     solana_message::{AccountKeys, compiled_instruction::CompiledInstruction},
     solana_vote_interface::instruction::VoteInstruction,
@@ -13,7 +12,7 @@ pub fn parse_vote(
     instruction: &CompiledInstruction,
     account_keys: &AccountKeys,
 ) -> Result<ParsedInstructionEnum, ParseInstructionError> {
-    let vote_instruction: VoteInstruction = deserialize(&instruction.data)
+    let vote_instruction: VoteInstruction = wincode::deserialize(&instruction.data)
         .map_err(|_| ParseInstructionError::InstructionNotParsable(ParsableProgram::Vote))?;
     match instruction.accounts.iter().max() {
         Some(index) if (*index as usize) < account_keys.len() => {}
@@ -1254,6 +1253,11 @@ mod test {
             .is_err()
         );
         let keys = message.account_keys.clone();
+        // The builder appends the system program so the deposit can invoke a
+        // transfer, but the program reads only the vote and source accounts, so
+        // the two-account form parses too.
+        message.instructions[0].accounts.pop();
+        assert!(parse_vote(&message.instructions[0], &AccountKeys::new(&keys, None)).is_ok());
         message.instructions[0].accounts.pop();
         assert!(parse_vote(&message.instructions[0], &AccountKeys::new(&keys, None)).is_err());
     }

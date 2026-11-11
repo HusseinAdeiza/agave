@@ -68,16 +68,22 @@ pub(crate) fn args<'a, 'b>(test_validator: bool) -> Vec<Arg<'a, 'b>> {
         )
     };
 
+    let rpc_pubsub_enable_block_sub_value = Arg::with_name("rpc_pubsub_enable_block_subscription")
+        .long("rpc-pubsub-enable-block-subscription")
+        .takes_value(false)
+        .help("Enable the unstable RPC PubSub `blockSubscribe` subscription");
+
+    // enable_rpc_transaction_history is on by default in the configs
+    // for test_validator, while required by agave_validator if
+    // rpc_pubsub_enable_block_subscription is passed
+    let rpc_pubsub_enable_block_sub_value = if !test_validator {
+        rpc_pubsub_enable_block_sub_value.requires("enable_rpc_transaction_history")
+    } else {
+        rpc_pubsub_enable_block_sub_value
+    };
+
     vec![
-        Arg::with_name("rpc_pubsub_enable_block_subscription")
-            .long("rpc-pubsub-enable-block-subscription")
-            .requires("enable_rpc_transaction_history")
-            .takes_value(false)
-            .help("Enable the unstable RPC PubSub `blockSubscribe` subscription"),
-        Arg::with_name("rpc_pubsub_enable_vote_subscription")
-            .long("rpc-pubsub-enable-vote-subscription")
-            .takes_value(false)
-            .help("Enable the unstable RPC PubSub `voteSubscribe` subscription"),
+        rpc_pubsub_enable_block_sub_value,
         Arg::with_name("rpc_pubsub_max_active_subscriptions")
             .long("rpc-pubsub-max-active-subscriptions")
             .takes_value(true)
@@ -123,7 +129,6 @@ impl FromClapArgMatches for PubSubConfig {
     fn from_clap_arg_match(matches: &ArgMatches) -> Result<Self> {
         Ok(PubSubConfig {
             enable_block_subscription: matches.is_present("rpc_pubsub_enable_block_subscription"),
-            enable_vote_subscription: matches.is_present("rpc_pubsub_enable_vote_subscription"),
             max_active_subscriptions: value_t!(
                 matches,
                 "rpc_pubsub_max_active_subscriptions",
@@ -174,20 +179,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_args_struct_by_command_run_with_enable_vote_subscription() {
-        let default_run_args = crate::commands::run::args::RunArgs::default();
-        let expected_args = RunArgs {
-            pub_sub_config: PubSubConfig {
-                enable_vote_subscription: true,
-                ..default_run_args.pub_sub_config.clone()
-            },
-            ..default_run_args.clone()
-        };
-        verify_args_struct_by_command_run_with_identity_setup(
-            default_run_args,
-            vec!["--rpc-pubsub-enable-vote-subscription"],
-            expected_args,
-        );
+    fn verify_removed_vote_subscription_flag() {
+        let error = clap::App::new("test-validator")
+            .args(&args(true))
+            .get_matches_from_safe(["test-validator", "--rpc-pubsub-enable-vote-subscription"])
+            .unwrap_err();
+        assert_eq!(error.kind, clap::ErrorKind::UnknownArgument);
     }
 
     #[test]

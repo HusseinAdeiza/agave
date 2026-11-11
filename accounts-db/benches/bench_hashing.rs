@@ -24,9 +24,13 @@ const DATA_SIZES: [usize; 6] = [
 /// The number of bytes of *non account data* that are also hashed as
 /// part of computing an account's hash.
 ///
-/// Ensure this constant stays in sync with the value of `META_SIZE` in
-/// AccountsDb::hash_account_helper().
-const META_SIZE: usize = 73;
+/// Ensure this constant stays in sync with the non-data parts written by
+/// AccountsDb::write_account_hash_input().
+const META_SIZE: usize = size_of::<u64>() // lamports
+    + size_of::<bool>() // executable
+    + size_of::<Pubkey>() // owner
+    + size_of::<Pubkey>(); // pubkey
+const _: () = assert!(META_SIZE == 73);
 
 fn bench_hash_account(c: &mut Criterion) {
     let lamports = 123_456_789;
@@ -37,7 +41,7 @@ fn bench_hash_account(c: &mut Criterion) {
     for data_size in DATA_SIZES {
         let num_bytes = META_SIZE.checked_add(data_size).unwrap();
         group.throughput(Throughput::Bytes(num_bytes as u64));
-        let account = AccountSharedData::new(lamports, data_size, &owner);
+        let account = AccountSharedData::new_with_data(lamports, vec![0; data_size], &owner);
         group.bench_function(BenchmarkId::new("lattice", data_size), |b| {
             b.iter(|| AccountsDb::lt_hash_account(&account, &address));
         });

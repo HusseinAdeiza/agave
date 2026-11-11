@@ -12,7 +12,6 @@ use {
 // Need this struct to provide &str whose lifetime matches that of the CLAP Arg's
 pub struct DefaultThreadArgs {
     pub accounts_db_background_threads: String,
-    pub accounts_db_foreground_threads: String,
     pub accounts_index_flush_threads: String,
     pub block_production_num_workers: String,
     pub ip_echo_server_threads: String,
@@ -22,7 +21,6 @@ pub struct DefaultThreadArgs {
     pub tpu_sigverify_threads: String,
     pub tpu_transaction_forward_receive_threads: String,
     pub tpu_transaction_receive_threads: String,
-    pub tpu_vote_transaction_receive_threads: String,
     pub tvu_receive_threads: String,
     pub tvu_retransmit_threads: String,
     pub tvu_sigverify_threads: String,
@@ -33,8 +31,6 @@ impl Default for DefaultThreadArgs {
     fn default() -> Self {
         Self {
             accounts_db_background_threads: AccountsDbBackgroundThreadsArg::bounded_default()
-                .to_string(),
-            accounts_db_foreground_threads: AccountsDbForegroundThreadsArg::bounded_default()
                 .to_string(),
             accounts_index_flush_threads: AccountsIndexFlushThreadsArg::bounded_default()
                 .to_string(),
@@ -49,8 +45,6 @@ impl Default for DefaultThreadArgs {
                 TpuTransactionForwardReceiveThreadArgs::bounded_default().to_string(),
             tpu_transaction_receive_threads: TpuTransactionReceiveThreads::bounded_default()
                 .to_string(),
-            tpu_vote_transaction_receive_threads:
-                TpuVoteTransactionReceiveThreads::bounded_default().to_string(),
             tvu_receive_threads: TvuReceiveThreadsArg::bounded_default().to_string(),
             tvu_retransmit_threads: TvuRetransmitThreadsArg::bounded_default().to_string(),
             tvu_sigverify_threads: TvuShredSigverifyThreadsArg::bounded_default().to_string(),
@@ -63,7 +57,6 @@ impl Default for DefaultThreadArgs {
 pub fn thread_args<'a>(defaults: &DefaultThreadArgs) -> Vec<Arg<'_, 'a>> {
     vec![
         new_thread_arg::<AccountsDbBackgroundThreadsArg>(&defaults.accounts_db_background_threads),
-        new_thread_arg::<AccountsDbForegroundThreadsArg>(&defaults.accounts_db_foreground_threads),
         new_thread_arg::<AccountsIndexFlushThreadsArg>(&defaults.accounts_index_flush_threads),
         new_thread_arg::<BlockProductionNumWorkersArg>(&defaults.block_production_num_workers),
         new_thread_arg::<IpEchoServerThreadsArg>(&defaults.ip_echo_server_threads),
@@ -75,9 +68,6 @@ pub fn thread_args<'a>(defaults: &DefaultThreadArgs) -> Vec<Arg<'_, 'a>> {
             &defaults.tpu_transaction_forward_receive_threads,
         ),
         new_thread_arg::<TpuTransactionReceiveThreads>(&defaults.tpu_transaction_receive_threads),
-        new_thread_arg::<TpuVoteTransactionReceiveThreads>(
-            &defaults.tpu_vote_transaction_receive_threads,
-        ),
         new_thread_arg::<TvuReceiveThreadsArg>(&defaults.tvu_receive_threads),
         new_thread_arg::<TvuRetransmitThreadsArg>(&defaults.tvu_retransmit_threads),
         new_thread_arg::<TvuShredSigverifyThreadsArg>(&defaults.tvu_sigverify_threads),
@@ -98,7 +88,6 @@ pub(crate) fn new_thread_arg<'a, T: ThreadArg>(default: &str) -> Arg<'_, 'a> {
 
 pub struct NumThreadConfig {
     pub accounts_db_background_threads: NonZeroUsize,
-    pub accounts_db_foreground_threads: NonZeroUsize,
     pub accounts_index_flush_threads: NonZeroUsize,
     pub block_production_num_workers: NonZeroUsize,
     pub ip_echo_server_threads: NonZeroUsize,
@@ -108,7 +97,6 @@ pub struct NumThreadConfig {
     pub tpu_sigverify_threads: NonZeroUsize,
     pub tpu_transaction_forward_receive_threads: NonZeroUsize,
     pub tpu_transaction_receive_threads: NonZeroUsize,
-    pub tpu_vote_transaction_receive_threads: NonZeroUsize,
     pub tvu_receive_threads: NonZeroUsize,
     pub tvu_retransmit_threads: NonZeroUsize,
     pub tvu_sigverify_threads: NonZeroUsize,
@@ -120,11 +108,6 @@ pub fn parse_num_threads_args(matches: &ArgMatches) -> NumThreadConfig {
         accounts_db_background_threads: value_t_or_exit!(
             matches,
             AccountsDbBackgroundThreadsArg::NAME,
-            NonZeroUsize
-        ),
-        accounts_db_foreground_threads: value_t_or_exit!(
-            matches,
-            AccountsDbForegroundThreadsArg::NAME,
             NonZeroUsize
         ),
         accounts_index_flush_threads: value_t_or_exit!(
@@ -162,11 +145,6 @@ pub fn parse_num_threads_args(matches: &ArgMatches) -> NumThreadConfig {
         tpu_transaction_receive_threads: value_t_or_exit!(
             matches,
             TpuTransactionReceiveThreads::NAME,
-            NonZeroUsize
-        ),
-        tpu_vote_transaction_receive_threads: value_t_or_exit!(
-            matches,
-            TpuVoteTransactionReceiveThreads::NAME,
             NonZeroUsize
         ),
         tvu_receive_threads: value_t_or_exit!(matches, TvuReceiveThreadsArg::NAME, NonZeroUsize),
@@ -228,18 +206,6 @@ impl ThreadArg for AccountsDbBackgroundThreadsArg {
 
     fn default() -> usize {
         accounts_db::quarter_thread_count()
-    }
-}
-
-struct AccountsDbForegroundThreadsArg;
-impl ThreadArg for AccountsDbForegroundThreadsArg {
-    const NAME: &'static str = "accounts_db_foreground_threads";
-    const LONG_NAME: &'static str = "accounts-db-foreground-threads";
-    const HELP: &'static str =
-        "Number of threads to use for AccountsDb foreground tasks, e.g. transaction processing";
-
-    fn default() -> usize {
-        accounts_db::default_num_foreground_threads()
     }
 }
 
@@ -316,7 +282,8 @@ struct ReplayTransactionsThreadsArg;
 impl ThreadArg for ReplayTransactionsThreadsArg {
     const NAME: &'static str = "replay_transactions_threads";
     const LONG_NAME: &'static str = "replay-transactions-threads";
-    const HELP: &'static str = "Number of threads to use for transaction replay";
+    const HELP: &'static str =
+        "Number of threads to use for PoH and transaction signature verification during replay";
 
     fn default() -> usize {
         num_cpus::get()
@@ -356,18 +323,6 @@ impl ThreadArg for TpuTransactionReceiveThreads {
 
     fn default() -> usize {
         solana_streamer::quic::default_num_tpu_transaction_receive_threads()
-    }
-}
-
-struct TpuVoteTransactionReceiveThreads;
-impl ThreadArg for TpuVoteTransactionReceiveThreads {
-    const NAME: &'static str = "tpu_vote_transaction_receive_threads";
-    const LONG_NAME: &'static str = "tpu-vote-transaction-receive-threads";
-    const HELP: &'static str =
-        "Number of threads to use for receiving transactions on the TPU vote port";
-
-    fn default() -> usize {
-        solana_streamer::quic::default_num_tpu_vote_transaction_receive_threads()
     }
 }
 

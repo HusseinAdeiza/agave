@@ -10,10 +10,7 @@ use {
     log::*,
     solana_accounts_db::{
         accounts_db::TOTAL_IO_URING_BUFFERS_SIZE_LIMIT,
-        utils::{
-            create_all_accounts_run_and_snapshot_dirs, move_and_async_delete_path_contents,
-            validate_account_paths_for_direct_io,
-        },
+        utils::{create_all_accounts_run_dirs, validate_account_paths_for_direct_io},
     },
     solana_clock::Slot,
     solana_core::{
@@ -29,15 +26,13 @@ use {
         bank_forks_utils::{self, BankForksUtilsError},
         blockstore::{Blockstore, BlockstoreError},
         blockstore_options::{AccessType, BlockstoreOptions, BlockstoreRecoveryMode},
-        blockstore_processor::{
-            self, BlockstoreProcessorError, ProcessOptions, TransactionStatusSender,
-        },
+        blockstore_processor::{self, BlockstoreProcessorError, ProcessOptions},
         leader_schedule_cache::LeaderScheduleCache,
         use_snapshot_archives_at_startup::UseSnapshotArchivesAtStartup,
     },
-    solana_measure::measure_time,
-    solana_pubkey::Pubkey,
-    solana_rpc::transaction_status_service::TransactionStatusService,
+    solana_rpc::transaction_status_service::{
+        TransactionStatusService, TransactionStatusServiceConfig,
+    },
     solana_runtime::{
         accounts_background_service::{
             AbsRequestHandlers, AccountsBackgroundService, PendingSnapshotPackages,
@@ -45,9 +40,10 @@ use {
         },
         bank_forks::BankForks,
         snapshot_controller::SnapshotController,
-        snapshot_utils::{self, clean_orphaned_account_snapshot_dirs},
+        snapshot_utils,
+        transaction_execution::TransactionStatusSender,
     },
-    solana_transaction::versioned::VersionedTransaction,
+    solana_shred_version::compute_shred_version,
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         path::{Path, PathBuf},
@@ -81,11 +77,8 @@ const PROCESS_SLOTS_HELP_STRING: &str =
 
 #[derive(Error, Debug)]
 pub(crate) enum LoadAndProcessLedgerError {
-    #[error("failed to clean orphaned account snapshot directories: {0}")]
-    CleanOrphanedAccountSnapshotDirectories(#[source] std::io::Error),
-
-    #[error("failed to create all run and snapshot directories: {0}")]
-    CreateAllAccountsRunAndSnapshotDirectories(#[source] std::io::Error),
+    #[error("failed to create all account run directories: {0}")]
+    CreateAllAccountsRunDirectories(#[source] std::io::Error),
 
     #[error("custom accounts path is not supported with read-only blockstore access")]
     CustomAccountsPathUnsupported(#[source] BlockstoreError),
@@ -260,44 +253,22 @@ pub fn load_and_process_ledger(
         vec![non_primary_accounts_path]
     };
 
-    let (account_run_paths, account_snapshot_paths) =
-        create_all_accounts_run_and_snapshot_dirs(&account_paths)
-            .map_err(LoadAndProcessLedgerError::CreateAllAccountsRunAndSnapshotDirectories)?;
+    let account_run_paths = create_all_accounts_run_dirs(&account_paths)
+        .map_err(LoadAndProcessLedgerError::CreateAllAccountsRunDirectories)?;
     // From now on, use run/ paths in the same way as the previous account_paths.
     let account_paths = account_run_paths;
 
     validate_account_paths_for_direct_io(
         snapshot_config.use_direct_io,
-        account_paths
-            .iter()
-            .chain(account_snapshot_paths.iter())
-            .chain([
-                &snapshot_config.full_snapshot_archives_dir,
-                &snapshot_config.incremental_snapshot_archives_dir,
-                &snapshot_config.bank_snapshots_dir,
-            ]),
+        account_paths.iter().chain([
+            &snapshot_config.full_snapshot_archives_dir,
+            &snapshot_config.incremental_snapshot_archives_dir,
+            &snapshot_config.bank_snapshots_dir,
+        ]),
     )
     .map_err(LoadAndProcessLedgerError::ValidateAccountPaths)?;
 
-    let (_, measure_clean_account_paths) = measure_time!(
-        account_paths.iter().for_each(|path| {
-            if path.exists() {
-                info!("Cleaning contents of account path: {}", path.display());
-                move_and_async_delete_path_contents(path);
-            }
-        }),
-        "Cleaning account paths"
-    );
-    info!("{measure_clean_account_paths}");
-
     snapshot_utils::purge_incomplete_bank_snapshots(&snapshot_config.bank_snapshots_dir);
-
-    info!("Cleaning contents of account snapshot paths: {account_snapshot_paths:?}");
-    clean_orphaned_account_snapshot_dirs(
-        &snapshot_config.bank_snapshots_dir,
-        &account_snapshot_paths,
-    )
-    .map_err(LoadAndProcessLedgerError::CleanOrphanedAccountSnapshotDirectories)?;
 
     let geyser_plugin_active = arg_matches.is_present("geyser_plugin_config");
     let (accounts_update_notifier, transaction_notifier) = if geyser_plugin_active {
@@ -320,9 +291,6 @@ pub fn load_and_process_ledger(
     };
 
     let exit = Arc::new(AtomicBool::new(false));
-    // Separate TSS exit flag as it needs to get set at a later point than
-    // the common exit flag. This is coupled to draining TSS receiver queue first.
-    let tss_exit = Arc::new(AtomicBool::new(false));
 
     let enable_rpc_transaction_history = arg_matches.is_present("enable_rpc_transaction_history");
 
@@ -345,12 +313,18 @@ pub fn load_and_process_ledger(
             let transaction_status_service = TransactionStatusService::new(
                 transaction_status_receiver,
                 Arc::default(),
-                enable_rpc_transaction_history,
-                transaction_notifier,
+                Arc::default(),
                 write_blockstore.clone(),
-                arg_matches.is_present("enable_extended_tx_metadata_storage"),
+                TransactionStatusServiceConfig {
+                    enable_rpc_transaction_history,
+                    transaction_notifier,
+                    enable_extended_tx_metadata_storage: arg_matches
+                        .is_present("enable_extended_tx_metadata_storage"),
+                    dependency_tracker: None,
+                    transaction_history_notification_sender: None,
+                },
+                exit.clone(),
                 None,
-                tss_exit.clone(),
             );
 
             (
@@ -375,6 +349,11 @@ pub fn load_and_process_ledger(
         )
         .transpose()
         .unwrap_or_else(|| {
+            // Clean run from genesis — must not use any existing state from previous runs.
+            bank_forks_utils::discard_previous_run_state(
+                &snapshot_config.bank_snapshots_dir,
+                &account_paths,
+            );
             bank_forks_utils::load_bank_forks_from_genesis(
                 genesis_config,
                 &blockstore,
@@ -387,6 +366,26 @@ pub fn load_and_process_ledger(
             )
         })
         .map_err(LoadAndProcessLedgerError::LoadBankForks)?;
+
+    // With hard-linking gone, an AppendVec's Drop removes the only copy of the storage file by
+    // default. For a fastboot load we don't want that — the files belong to the validator's
+    // local state and need to outlive this process. Storages ledger-tool creates itself (archive
+    // or genesis load) can be cleaned up normally. We detect fastboot via the bank snapshot dir
+    // at the root slot: archive/genesis paths went through `discard_previous_run_state`, which
+    // purges those dirs, so its presence here means we loaded from it.
+    {
+        let root_bank = bank_forks.read().unwrap().root_bank();
+        let loaded_from_fastboot = snapshot_config
+            .bank_snapshots_dir
+            .join(root_bank.slot().to_string())
+            .is_dir();
+        if loaded_from_fastboot {
+            for storage in root_bank.get_snapshot_storages(None) {
+                storage.disable_remove_on_drop();
+            }
+        }
+    }
+
     let leader_schedule_cache =
         LeaderScheduleCache::new_from_bank(&bank_forks.read().unwrap().root_bank());
 
@@ -410,15 +409,14 @@ pub fn load_and_process_ledger(
         value_t!(arg_matches, "unified_scheduler_handler_threads", usize).ok();
     match block_verification_method {
         BlockVerificationMethod::UnifiedScheduler => {
-            let no_replay_vote_sender = None;
             let no_prioritization_fee_cache = None;
 
             let scheduler_pool = DefaultSchedulerPool::new(
                 unified_scheduler_handler_threads,
                 process_options.runtime_config.log_messages_bytes_limit,
                 transaction_status_sender.clone(),
-                no_replay_vote_sender,
                 no_prioritization_fee_cache,
+                None,
             );
             bank_forks
                 .write()
@@ -460,10 +458,15 @@ pub fn load_and_process_ledger(
     };
     let accounts_background_service =
         AccountsBackgroundService::new(bank_forks.clone(), exit.clone(), abs_request_handler);
+    let shred_version = {
+        let hard_forks = bank_forks.read().unwrap().root_bank().hard_forks();
+        compute_shred_version(&genesis_config.hash(), Some(&hard_forks))
+    };
 
     let result = blockstore_processor::process_blockstore_from_root(
         blockstore.as_ref(),
         &bank_forks,
+        shred_version,
         &leader_schedule_cache,
         &process_options,
         transaction_status_sender.as_ref(),
@@ -479,7 +482,7 @@ pub fn load_and_process_ledger(
 
     exit.store(true, Ordering::Relaxed);
     if let Some(service) = transaction_status_service {
-        service.quiesce_and_join_for_tests(tss_exit);
+        service.join().unwrap();
     }
 
     result
@@ -599,16 +602,6 @@ pub fn open_genesis_config_by(ledger_path: &Path, matches: &ArgMatches<'_>) -> G
         eprintln!("Exiting. Failed to open genesis config: {err}");
         exit(1);
     })
-}
-
-pub fn get_program_ids(tx: &VersionedTransaction) -> impl Iterator<Item = &Pubkey> + '_ {
-    let message = &tx.message;
-    let account_keys = message.static_account_keys();
-
-    message
-        .instructions()
-        .iter()
-        .map(|ix| ix.program_id(account_keys))
 }
 
 /// Get the AccessType required, based on `process_options`

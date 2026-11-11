@@ -4,6 +4,7 @@ use {
         duplicate_shred_listener::DuplicateShredHandlerTrait,
         epoch_specs::EpochSpecs,
     },
+    agave_votor_messages::migration::MigrationStatus,
     crossbeam_channel::Sender,
     log::error,
     solana_clock::Slot,
@@ -39,12 +40,19 @@ pub struct DuplicateShredHandler {
     // Used to notify duplicate consensus state machine
     duplicate_slots_sender: Sender<Slot>,
     shred_version: u16,
+    /// Alpenglow migration status
+    migration_status: Arc<MigrationStatus>,
 }
 
 impl DuplicateShredHandlerTrait for DuplicateShredHandler {
     // Here we are sending data one by one rather than in a batch because in the future
     // we may send different type of CrdsData to different senders.
     fn handle(&mut self, shred_data: DuplicateShred) {
+        if self.migration_status.is_full_alpenglow_epoch() {
+            // turn into noop and clear any existing buffer
+            self.buffer.clear();
+            return;
+        }
         self.cache_root_info();
         self.maybe_prune_buffer();
         let slot = shred_data.slot;
@@ -72,6 +80,7 @@ impl DuplicateShredHandler {
         epoch_specs: Box<dyn EpochSpecs>,
         duplicate_slots_sender: Sender<Slot>,
         shred_version: u16,
+        migration_status: Arc<MigrationStatus>,
     ) -> Self {
         Self {
             buffer: HashMap::<(Slot, Pubkey), BufferEntry>::default(),
@@ -83,11 +92,12 @@ impl DuplicateShredHandler {
             epoch_specs,
             duplicate_slots_sender,
             shred_version,
+            migration_status,
         }
     }
 
     fn cache_root_info(&mut self) {
-        let last_root = self.blockstore.max_root();
+        let last_root = self.epoch_specs.root_slot();
         if last_root == self.last_root && self.cached_slots_in_epoch != 0 {
             return;
         }
@@ -123,18 +133,30 @@ impl DuplicateShredHandler {
                 .leader_schedule_cache
                 .slot_leader_at(slot, /*bank:*/ None)
                 .ok_or(Error::UnknownSlotLeader(slot))?;
-            let (shred1, shred2) =
-                duplicate_shred::into_shreds(&slot_leader.id, chunks, self.shred_version)?;
+            let (shred1, shred2) = duplicate_shred::into_shreds(
+                &slot_leader.id,
+                chunks,
+                self.shred_version,
+                self.epoch_specs.should_enforce_correct_proof_size(slot),
+            )?;
             if !self.blockstore.has_duplicate_shreds_in_slot(slot) {
                 self.blockstore.store_duplicate_slot(
                     slot,
                     shred1.into_payload(),
                     shred2.into_payload(),
                 )?;
-                // Notify duplicate consensus state machine
-                self.duplicate_slots_sender
-                    .send(slot)
-                    .map_err(|_| Error::DuplicateSlotSenderFailure)?;
+
+                // Notify the Tower duplicate-consensus state machine. ReplayStage stops
+                // consuming this channel once Alpenglow is enabled, while duplicate proofs are
+                // still stored during the mixed epoch for slashing.
+                if !self.migration_status.is_alpenglow_enabled()
+                    && self.duplicate_slots_sender.len() * 2
+                        < self.duplicate_slots_sender.capacity().unwrap_or(usize::MAX)
+                {
+                    self.duplicate_slots_sender
+                        .try_send(slot)
+                        .map_err(|_| Error::DuplicateSlotSenderFailure)?;
+                }
             }
             self.consumed.insert(slot, true);
         }
@@ -213,21 +235,22 @@ mod tests {
             epoch_specs::TestEpochSpecs,
             protocol::DUPLICATE_SHRED_MAX_PAYLOAD_SIZE,
         },
-        crossbeam_channel::unbounded,
+        crossbeam_channel::bounded,
         itertools::Itertools,
         solana_keypair::Keypair,
         solana_ledger::{
-            genesis_utils::{GenesisConfigInfo, create_genesis_config_with_leader},
+            genesis_utils::GenesisConfigInfo,
             get_tmp_ledger_path_auto_delete,
-            shred::Shredder,
+            shred::{Shred, Shredder, override_proof_size},
         },
         solana_runtime::{
             bank::{Bank, SlotLeader},
             bank_forks::BankForks,
+            genesis_utils::create_genesis_config_with_tower_leader,
         },
         solana_signer::Signer,
         solana_time_utils::timestamp,
-        std::time::Duration,
+        test_case::test_case,
     };
 
     fn create_duplicate_proof(
@@ -244,7 +267,7 @@ mod tests {
         };
         let mut rng = rand::rng();
         let shredder = Shredder::new(slot, slot - 1, 0, shred_version).unwrap();
-        let next_shred_index = 353;
+        let next_shred_index = 352;
         let shred1 = new_rand_shred(&mut rng, next_shred_index, &shredder, &my_keypair);
         let shredder1 = Shredder::new(slot + 1, slot, 0, shred_version).unwrap();
         let shred2 = match expected_error {
@@ -270,6 +293,106 @@ mod tests {
         Ok(chunks)
     }
 
+    // Builds a duplicate proof whose two shreds carry a Merkle proof height
+    // that no 32:32 erasure set can produce. The shreds are re-signed after the
+    // rewrite so that only the proof height sets them apart from a proof the
+    // handler would otherwise store.
+    fn create_duplicate_proof_with_bad_proof_size(
+        keypair: Arc<Keypair>,
+        slot: Slot,
+        shred_version: u16,
+    ) -> impl Iterator<Item = DuplicateShred> {
+        let mut rng = rand::rng();
+        let shredder = Shredder::new(slot, slot - 1, 0, shred_version).unwrap();
+        let mut bad_proof_size_shred = || {
+            let shred = new_rand_shred(&mut rng, 352, &shredder, &keypair);
+            let mut payload = shred.payload().to_vec();
+            override_proof_size(&mut payload, 5);
+            let mut shred = Shred::new_from_serialized_shred(payload).unwrap();
+            assert_eq!(
+                shred.proof_size().unwrap(),
+                5,
+                "the rewritten proof height has to survive a round trip"
+            );
+            shred.sign(&keypair);
+            shred
+        };
+        let shred1 = bad_proof_size_shred();
+        let shred2 = bad_proof_size_shred();
+        from_shred(
+            shred1,
+            keypair.pubkey(),
+            shred2.payload().clone(),
+            None::<fn(Slot) -> Option<Pubkey>>,
+            timestamp(), // wallclock
+            DUPLICATE_SHRED_MAX_PAYLOAD_SIZE,
+            shred_version,
+        )
+        .unwrap()
+    }
+
+    // A duplicate proof marks the slot duplicate, so a proof whose shreds could
+    // never have been retransmitted must be admitted only while the gate that
+    // rejects them on the shred paths is still off for the slot.
+    #[test_case(true, false; "enforced")]
+    #[test_case(false, true; "not_enforced")]
+    fn test_handle_bad_proof_size(enforce_correct_proof_size: bool, expect_stored: bool) {
+        agave_logger::setup();
+
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let my_keypair = Arc::new(Keypair::new());
+        let my_pubkey = my_keypair.pubkey();
+        let shred_version = 0;
+        let GenesisConfigInfo { genesis_config, .. } =
+            create_genesis_config_with_tower_leader(10_000, &my_pubkey, 10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks_arc = BankForks::new_rw_arc(bank);
+        {
+            let bank0 = bank_forks_arc.read().unwrap().get(0).unwrap();
+            let bank9 = Bank::new_from_parent(bank0, SlotLeader::default(), 9);
+            let mut bank_forks = bank_forks_arc.write().unwrap();
+            bank_forks.insert(bank9);
+            bank_forks.set_root(9, None, None);
+        }
+        let slots_in_epoch = bank_forks_arc
+            .read()
+            .unwrap()
+            .working_bank()
+            .get_slots_in_epoch(0);
+        let epoch_specs = TestEpochSpecs {
+            staked_nodes: Arc::new(HashMap::new()),
+            slots_in_epoch,
+            enforce_correct_proof_size,
+            root_slot: bank_forks_arc.read().unwrap().root(),
+        };
+
+        blockstore.set_roots([0, 9].iter()).unwrap();
+        let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
+            &bank_forks_arc.read().unwrap().working_bank(),
+        ));
+        let (sender, receiver) = bounded(1024);
+        let migration_status = bank_forks_arc.read().unwrap().migration_status();
+        let mut duplicate_shred_handler = DuplicateShredHandler::new(
+            blockstore.clone(),
+            leader_schedule_cache,
+            epoch_specs.clone_box(),
+            sender,
+            shred_version,
+            migration_status,
+        );
+
+        let slot: Slot = 10;
+        for chunk in create_duplicate_proof_with_bad_proof_size(my_keypair, slot, shred_version) {
+            duplicate_shred_handler.handle(chunk);
+        }
+        assert_eq!(blockstore.has_duplicate_shreds_in_slot(slot), expect_stored);
+        assert_eq!(
+            receiver.try_iter().collect_vec(),
+            if expect_stored { vec![slot] } else { vec![] }
+        );
+    }
+
     #[test]
     fn test_handle_mixed_entries() {
         agave_logger::setup();
@@ -279,7 +402,8 @@ mod tests {
         let my_keypair = Arc::new(Keypair::new());
         let my_pubkey = my_keypair.pubkey();
         let shred_version = 0;
-        let genesis_config_info = create_genesis_config_with_leader(10_000, &my_pubkey, 10_000);
+        let genesis_config_info =
+            create_genesis_config_with_tower_leader(10_000, &my_pubkey, 10_000);
         let GenesisConfigInfo { genesis_config, .. } = genesis_config_info;
         let bank = Bank::new_for_tests(&genesis_config);
         let bank_forks_arc = BankForks::new_rw_arc(bank);
@@ -297,23 +421,26 @@ mod tests {
             .get_slots_in_epoch(0);
         let epoch_specs = TestEpochSpecs {
             staked_nodes: Arc::new(HashMap::new()),
-            epoch_duration: Duration::from_millis(slots_in_epoch * 400),
             slots_in_epoch,
+            enforce_correct_proof_size: true,
+            root_slot: bank_forks_arc.read().unwrap().root(),
         };
 
         assert!(blockstore.set_roots([0, 9].iter()).is_ok());
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
             &bank_forks_arc.read().unwrap().working_bank(),
         ));
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(1024);
         let start_slot: Slot = 10;
 
+        let migration_status = bank_forks_arc.read().unwrap().migration_status();
         let mut duplicate_shred_handler = DuplicateShredHandler::new(
             blockstore.clone(),
             leader_schedule_cache,
             epoch_specs.clone_box(),
             sender,
             shred_version,
+            migration_status.clone(),
         );
         let chunks = create_duplicate_proof(
             my_keypair.clone(),
@@ -372,6 +499,25 @@ mod tests {
                 }
             }
         }
+
+        // Duplicate proofs are retained for slashing during the mixed Alpenglow epoch, but the
+        // Tower duplicate-consensus channel no longer has a consumer.
+        migration_status.enable_alpenglow_for_tests();
+        let alpenglow_slot = start_slot + 3;
+        let chunks = create_duplicate_proof(
+            my_keypair,
+            None,
+            alpenglow_slot,
+            None,
+            DUPLICATE_SHRED_MAX_PAYLOAD_SIZE,
+            shred_version,
+        )
+        .unwrap();
+        for chunk in chunks {
+            duplicate_shred_handler.handle(chunk);
+        }
+        assert!(blockstore.has_duplicate_shreds_in_slot(alpenglow_slot));
+        assert!(receiver.is_empty());
     }
 
     #[test]
@@ -383,7 +529,8 @@ mod tests {
         let my_keypair = Arc::new(Keypair::new());
         let my_pubkey = my_keypair.pubkey();
         let shred_version = 0;
-        let genesis_config_info = create_genesis_config_with_leader(10_000, &my_pubkey, 10_000);
+        let genesis_config_info =
+            create_genesis_config_with_tower_leader(10_000, &my_pubkey, 10_000);
         let GenesisConfigInfo { genesis_config, .. } = genesis_config_info;
         let bank = Bank::new_for_tests(&genesis_config);
         let bank_forks_arc = BankForks::new_rw_arc(bank);
@@ -401,21 +548,24 @@ mod tests {
             .get_slots_in_epoch(0);
         let epoch_specs = TestEpochSpecs {
             staked_nodes: Arc::new(HashMap::new()),
-            epoch_duration: Duration::from_millis(slots_in_epoch * 400),
             slots_in_epoch,
+            enforce_correct_proof_size: true,
+            root_slot: bank_forks_arc.read().unwrap().root(),
         };
 
         blockstore.set_roots([0, 9].iter()).unwrap();
         let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(
             &bank_forks_arc.read().unwrap().working_bank(),
         ));
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(1024);
+        let migration_status = bank_forks_arc.read().unwrap().migration_status();
         let mut duplicate_shred_handler = DuplicateShredHandler::new(
             blockstore.clone(),
             leader_schedule_cache,
             epoch_specs.clone_box(),
             sender,
             shred_version,
+            migration_status,
         );
         let start_slot: Slot = 10;
 

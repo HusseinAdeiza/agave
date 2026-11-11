@@ -1,15 +1,14 @@
 use {
-    super::{ComputeBudgetInstructionDetails, RuntimeTransaction},
+    super::RuntimeTransaction,
     crate::{
         instruction_meta::InstructionMeta,
         transaction_meta::{
-            CachedTransactionMeta, TransactionConfiguration, TransactionMeta,
-            VersionedTransactionConfiguration,
+            CachedTransactionMeta, TransactionMeta, VersionedTransactionConfiguration,
         },
-        transaction_with_meta::TransactionWithMeta,
+        transaction_with_meta::{StaticTransactionWithMeta, TransactionWithMeta},
     },
     agave_transaction_view::{
-        resolved_transaction_view::ResolvedTransactionView, transaction_data::TransactionData,
+        resolved_transaction_view::ResolvedTransactionView,
         transaction_version::TransactionVersion, transaction_view::SanitizedTransactionView,
     },
     solana_message::{
@@ -19,7 +18,6 @@ use {
         v0::{LoadedAddresses, LoadedMessage, MessageAddressTableLookup},
         v1,
     },
-    solana_program_entrypoint::HEAP_LENGTH,
     solana_pubkey::Pubkey,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::{
@@ -31,9 +29,7 @@ use {
     std::{borrow::Cow, collections::HashSet},
 };
 
-fn is_simple_vote_transaction<D: TransactionData>(
-    transaction: &SanitizedTransactionView<D>,
-) -> bool {
+fn is_simple_vote_transaction<D: AsRef<[u8]>>(transaction: &SanitizedTransactionView<D>) -> bool {
     let signatures = transaction.signatures();
     let is_legacy_message = matches!(transaction.version(), TransactionVersion::Legacy);
     let instruction_programs = transaction
@@ -43,25 +39,35 @@ fn is_simple_vote_transaction<D: TransactionData>(
     is_simple_vote_transaction_impl(signatures, is_legacy_message, instruction_programs)
 }
 
-impl<D: TransactionData> RuntimeTransaction<SanitizedTransactionView<D>> {
+impl<D: AsRef<[u8]>> RuntimeTransaction<SanitizedTransactionView<D>> {
     pub fn try_new(
         transaction: SanitizedTransactionView<D>,
         message_hash: MessageHash,
         is_simple_vote_tx: Option<bool>,
     ) -> Result<Self> {
-        from_sanitized_transaction_view(&transaction, message_hash, is_simple_vote_tx)
-            .map(|meta| RuntimeTransaction { transaction, meta })
+        from_sanitized_transaction_view(&transaction, message_hash, is_simple_vote_tx).map(|meta| {
+            RuntimeTransaction {
+                implicit_read_locks: Vec::new(),
+                transaction,
+                meta,
+            }
+        })
     }
 }
 
-impl<'a, D: TransactionData> RuntimeTransaction<&'a SanitizedTransactionView<D>> {
+impl<'a, D: AsRef<[u8]>> RuntimeTransaction<&'a SanitizedTransactionView<D>> {
     pub fn try_new(
         transaction: &'a SanitizedTransactionView<D>,
         message_hash: MessageHash,
         is_simple_vote_tx: Option<bool>,
     ) -> Result<Self> {
-        from_sanitized_transaction_view(transaction, message_hash, is_simple_vote_tx)
-            .map(|meta| RuntimeTransaction { transaction, meta })
+        from_sanitized_transaction_view(transaction, message_hash, is_simple_vote_tx).map(|meta| {
+            RuntimeTransaction {
+                implicit_read_locks: Vec::new(),
+                transaction,
+                meta,
+            }
+        })
     }
 }
 
@@ -71,8 +77,16 @@ fn from_sanitized_transaction_view<D>(
     is_simple_vote_tx: Option<bool>,
 ) -> Result<CachedTransactionMeta>
 where
-    D: TransactionData,
+    D: AsRef<[u8]>,
 {
+    crate::transaction_limits::validate_transaction_limits(
+        transaction,
+        transaction.data().len() as u64,
+    )?;
+    if let Some(config) = transaction.transaction_config() {
+        crate::transaction_limits::validate_transaction_config_view(&config)?;
+    }
+
     let message_hash = match message_hash {
         MessageHash::Precomputed(hash) => hash,
         MessageHash::Compute => VersionedMessage::hash_raw_message(transaction.message_data()),
@@ -91,25 +105,10 @@ where
         precompile_signature_details.num_ed25519_instruction_signatures,
         precompile_signature_details.num_secp256r1_instruction_signatures,
     );
-    let versioned_transaction_config =
-        if let Some(transaction_config_view) = transaction.transaction_config() {
-            // NOTE: only txv1 has `transaction_config_view`, which must have been validated for
-            // SanitizedTransactionView.
-            VersionedTransactionConfiguration::V1(TransactionConfiguration {
-                priority_fee_lamports: transaction_config_view.priority_fee_lamports().unwrap_or(0),
-                compute_unit_limit: transaction_config_view.compute_unit_limit().unwrap_or(0),
-                loaded_accounts_data_size_limit: transaction_config_view
-                    .loaded_accounts_data_size_limit()
-                    .unwrap_or(0),
-                updated_heap_bytes: transaction_config_view
-                    .requested_heap_size()
-                    .unwrap_or(HEAP_LENGTH as u32),
-            })
-        } else {
-            VersionedTransactionConfiguration::LegacyAndV0(
-                ComputeBudgetInstructionDetails::try_from(transaction.program_instructions_iter())?,
-            )
-        };
+    let versioned_transaction_config = VersionedTransactionConfiguration::try_from_view_parts(
+        transaction.transaction_config(),
+        transaction.program_instructions_iter(),
+    )?;
 
     Ok(CachedTransactionMeta {
         message_hash,
@@ -120,7 +119,7 @@ where
     })
 }
 
-impl<D: TransactionData> RuntimeTransaction<ResolvedTransactionView<D>> {
+impl<D: AsRef<[u8]>> RuntimeTransaction<ResolvedTransactionView<D>> {
     /// Create a new `RuntimeTransaction<ResolvedTransactionView>` from a
     /// `RuntimeTransaction<SanitizedTransactionView>` that already has
     /// static metadata loaded.
@@ -129,7 +128,11 @@ impl<D: TransactionData> RuntimeTransaction<ResolvedTransactionView<D>> {
         loaded_addresses: Option<LoadedAddresses>,
         reserved_account_keys: &HashSet<Pubkey>,
     ) -> Result<Self> {
-        let RuntimeTransaction { transaction, meta } = statically_loaded_runtime_tx;
+        let RuntimeTransaction {
+            transaction,
+            meta,
+            implicit_read_locks,
+        } = statically_loaded_runtime_tx;
         // transaction-view does not distinguish between different types of errors here.
         // return generic sanitize failure error here.
         // these transactions should be immediately dropped, and we generally
@@ -137,12 +140,127 @@ impl<D: TransactionData> RuntimeTransaction<ResolvedTransactionView<D>> {
         let transaction =
             ResolvedTransactionView::try_new(transaction, loaded_addresses, reserved_account_keys)
                 .map_err(|_| TransactionError::SanitizeFailure)?;
-        let tx = Self { transaction, meta };
-        Ok(tx)
+        crate::transaction_limits::validate_unique_account_keys(transaction.account_keys())?;
+        Ok(Self {
+            implicit_read_locks,
+            transaction,
+            meta,
+        })
     }
 }
 
-impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTransactionView<D>> {
+fn to_versioned_transaction<D: AsRef<[u8]>>(
+    view: &SanitizedTransactionView<D>,
+) -> VersionedTransaction {
+    let header = MessageHeader {
+        num_required_signatures: view.num_required_signatures(),
+        num_readonly_signed_accounts: view.num_readonly_signed_static_accounts(),
+        num_readonly_unsigned_accounts: view.num_readonly_unsigned_static_accounts(),
+    };
+    let static_account_keys = view.static_account_keys().to_vec();
+    let recent_blockhash = *view.recent_blockhash();
+    let instructions = view
+        .instructions_iter()
+        .map(|ix| CompiledInstruction {
+            program_id_index: ix.program_id_index,
+            accounts: ix.accounts.to_vec(),
+            data: ix.data.to_vec(),
+        })
+        .collect();
+
+    let message = match view.version() {
+        TransactionVersion::Legacy => VersionedMessage::Legacy(solana_message::legacy::Message {
+            header,
+            account_keys: static_account_keys,
+            recent_blockhash,
+            instructions,
+        }),
+        TransactionVersion::V0 => VersionedMessage::V0(solana_message::v0::Message {
+            header,
+            account_keys: static_account_keys,
+            recent_blockhash,
+            instructions,
+            address_table_lookups: view
+                .address_table_lookup_iter()
+                .map(|atl| MessageAddressTableLookup {
+                    account_key: *atl.account_key,
+                    writable_indexes: atl.writable_indexes.to_vec(),
+                    readonly_indexes: atl.readonly_indexes.to_vec(),
+                })
+                .collect(),
+        }),
+        TransactionVersion::V1 => {
+            let config_view = view.transaction_config().expect("V1 must have config_view");
+            let config = solana_message::v1::TransactionConfig {
+                priority_fee: config_view.priority_fee_lamports(),
+                compute_unit_limit: config_view.compute_unit_limit(),
+                loaded_accounts_data_size_limit: config_view.loaded_accounts_data_size_limit(),
+                heap_size: config_view.requested_heap_size(),
+            };
+            VersionedMessage::V1(solana_message::v1::Message {
+                header,
+                config,
+                lifetime_specifier: recent_blockhash,
+                account_keys: static_account_keys,
+                instructions,
+            })
+        }
+    };
+
+    VersionedTransaction {
+        signatures: view.signatures().to_vec(),
+        message,
+    }
+}
+
+impl<D: AsRef<[u8]>> StaticTransactionWithMeta for RuntimeTransaction<SanitizedTransactionView<D>> {
+    fn to_versioned_transaction(&self) -> VersionedTransaction {
+        to_versioned_transaction(&self.transaction)
+    }
+
+    fn serialized_size(&self) -> usize {
+        self.transaction.data().len()
+    }
+}
+
+impl<D: AsRef<[u8]>> StaticTransactionWithMeta for RuntimeTransaction<ResolvedTransactionView<D>> {
+    fn to_versioned_transaction(&self) -> VersionedTransaction {
+        to_versioned_transaction(&self.transaction)
+    }
+
+    fn serialized_size(&self) -> usize {
+        self.transaction.data().len()
+    }
+}
+
+#[cfg(feature = "dev-context-only-utils")]
+impl<D> From<solana_transaction::Transaction> for RuntimeTransaction<ResolvedTransactionView<D>>
+where
+    D: AsRef<[u8]> + From<Vec<u8>>,
+{
+    fn from(transaction: solana_transaction::Transaction) -> Self {
+        let versioned_transaction = VersionedTransaction::from(transaction);
+        let data = D::from(wincode::serialize(&versioned_transaction).unwrap());
+        let sanitized_view = SanitizedTransactionView::try_new_sanitized(data)
+            .expect("failed to create SanitizedTransactionView from Transaction");
+        let static_runtime_tx = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
+            sanitized_view,
+            MessageHash::Compute,
+            None,
+        )
+        .expect("failed to create RuntimeTransaction from Transaction");
+        let mut tx = RuntimeTransaction::<ResolvedTransactionView<_>>::try_new(
+            static_runtime_tx,
+            None,
+            &HashSet::new(),
+        )
+        .expect("failed to create RuntimeTransaction from Transaction");
+        tx.load_implicit_read_locks();
+        tx
+    }
+}
+
+impl<D: AsRef<[u8]>> TransactionWithMeta for RuntimeTransaction<ResolvedTransactionView<D>> {
     fn as_sanitized_transaction(&self) -> Cow<'_, SanitizedTransaction> {
         let VersionedTransaction {
             signatures,
@@ -158,11 +276,29 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
                 message: Cow::Owned(message),
                 is_writable_account_cache,
             }),
-            VersionedMessage::V0(message) => SanitizedMessage::V0(LoadedMessage {
-                message: Cow::Owned(message),
-                loaded_addresses: Cow::Owned(self.loaded_addresses().unwrap().clone()),
-                is_writable_account_cache,
-            }),
+            VersionedMessage::V0(message) => {
+                // transaction-view does not expose its loaded-address source. Reconstruct the
+                // legacy representation from the resolved account keys, whose layout is static,
+                // writable loaded, then readonly loaded.
+                let mut loaded_account_keys = self
+                    .account_keys()
+                    .iter()
+                    .skip(self.static_account_keys().len())
+                    .copied();
+                let loaded_addresses = LoadedAddresses {
+                    writable: loaded_account_keys
+                        .by_ref()
+                        .take(usize::from(self.total_writable_lookup_accounts()))
+                        .collect(),
+                    readonly: loaded_account_keys.collect(),
+                };
+
+                SanitizedMessage::V0(LoadedMessage {
+                    message: Cow::Owned(message),
+                    loaded_addresses: Cow::Owned(loaded_addresses),
+                    is_writable_account_cache,
+                })
+            }
             VersionedMessage::V1(message) => SanitizedMessage::V1(v1::CachedMessage {
                 message: Cow::Owned(message),
                 is_writable_account_cache,
@@ -181,74 +317,6 @@ impl<D: TransactionData> TransactionWithMeta for RuntimeTransaction<ResolvedTran
             )
             .expect("transaction view is sanitized"),
         )
-    }
-
-    fn to_versioned_transaction(&self) -> VersionedTransaction {
-        let header = MessageHeader {
-            num_required_signatures: self.num_required_signatures(),
-            num_readonly_signed_accounts: self.num_readonly_signed_static_accounts(),
-            num_readonly_unsigned_accounts: self.num_readonly_unsigned_static_accounts(),
-        };
-        let static_account_keys = self.static_account_keys().to_vec();
-        let recent_blockhash = *self.recent_blockhash();
-        let instructions = self
-            .instructions_iter()
-            .map(|ix| CompiledInstruction {
-                program_id_index: ix.program_id_index,
-                accounts: ix.accounts.to_vec(),
-                data: ix.data.to_vec(),
-            })
-            .collect();
-
-        let message = match self.version() {
-            TransactionVersion::Legacy => {
-                VersionedMessage::Legacy(solana_message::legacy::Message {
-                    header,
-                    account_keys: static_account_keys,
-                    recent_blockhash,
-                    instructions,
-                })
-            }
-            TransactionVersion::V0 => VersionedMessage::V0(solana_message::v0::Message {
-                header,
-                account_keys: static_account_keys,
-                recent_blockhash,
-                instructions,
-                address_table_lookups: self
-                    .address_table_lookup_iter()
-                    .map(|atl| MessageAddressTableLookup {
-                        account_key: *atl.account_key,
-                        writable_indexes: atl.writable_indexes.to_vec(),
-                        readonly_indexes: atl.readonly_indexes.to_vec(),
-                    })
-                    .collect(),
-            }),
-            TransactionVersion::V1 => {
-                let config_view = self.transaction_config().expect("V1 must have config_view");
-                let config = solana_message::v1::TransactionConfig {
-                    priority_fee: config_view.priority_fee_lamports(),
-                    compute_unit_limit: config_view.compute_unit_limit(),
-                    loaded_accounts_data_size_limit: config_view.loaded_accounts_data_size_limit(),
-                    heap_size: config_view.requested_heap_size(),
-                };
-                VersionedMessage::V1(solana_message::v1::Message {
-                    header,
-                    config,
-                    lifetime_specifier: recent_blockhash,
-                    account_keys: static_account_keys,
-                    instructions,
-                })
-            }
-        };
-
-        VersionedTransaction {
-            signatures: self.signatures().to_vec(),
-            message,
-        }
-    }
-
-    fn serialized_size(&self) -> usize {
-        self.transaction.data().len()
     }
 }
 
@@ -280,7 +348,7 @@ mod tests {
 
         let hash = Hash::new_unique();
         let transaction =
-            SanitizedTransactionView::try_new_sanitized(&serialized_transaction[..], true).unwrap();
+            SanitizedTransactionView::try_new_sanitized(&serialized_transaction[..]).unwrap();
         let static_runtime_transaction =
             RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
                 transaction,
@@ -312,8 +380,7 @@ mod tests {
             reserved_account_keys: &HashSet<Pubkey>,
         ) {
             let bytes = wincode::serialize(&original_transaction).unwrap();
-            let transaction_view =
-                SanitizedTransactionView::try_new_sanitized(&bytes[..], true).unwrap();
+            let transaction_view = SanitizedTransactionView::try_new_sanitized(&bytes[..]).unwrap();
             let runtime_transaction = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
                 transaction_view,
                 MessageHash::Compute,
@@ -379,8 +446,7 @@ mod tests {
         ) {
             let bytes =
                 wincode::serialize(&original_transaction.to_versioned_transaction()).unwrap();
-            let transaction_view =
-                SanitizedTransactionView::try_new_sanitized(&bytes[..], true).unwrap();
+            let transaction_view = SanitizedTransactionView::try_new_sanitized(&bytes[..]).unwrap();
             let runtime_transaction = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
                 transaction_view,
                 MessageHash::Compute,
@@ -468,7 +534,7 @@ mod tests {
             )))
             .unwrap();
         let transaction_view =
-            SanitizedTransactionView::try_new_sanitized(&serialized_transaction[..], true).unwrap();
+            SanitizedTransactionView::try_new_sanitized(&serialized_transaction[..]).unwrap();
         let runtime_transaction = RuntimeTransaction::<SanitizedTransactionView<_>>::try_new(
             transaction_view,
             MessageHash::Compute,

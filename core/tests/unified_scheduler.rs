@@ -1,27 +1,18 @@
 use {
-    crossbeam_channel::unbounded,
+    agave_votor::root_utils,
+    crossbeam_channel::bounded,
     itertools::Itertools,
     log::*,
-    solana_core::{
-        consensus::{
-            heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
-            progress_map::{ForkProgress, ProgressMap},
-        },
-        drop_bank_service::DropBankService,
-        repair::cluster_slot_state_verifier::{
-            DuplicateConfirmedSlots, DuplicateSlotsTracker, EpochSlotsFrozenSlots,
-        },
-        replay_stage::{ReplayStage, TowerBFTStructures},
-        unfrozen_gossip_verified_vote_hashes::UnfrozenGossipVerifiedVoteHashes,
-    },
-    solana_hash::Hash,
+    solana_core::drop_bank_service::DropBankService,
+    solana_cost_model::transaction_cost::TrackedCost,
     solana_leader_schedule::SlotLeader,
     solana_ledger::genesis_utils::create_genesis_config,
+    solana_pubkey::Pubkey,
     solana_runtime::{
         bank::Bank, bank_forks::BankForks, genesis_utils::GenesisConfigInfo,
         installed_scheduler_pool::SchedulingContext,
     },
-    solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
+    solana_runtime_transaction::runtime_transaction::ReplayTransaction,
     solana_svm_timings::ExecuteTimings,
     solana_system_transaction as system_transaction,
     solana_transaction_error::TransactionResult as Result,
@@ -29,10 +20,7 @@ use {
     solana_unified_scheduler_pool::{
         DefaultTaskHandler, HandlerContext, PooledScheduler, SchedulerPool, TaskHandler,
     },
-    std::{
-        collections::HashMap,
-        sync::{Arc, Mutex},
-    },
+    std::sync::{Arc, Mutex},
 };
 
 #[test]
@@ -45,19 +33,18 @@ fn test_scheduler_waited_by_drop_bank_service() {
     struct StallingHandler;
     impl TaskHandler for StallingHandler {
         fn handle(
-            result: &mut Result<()>,
             timings: &mut ExecuteTimings,
             scheduling_context: &SchedulingContext,
             task: &Task,
             handler_context: &HandlerContext,
-        ) {
+        ) -> Result<TrackedCost> {
             info!("Stalling at StallingHandler::handle()...");
             *LOCK_TO_STALL.lock().unwrap();
             // Wait a bit for the replay stage to prune banks
             std::thread::sleep(std::time::Duration::from_secs(3));
             info!("Now entering into DefaultTaskHandler::handle()...");
 
-            DefaultTaskHandler::handle(result, timings, scheduling_context, task, handler_context);
+            DefaultTaskHandler::handle(timings, scheduling_context, task, handler_context)
         }
     }
 
@@ -71,7 +58,7 @@ fn test_scheduler_waited_by_drop_bank_service() {
     let genesis_bank = Bank::new_for_tests(&genesis_config);
     let bank_forks = BankForks::new_rw_arc(genesis_bank);
     let pool_raw = SchedulerPool::<PooledScheduler<StallingHandler>, _>::new_for_verification(
-        None, None, None, None, None,
+        None, None, None, None,
     );
     let pool = pool_raw.clone();
     bank_forks.write().unwrap().install_scheduler_pool(pool);
@@ -88,10 +75,9 @@ fn test_scheduler_waited_by_drop_bank_service() {
     let root = 3;
     let root_bank = Bank::new_from_parent(genesis_bank.clone(), SlotLeader::default(), root);
     root_bank.freeze();
-    let root_hash = root_bank.hash();
     bank_forks.write().unwrap().insert(root_bank);
 
-    let tx = RuntimeTransaction::from_transaction_for_tests(system_transaction::transfer(
+    let tx = ReplayTransaction::from(system_transaction::transfer(
         &mint_keypair,
         &solana_pubkey::new_rand(),
         2,
@@ -109,61 +95,22 @@ fn test_scheduler_waited_by_drop_bank_service() {
     drop(lock_to_stall);
 
     // Create 2 channels to check actual pruned banks
-    let (drop_bank_sender1, drop_bank_receiver1) = unbounded();
-    let (drop_bank_sender2, drop_bank_receiver2) = unbounded();
+    let (drop_bank_sender1, drop_bank_receiver1) = bounded(1024);
+    let (drop_bank_sender2, drop_bank_receiver2) = bounded(1024);
     let drop_bank_service = DropBankService::new(drop_bank_receiver2);
 
-    info!("calling handle_new_root()...");
-    // Mostly copied from: test_handle_new_root()
-    {
-        let heaviest_subtree_fork_choice = HeaviestSubtreeForkChoice::new((root, root_hash));
+    info!("calling set_bank_forks_root()...");
+    root_utils::set_bank_forks_root(
+        &Pubkey::new_unique(),
+        root,
+        &bank_forks,
+        None, // snapshot_controller
+        Some(root),
+        &drop_bank_sender1,
+        |_| {},
+    );
 
-        let mut progress = ProgressMap::default();
-        for i in genesis..=root {
-            progress.insert(
-                i,
-                ForkProgress::new(Hash::default(), None, None, 0, 0, None),
-            );
-        }
-
-        let duplicate_slots_tracker: DuplicateSlotsTracker =
-            vec![root - 1, root, root + 1].into_iter().collect();
-        let duplicate_confirmed_slots: DuplicateConfirmedSlots = vec![root - 1, root, root + 1]
-            .into_iter()
-            .map(|s| (s, Hash::default()))
-            .collect();
-        let unfrozen_gossip_verified_vote_hashes: UnfrozenGossipVerifiedVoteHashes =
-            UnfrozenGossipVerifiedVoteHashes {
-                votes_per_slot: vec![root - 1, root, root + 1]
-                    .into_iter()
-                    .map(|s| (s, HashMap::new()))
-                    .collect(),
-            };
-        let epoch_slots_frozen_slots: EpochSlotsFrozenSlots = vec![root - 1, root, root + 1]
-            .into_iter()
-            .map(|slot| (slot, Hash::default()))
-            .collect();
-        let mut tbft_structs = TowerBFTStructures {
-            heaviest_subtree_fork_choice,
-            duplicate_slots_tracker,
-            duplicate_confirmed_slots,
-            unfrozen_gossip_verified_vote_hashes,
-            epoch_slots_frozen_slots,
-        };
-        ReplayStage::handle_new_root(
-            root,
-            &bank_forks,
-            &mut progress,
-            None, // snapshot_controller
-            None,
-            &mut true,
-            &mut Vec::new(),
-            &drop_bank_sender1,
-            &mut tbft_structs,
-        );
-    }
-
-    // Receive pruned banks from the above handle_new_root
+    // Receive pruned banks from the root change above
     let pruned_banks = drop_bank_receiver1.recv().unwrap();
     assert_eq!(
         pruned_banks
@@ -184,6 +131,8 @@ fn test_scheduler_waited_by_drop_bank_service() {
     drop_bank_service.join().unwrap();
     info!("finally joined the drop bank service!");
 
-    // the scheduler used by the pruned_bank have been returned now.
-    assert_eq!(pool_raw.pooled_scheduler_count(), 1);
+    // Quiescing the pruned bank prevents the stalled transaction from entering
+    // execution.  CommitCancelled aborts the scheduler, so it is retired instead
+    // of being returned to the reusable pool.
+    assert_eq!(pool_raw.pooled_scheduler_count(), 0);
 }

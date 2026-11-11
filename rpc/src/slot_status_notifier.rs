@@ -1,17 +1,18 @@
 use {
     solana_clock::Slot,
+    solana_runtime::bank::BankId,
     std::sync::{Arc, RwLock},
 };
 
 pub trait SlotStatusNotifierInterface {
     /// Notified when a slot is optimistically confirmed
-    fn notify_slot_confirmed(&self, slot: Slot, parent: Option<Slot>);
+    fn notify_slot_confirmed(&self, slot: Slot, parent: Option<Slot>, bank_id: BankId);
 
     /// Notified when a slot is marked frozen.
-    fn notify_slot_processed(&self, slot: Slot, parent: Option<Slot>);
+    fn notify_slot_processed(&self, slot: Slot, parent: Option<Slot>, bank_id: BankId);
 
     /// Notified when a slot is rooted.
-    fn notify_slot_rooted(&self, slot: Slot, parent: Option<Slot>);
+    fn notify_slot_rooted(&self, slot: Slot, parent: Option<Slot>, bank_id: BankId);
 
     /// Notified when the first shred is received for a slot.
     fn notify_first_shred_received(&self, slot: Slot);
@@ -20,10 +21,11 @@ pub trait SlotStatusNotifierInterface {
     fn notify_completed(&self, slot: Slot);
 
     /// Notified when the slot has bank created.
-    fn notify_created_bank(&self, slot: Slot, parent: Slot);
+    fn notify_created_bank(&self, slot: Slot, parent: Slot, bank_id: BankId);
 
-    /// Notified when the slot is marked "Dead"
-    fn notify_slot_dead(&self, slot: Slot, parent: Slot, error: String);
+    /// Notified when a concrete bank is marked dead. A replacement bank at the same slot
+    /// may still be replayed successfully.
+    fn notify_dead_bank(&self, slot: Slot, parent: Slot, bank_id: BankId, error: String);
 }
 
 pub type SlotStatusNotifier = Arc<RwLock<dyn SlotStatusNotifierInterface + Sync + Send>>;

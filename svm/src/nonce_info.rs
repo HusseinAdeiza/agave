@@ -1,7 +1,7 @@
 #[cfg(feature = "dev-context-only-utils")]
 use {
     qualifier_attr::qualifiers,
-    solana_account::state_traits::StateMut,
+    solana_account::state_traits::StateMutWincode as StateMut,
     solana_nonce::{
         state::{DurableNonce, State as NonceState},
         versions::Versions as NonceVersions,
@@ -129,7 +129,7 @@ mod tests {
     fn test_try_advance_nonce_invalid() {
         let mut nonce_info = NonceInfo::new(
             Pubkey::new_unique(),
-            AccountSharedData::new(1_000_000, 0, &Pubkey::default()),
+            AccountSharedData::empty(1_000_000, &Pubkey::default()),
         );
 
         let durable_nonce = DurableNonce::from_blockhash(&Hash::new_unique());

@@ -27,7 +27,7 @@ cargo_build_sbf_sanity() {
   for program in "${rust_programs[@]}"
   do
     pushd "$program"
-    $cargo_build_sbf --arch "$1" --tools-version v1.54
+    $cargo_build_sbf --arch "$1" --tools-version v1.57
     popd
   done
   popd
@@ -45,11 +45,14 @@ export RUST_BACKTRACE=1
 export RUSTFLAGS="-D warnings"
 source scripts/ulimit-n.sh
 
-#shellcheck source=ci/common/limit-threads.sh
-source ci/common/limit-threads.sh
+JOBS="$(cargo xtask jobs)"
+export JOBS
 
 # get channel info
-eval "$(ci/channel-info.sh)"
+channel_info="$(cargo xtask channel-info --json)"
+EDGE_CHANNEL="$(jq -r '.EDGE_CHANNEL' <<<"$channel_info")"
+BETA_CHANNEL="$(jq -r '.BETA_CHANNEL' <<<"$channel_info")"
+STABLE_CHANNEL="$(jq -r '.STABLE_CHANNEL' <<<"$channel_info")"
 
 #shellcheck source=ci/common/shared-functions.sh
 source ci/common/shared-functions.sh
@@ -57,7 +60,7 @@ source ci/common/shared-functions.sh
 echo "Executing $testName"
 case $testName in
 test-stable)
-  _ ci/intercept.sh cargo test --jobs "$JOBS" --all --tests --exclude solana-local-cluster ${V:+--verbose} -- --nocapture
+  _ cargo test --jobs "$JOBS" --all --tests --exclude solana-local-cluster ${V:+--verbose}
   ;;
 test-stable-sbf)
   # Clear the C dependency files, if dependency moves these files are not regenerated
@@ -65,7 +68,7 @@ test-stable-sbf)
   test -d target/release/sbf && find target/release/sbf -name '*.d' -delete
 
   # rustfilt required for dumping SBF assembly listings
-  "$cargo" install rustfilt
+  "$cargo" install rustfilt@0.2.2 --locked
 
   # solana-keygen required when building C programs
   _ "$cargo" build --manifest-path=keygen/Cargo.toml

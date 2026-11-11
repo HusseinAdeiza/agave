@@ -13,17 +13,28 @@
 //!
 use {
     agave_feature_set::FeatureSet,
+    agave_transaction_view::{
+        message_view::SanitizedMessageView, transaction_config_view::TransactionConfigView,
+    },
     solana_compute_budget::compute_budget_limits::{
         MAX_COMPUTE_UNIT_LIMIT, MAX_HEAP_FRAME_BYTES, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
         MIN_HEAP_FRAME_BYTES,
     },
     solana_compute_budget_instruction::compute_budget_instruction_details::ComputeBudgetInstructionDetails,
     solana_hash::Hash,
-    solana_message::TransactionSignatureDetails,
+    solana_message::{
+        SanitizedMessage, SanitizedVersionedMessage, TransactionSignatureDetails, VersionedMessage,
+        v1::TransactionConfig,
+    },
+    solana_program_entrypoint::HEAP_LENGTH,
+    solana_pubkey::Pubkey,
+    solana_svm_transaction::{instruction::SVMInstruction, svm_message::SVMStaticMessage},
     solana_transaction::TransactionError,
 };
 
 pub trait TransactionMeta {
+    /// Cached implicit readonly locks for the currently loaded account keys.
+    fn implicit_read_locks(&self) -> &[Pubkey];
     fn message_hash(&self) -> &Hash;
     fn is_simple_vote_transaction(&self) -> bool;
     fn signature_details(&self) -> &TransactionSignatureDetails;
@@ -45,7 +56,7 @@ pub(crate) struct CachedTransactionMeta {
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", derive(Clone))]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TransactionConfiguration {
     pub updated_heap_bytes: u32,
     pub compute_unit_limit: u32,
@@ -54,6 +65,25 @@ pub struct TransactionConfiguration {
 }
 
 impl TransactionConfiguration {
+    pub fn try_from_sanitized_message(
+        message: &SanitizedMessage,
+        feature_set: &FeatureSet,
+    ) -> Result<Self, TransactionError> {
+        VersionedTransactionConfiguration::try_from_sanitized_message(message)?
+            .try_into_config(feature_set)
+    }
+
+    pub fn try_from_message_view<D: AsRef<[u8]>>(
+        message: &SanitizedMessageView<D>,
+        feature_set: &FeatureSet,
+    ) -> Result<Self, TransactionError> {
+        VersionedTransactionConfiguration::try_from_view_parts(
+            message.transaction_config(),
+            message.program_instructions_iter(),
+        )?
+        .try_into_config(feature_set)
+    }
+
     /// Compute the compute unit price in micro-lamports per compute unit.
     ///
     /// Note: that this will return an effective price according to the actual
@@ -77,6 +107,70 @@ pub(crate) enum VersionedTransactionConfiguration {
 }
 
 impl VersionedTransactionConfiguration {
+    pub(crate) fn try_from_sanitized_message(
+        message: &SanitizedMessage,
+    ) -> Result<Self, TransactionError> {
+        match message {
+            SanitizedMessage::V1(message) => Ok(Self::from_v1_config(&message.message.config)),
+            SanitizedMessage::Legacy(_) | SanitizedMessage::V0(_) => {
+                Self::try_from_legacy_and_v0_instructions(
+                    SVMStaticMessage::program_instructions_iter(message),
+                )
+            }
+        }
+    }
+
+    pub(crate) fn try_from_sanitized_versioned_message(
+        message: &SanitizedVersionedMessage,
+    ) -> Result<Self, TransactionError> {
+        match &message.message {
+            VersionedMessage::V1(message) => Ok(Self::from_v1_config(&message.config)),
+            VersionedMessage::Legacy(_) | VersionedMessage::V0(_) => {
+                Self::try_from_legacy_and_v0_instructions(
+                    message
+                        .program_instructions_iter()
+                        .map(|(program_id, ix)| (program_id, SVMInstruction::from(ix))),
+                )
+            }
+        }
+    }
+
+    /// Extracts configuration from the inline v1 config or legacy/v0
+    /// compute-budget instructions. Does not validate configuration limits.
+    pub(crate) fn try_from_view_parts<'a>(
+        transaction_config: Option<TransactionConfigView<'_>>,
+        instructions: impl Iterator<Item = (&'a Pubkey, SVMInstruction<'a>)> + Clone,
+    ) -> Result<Self, TransactionError> {
+        match transaction_config {
+            Some(config) => Ok(Self::V1(TransactionConfiguration {
+                priority_fee_lamports: config.priority_fee_lamports().unwrap_or(0),
+                compute_unit_limit: config.compute_unit_limit().unwrap_or(0),
+                loaded_accounts_data_size_limit: config
+                    .loaded_accounts_data_size_limit()
+                    .unwrap_or(0),
+                updated_heap_bytes: config.requested_heap_size().unwrap_or(HEAP_LENGTH as u32),
+            })),
+            None => Self::try_from_legacy_and_v0_instructions(instructions),
+        }
+    }
+
+    fn from_v1_config(config: &TransactionConfig) -> Self {
+        Self::V1(TransactionConfiguration {
+            priority_fee_lamports: config.priority_fee.unwrap_or(0),
+            compute_unit_limit: config.compute_unit_limit.unwrap_or(0),
+            loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit.unwrap_or(0),
+            updated_heap_bytes: config.heap_size.unwrap_or(HEAP_LENGTH as u32),
+        })
+    }
+
+    fn try_from_legacy_and_v0_instructions<'a>(
+        instructions: impl Iterator<Item = (&'a Pubkey, SVMInstruction<'a>)> + Clone,
+    ) -> Result<Self, TransactionError> {
+        Ok(Self::LegacyAndV0(
+            ComputeBudgetInstructionDetails::try_from(instructions)?,
+        ))
+    }
+
     pub(crate) fn try_into_config(
         &self,
         feature_set: &FeatureSet,
@@ -125,11 +219,15 @@ mod tests {
         super::*,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_keypair::Keypair,
-        solana_message::Message,
+        solana_message::{
+            Message, MessageHeader, SimpleAddressLoader, compiled_instruction::CompiledInstruction,
+            v1,
+        },
         solana_program_entrypoint::HEAP_LENGTH,
         solana_signer::Signer,
         solana_svm_transaction::svm_message::SVMStaticMessage,
         solana_transaction::{Transaction, sanitized::SanitizedTransaction},
+        std::{assert_matches, collections::HashSet},
     };
 
     #[test]
@@ -248,7 +346,7 @@ mod tests {
         };
 
         let config = VersionedTransactionConfiguration::V1(input).try_into_config(&feature_set);
-        assert!(matches!(config, Err(TransactionError::SanitizeFailure)));
+        assert_matches!(config, Err(TransactionError::SanitizeFailure));
     }
 
     #[test]
@@ -263,6 +361,104 @@ mod tests {
         };
 
         let config = VersionedTransactionConfiguration::V1(input).try_into_config(&feature_set);
-        assert!(matches!(config, Err(TransactionError::SanitizeFailure)));
+        assert_matches!(config, Err(TransactionError::SanitizeFailure));
+    }
+
+    fn try_from_message_and_view(
+        message: VersionedMessage,
+    ) -> (
+        Result<TransactionConfiguration, TransactionError>,
+        Result<TransactionConfiguration, TransactionError>,
+    ) {
+        let feature_set = FeatureSet::all_enabled();
+
+        let message_bytes = wincode::serialize(&message).unwrap();
+        let message_view =
+            SanitizedMessageView::try_new_sanitized(message_bytes.as_slice()).unwrap();
+        let sanitized_message = SanitizedMessage::try_new(
+            SanitizedVersionedMessage::try_new(message).unwrap(),
+            SimpleAddressLoader::Disabled,
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        (
+            TransactionConfiguration::try_from_message_view(&message_view, &feature_set),
+            TransactionConfiguration::try_from_sanitized_message(&sanitized_message, &feature_set),
+        )
+    }
+
+    fn v1_message(heap_size: Option<u32>) -> VersionedMessage {
+        VersionedMessage::V1(v1::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            config: TransactionConfig {
+                priority_fee: Some(42),
+                compute_unit_limit: Some(MAX_COMPUTE_UNIT_LIMIT.saturating_add(1)),
+                loaded_accounts_data_size_limit: Some(789_012),
+                heap_size,
+            },
+            lifetime_specifier: Hash::default(),
+            account_keys: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![1, 2, 3, 4],
+            }],
+        })
+    }
+
+    #[test]
+    fn test_try_from_message_view_legacy() {
+        let payer_keypair = Keypair::new();
+        let message = VersionedMessage::Legacy(Message::new(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_price(2_000_000),
+                ComputeBudgetInstruction::set_compute_unit_limit(123_456),
+                ComputeBudgetInstruction::set_loaded_accounts_data_size_limit(456_789),
+                ComputeBudgetInstruction::request_heap_frame(
+                    (HEAP_LENGTH as u32).saturating_mul(2),
+                ),
+            ],
+            Some(&payer_keypair.pubkey()),
+        ));
+
+        let (from_view, from_message) = try_from_message_and_view(message);
+        assert_eq!(from_view.unwrap(), from_message.unwrap());
+    }
+
+    #[test]
+    fn test_try_from_message_view_legacy_duplicate_instruction() {
+        let payer_keypair = Keypair::new();
+        let message = VersionedMessage::Legacy(Message::new(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(123_456),
+                ComputeBudgetInstruction::set_compute_unit_limit(123_456),
+            ],
+            Some(&payer_keypair.pubkey()),
+        ));
+
+        let (from_view, from_message) = try_from_message_and_view(message);
+        assert_matches!(from_view, Err(TransactionError::DuplicateInstruction(1)));
+        assert_eq!(from_view, from_message);
+    }
+
+    #[test]
+    fn test_try_from_message_view_v1() {
+        let (from_view, from_message) = try_from_message_and_view(v1_message(Some(65_536)));
+        let from_view = from_view.unwrap();
+        assert_eq!(from_view, from_message.unwrap());
+        assert_eq!(from_view.compute_unit_limit, MAX_COMPUTE_UNIT_LIMIT);
+    }
+
+    #[test]
+    fn test_try_from_message_view_v1_invalid_heap_size() {
+        let (from_view, from_message) =
+            try_from_message_and_view(v1_message(Some(MAX_HEAP_FRAME_BYTES.saturating_add(1024))));
+        assert_matches!(from_view, Err(TransactionError::SanitizeFailure));
+        assert_matches!(from_message, Err(TransactionError::SanitizeFailure));
     }
 }

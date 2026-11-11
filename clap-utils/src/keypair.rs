@@ -15,7 +15,7 @@ use {
         input_parsers::{STDOUT_OUTFILE_TOKEN, pubkeys_sigs_of},
         offline::{SIGN_ONLY_ARG, SIGNER_ARG},
     },
-    bip39::{Language, Mnemonic, Seed},
+    bip39::{Language, Mnemonic},
     clap::ArgMatches,
     rpassword::prompt_password,
     solana_derivation_path::{DerivationPath, DerivationPathError},
@@ -1065,15 +1065,15 @@ pub fn keypair_from_seed_phrase(
         let parse_language_fn = || {
             for language in &[
                 Language::English,
-                Language::ChineseSimplified,
-                Language::ChineseTraditional,
+                Language::SimplifiedChinese,
+                Language::TraditionalChinese,
                 Language::Japanese,
                 Language::Spanish,
                 Language::Korean,
                 Language::French,
                 Language::Italian,
             ] {
-                if let Ok(mnemonic) = Mnemonic::from_phrase(&sanitized, *language) {
+                if let Ok(mnemonic) = Mnemonic::parse_in(*language, &sanitized) {
                     return Ok(mnemonic);
                 }
             }
@@ -1081,11 +1081,11 @@ pub fn keypair_from_seed_phrase(
         };
         let mnemonic = parse_language_fn()?;
         let passphrase = prompt_passphrase(&passphrase_prompt)?;
-        let seed = Seed::new(&mnemonic, &passphrase);
+        let seed = mnemonic.to_seed(&passphrase);
         if legacy {
-            keypair_from_seed(seed.as_bytes())?
+            keypair_from_seed(&seed)?
         } else {
-            keypair_from_seed_and_derivation_path(seed.as_bytes(), derivation_path)?
+            keypair_from_seed_and_derivation_path(&seed, derivation_path)?
         }
     };
 
@@ -1116,11 +1116,11 @@ mod tests {
     use {
         super::*,
         crate::offline::OfflineArgs,
-        assert_matches::assert_matches,
         clap::{App, Arg, value_t_or_exit},
         solana_keypair::write_keypair_file,
         solana_remote_wallet::{locator::Manufacturer, remote_wallet::initialize_wallet_manager},
         solana_system_interface::instruction::transfer,
+        std::assert_matches,
         tempfile::{NamedTempFile, TempDir},
     };
 

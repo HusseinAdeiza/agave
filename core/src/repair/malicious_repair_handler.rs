@@ -3,6 +3,7 @@ use {
         repair_handler::RepairHandler, repair_response::repair_response_packet_from_bytes,
         standard_repair_handler::StandardRepairHandler,
     },
+    agave_shred_wire_format::constants::Nonce,
     log::info,
     solana_clock::Slot,
     solana_entry::entry::Entry,
@@ -11,9 +12,9 @@ use {
     solana_ledger::{
         blockstore::Blockstore,
         leader_schedule_cache::LeaderScheduleCache,
-        shred::{Nonce, ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
+        shred::{ProcessShredsStats, Shred, Shredder},
     },
-    solana_perf::packet::{Packet, PacketBatch, PacketBatchRecycler},
+    solana_perf::packet::{BytesPacket, PacketBatch},
     solana_signer::Signer,
     std::{net::SocketAddr, sync::Arc},
 };
@@ -33,7 +34,6 @@ pub struct MaliciousRepairHandler {
     keypair: Arc<Keypair>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
     config: MaliciousRepairConfig,
-    reed_solomon_cache: ReedSolomonCache,
     standard_repair_handler: StandardRepairHandler,
 }
 
@@ -50,16 +50,15 @@ impl MaliciousRepairHandler {
             keypair,
             leader_schedule_cache,
             config,
-            reed_solomon_cache: ReedSolomonCache::default(),
         }
     }
 
     /// Check if we should respond maliciously for this slot and shred index
     fn should_respond_maliciously(&self, slot: Slot, shred_index: u64) -> bool {
-        if let Some((start, end)) = self.config.slot_range {
-            if slot < start || slot > end {
-                return false;
-            }
+        if let Some((start, end)) = self.config.slot_range
+            && (slot < start || slot > end)
+        {
+            return false;
         }
 
         let slot_matches = self
@@ -116,18 +115,15 @@ impl MaliciousRepairHandler {
         let chained_merkle_root = original_shred.chained_merkle_root().ok()?;
         let is_last_in_slot = original_shred.last_in_slot();
 
-        let shreds: Vec<Shred> = shredder
-            .make_merkle_shreds_from_entries(
-                &self.keypair,
-                &fake_entries,
-                is_last_in_slot,
-                chained_merkle_root,
-                shred_index as u32, // next_shred_index
-                0,                  // next_code_index
-                &self.reed_solomon_cache,
-                &mut ProcessShredsStats::default(),
-            )
-            .collect();
+        let shreds = shredder.make_merkle_shreds_from_entries(
+            &self.keypair,
+            &fake_entries,
+            is_last_in_slot,
+            chained_merkle_root,
+            shred_index as u32, // next_shred_index
+            0,                  // next_code_index
+            &mut ProcessShredsStats::default(),
+        );
 
         // Return the first data shred's payload
         shreds
@@ -148,7 +144,7 @@ impl RepairHandler for MaliciousRepairHandler {
         shred_index: u64,
         dest: &SocketAddr,
         nonce: Nonce,
-    ) -> Option<Packet> {
+    ) -> Option<BytesPacket> {
         // Get the original shred from blockstore
         let original_shred_bytes = self
             .blockstore
@@ -162,16 +158,14 @@ impl RepairHandler for MaliciousRepairHandler {
             // Parse the original shred to get its metadata
             if let Ok(original_shred) =
                 Shred::new_from_serialized_shred(original_shred_bytes.clone())
-            {
-                if let Some(equivocating_shred) =
+                && let Some(equivocating_shred) =
                     self.generate_equivocating_shred(&original_shred, shred_index)
-                {
-                    info!(
-                        "Responding with equivocating shred in slot {slot} index {shred_index} to \
-                         {dest}"
-                    );
-                    return repair_response_packet_from_bytes(equivocating_shred, dest, nonce);
-                }
+            {
+                info!(
+                    "Responding with equivocating shred in slot {slot} index {shred_index} to \
+                     {dest}"
+                );
+                return repair_response_packet_from_bytes(equivocating_shred, dest, nonce);
             }
         }
 
@@ -181,13 +175,12 @@ impl RepairHandler for MaliciousRepairHandler {
 
     fn run_orphan(
         &self,
-        recycler: &PacketBatchRecycler,
         from_addr: &SocketAddr,
         slot: Slot,
         max_responses: usize,
         nonce: Nonce,
     ) -> Option<PacketBatch> {
         self.standard_repair_handler
-            .run_orphan(recycler, from_addr, slot, max_responses, nonce)
+            .run_orphan(from_addr, slot, max_responses, nonce)
     }
 }

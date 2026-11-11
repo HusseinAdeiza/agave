@@ -29,6 +29,7 @@ use {
     base64::{Engine, prelude::BASE64_STANDARD},
     serde::{Deserialize, Serialize},
     solana_clock::{Slot, UnixTimestamp},
+    solana_entry::block_component::VersionedBlockMarker,
     solana_hash::Hash,
     solana_instruction::TRANSACTION_LEVEL_STACK_HEIGHT,
     solana_message::{
@@ -393,15 +394,17 @@ impl ConfirmedBlock {
 }
 
 // Confirmed block with type guarantees that transaction metadata is always
-// present, as well as a list of the entry data needed to cryptographically
-// verify the block. Used for uploading to BigTable.
-pub struct VersionedConfirmedBlockWithEntries {
+// present, as well as the entry data and block markers needed to
+// cryptographically verify the block. Used for uploading to BigTable.
+pub struct VersionedConfirmedBlockWithSplitComponents {
     pub block: VersionedConfirmedBlock,
     pub entries: Vec<EntrySummary>,
+    pub markers: Vec<VersionedBlockMarker>,
 }
 
 // Data needed to reconstruct an Entry, given an ordered list of transactions in
 // a block. Used for uploading to BigTable.
+#[derive(Clone, Copy)]
 pub struct EntrySummary {
     pub num_hashes: u64,
     pub hash: Hash,
@@ -717,14 +720,14 @@ impl Encodable for Transaction {
     fn encode(&self, encoding: UiTransactionEncoding) -> Self::Encoded {
         match encoding {
             UiTransactionEncoding::Binary => EncodedTransaction::LegacyBinary(
-                bs58::encode(bincode::serialize(self).unwrap()).into_string(),
+                bs58::encode(wincode::serialize(self).unwrap()).into_string(),
             ),
             UiTransactionEncoding::Base58 => EncodedTransaction::Binary(
-                bs58::encode(bincode::serialize(self).unwrap()).into_string(),
+                bs58::encode(wincode::serialize(self).unwrap()).into_string(),
                 TransactionBinaryEncoding::Base58,
             ),
             UiTransactionEncoding::Base64 => EncodedTransaction::Binary(
-                BASE64_STANDARD.encode(bincode::serialize(self).unwrap()),
+                BASE64_STANDARD.encode(wincode::serialize(self).unwrap()),
                 TransactionBinaryEncoding::Base64,
             ),
             UiTransactionEncoding::Json | UiTransactionEncoding::JsonParsed => {

@@ -9,9 +9,7 @@ use {
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     solana_signature::{SIGNATURE_BYTES, Signature},
     solana_storage_proto::convert::generated,
-    wincode::{
-        ReadError, SchemaRead, SchemaReadOwned, SchemaWrite, config::DefaultConfig, io::Reader,
-    },
+    wincode::{SchemaReadOwned, SchemaWrite, config::DefaultConfig},
 };
 
 pub(crate) const DEPRECATED_PROGRAM_COSTS_COLUMN_NAME: &str = "program_costs";
@@ -271,20 +269,6 @@ macro_rules! convert_column_key_bytes_to_index {
     }};
 }
 
-// TODO: replace with dedicated wincode API on wincode>=0.5.1
-fn deserialize_reject_trailing<'de, T>(src: &'de [u8]) -> Result<T>
-where
-    T: SchemaRead<'de, DefaultConfig, Dst = T>,
-{
-    let mut reader = src;
-    let value = <T as SchemaRead<'de, DefaultConfig>>::get(reader.by_ref())?;
-    if reader.is_empty() {
-        Ok(value)
-    } else {
-        Err(ReadError::Custom("trailing bytes").into())
-    }
-}
-
 pub trait Column {
     // The logical key for how data will be accessed in this column
     type Index;
@@ -326,13 +310,7 @@ pub trait ProtobufColumn: Column {
     type Type: prost::Message + Default;
 }
 
-/// SlotColumn is a trait for slot-based column families.  Its index is
-/// essentially Slot (or more generally speaking, has a 1:1 mapping to Slot).
-///
-/// The clean-up of any LedgerColumn that implements SlotColumn is managed by
-/// `LedgerCleanupService`, which will periodically deprecate and purge
-/// oldest entries that are older than the latest root in order to maintain the
-/// configured --limit-ledger-size under the validator argument.
+/// Columns where the index (key) is simply a `Slot`
 pub trait SlotColumn<Index = Slot> {}
 
 pub enum IndexError {
@@ -610,7 +588,7 @@ impl TypedColumn for columns::Index {
 
     #[inline]
     fn deserialize(data: &[u8]) -> Result<Self::Type> {
-        deserialize_reject_trailing(data)
+        Ok(wincode::deserialize_exact(data)?)
     }
 }
 
@@ -887,6 +865,7 @@ mod tests {
     use {
         super::*,
         crate::blockstore_meta::{CompletedDataIndexes, ConnectedFlags},
+        smallvec::smallvec,
         solana_hash::Hash,
         wincode,
     };
@@ -900,7 +879,7 @@ mod tests {
             first_shred_timestamp: 1234567890,
             last_index: Some(14),
             parent_slot: Some(41),
-            next_slots: vec![43, 44],
+            next_slots: smallvec![43, 44],
             connected_flags: ConnectedFlags::CONNECTED | ConnectedFlags::PARENT_CONNECTED,
             completed_data_indexes: [0u32, 5, 10].into_iter().collect(),
             parent_block_id: Hash::new_unique(),
@@ -921,7 +900,7 @@ mod tests {
             first_shred_timestamp: 1234567890,
             last_index: Some(14),
             parent_slot: Some(41),
-            next_slots: vec![43, 44],
+            next_slots: smallvec![43, 44],
             connected_flags: ConnectedFlags::CONNECTED | ConnectedFlags::PARENT_CONNECTED,
             completed_data_indexes: [0u32, 5, 10].into_iter().collect(),
         };
@@ -935,7 +914,7 @@ mod tests {
             first_shred_timestamp: 1234567890,
             last_index: Some(14),
             parent_slot: Some(41),
-            next_slots: vec![43, 44],
+            next_slots: smallvec![43, 44],
             connected_flags: ConnectedFlags::CONNECTED | ConnectedFlags::PARENT_CONNECTED,
             completed_data_indexes: [0u32, 5, 10].into_iter().collect(),
             ..Default::default()
@@ -952,7 +931,7 @@ mod tests {
             first_shred_timestamp: 0,
             last_index: None,
             parent_slot: Some(0),
-            next_slots: vec![],
+            next_slots: smallvec![],
             connected_flags: ConnectedFlags::empty(),
             completed_data_indexes: CompletedDataIndexes::default(),
         };
@@ -968,7 +947,7 @@ mod tests {
             first_shred_timestamp: 0,
             last_index: None,
             parent_slot: Some(0),
-            next_slots: vec![],
+            next_slots: smallvec![],
             connected_flags: ConnectedFlags::empty(),
             completed_data_indexes: CompletedDataIndexes::default(),
             parent_block_id: Hash::new_unique(),

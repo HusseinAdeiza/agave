@@ -1,6 +1,6 @@
 #![cfg(feature = "agave-unstable-api")]
 //! Core RPC client types for solana-account-decoder
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #[cfg(feature = "zstd")]
 use std::io::Read;
 use {
@@ -10,7 +10,6 @@ use {
     serde_json::Value,
     solana_account::{Account, AccountSharedData},
     solana_pubkey::Pubkey,
-    std::sync::Arc,
 };
 pub mod token;
 
@@ -74,14 +73,7 @@ pub enum UiAccountEncoding {
 
 impl UiAccount {
     pub fn to_account_shared_data(&self) -> Option<AccountSharedData> {
-        let data = Arc::new(self.data.decode()?);
-        Some(AccountSharedData::create_from_existing_shared_data(
-            self.lamports,
-            data,
-            Pubkey::from_str(&self.owner).ok()?,
-            self.executable,
-            self.rent_epoch,
-        ))
+        Some(AccountSharedData::from(self.to_account()?))
     }
 
     pub fn to_account(&self) -> Option<Account> {

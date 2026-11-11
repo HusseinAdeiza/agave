@@ -1,17 +1,17 @@
 use {
     crate::{
-        cli::{CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult},
-        compute_budget::{ComputeUnitConfig, WithComputeUnitConfig},
+        cli::{
+            CliCommand, CliCommandInfo, CliConfig, CliError, ProcessResult,
+            message_into_signed_transaction,
+        },
+        compute_budget::ComputeUnitConfig,
+        message_builder::MessageBuilder,
         spend_utils::{SpendAmount, resolve_spend_tx_and_check_account_balance},
     },
-    bincode::{deserialize, serialized_size},
     clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
     reqwest::blocking::Client,
     serde_json::{Map, Value},
-    solana_account::Account,
-    solana_account_decoder::validator_info::{
-        self, MAX_LONG_FIELD_LENGTH, MAX_SHORT_FIELD_LENGTH, MAX_VALIDATOR_INFO, ValidatorInfo,
-    },
+    solana_account::{Account, WINCODE_CONFIG},
     solana_clap_utils::{
         compute_budget::{COMPUTE_UNIT_PRICE_ARG, ComputeUnitLimit, compute_unit_price_arg},
         hidden_unless_forced,
@@ -19,23 +19,35 @@ use {
         input_validators::{is_pubkey, is_url},
         keypair::DefaultSigner,
     },
-    solana_cli_output::{CliValidatorInfo, CliValidatorInfoVec},
+    solana_cli_output::{CliValidatorInfo, CliValidatorInfoVec, stdout::writeln_stdout},
     solana_config_interface::{
         instruction::{self as config_instruction},
         state::{ConfigKeys, get_config_data},
     },
     solana_keypair::Keypair,
-    solana_message::Message,
     solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_signer::Signer,
-    solana_transaction::Transaction,
     std::{error, rc::Rc},
+    wincode::{SchemaRead, SchemaWrite, serialized_size},
 };
 
+const MAX_SHORT_FIELD_LENGTH: usize = 80;
+const MAX_LONG_FIELD_LENGTH: usize = 300;
+/// Maximum size of validator configuration data (`ValidatorInfo`).
+const MAX_VALIDATOR_INFO: u64 = 576;
+
+const VALIDATOR_INFO_ID: Pubkey =
+    solana_pubkey::pubkey!("Va1idator1nfo111111111111111111111111111111");
+
+#[derive(Debug, Default, SchemaRead, SchemaWrite)]
+struct ValidatorInfo {
+    info: String,
+}
+
 // Return an error if a validator details are longer than the max length.
-pub fn check_details_length(string: String) -> Result<(), String> {
+fn check_details_length(string: String) -> Result<(), String> {
     if string.len() > MAX_LONG_FIELD_LENGTH {
         Err(format!(
             "validator details longer than {MAX_LONG_FIELD_LENGTH:?}-byte limit"
@@ -45,7 +57,7 @@ pub fn check_details_length(string: String) -> Result<(), String> {
     }
 }
 
-pub fn check_total_length(info: &ValidatorInfo) -> Result<(), String> {
+fn check_total_length(info: &ValidatorInfo) -> Result<(), String> {
     let size = serialized_size(&info).unwrap();
     let limit = MAX_VALIDATOR_INFO;
 
@@ -134,11 +146,12 @@ fn parse_validator_info(
     if account.owner != solana_config_interface::id() {
         return None;
     }
-    let key_list: ConfigKeys = deserialize(&account.data).ok()?;
+    let key_list: ConfigKeys = wincode::config::deserialize(&account.data, WINCODE_CONFIG).ok()?;
     if key_list.keys.len() > 1 {
         let (validator_pubkey, is_signed) = key_list.keys[1];
+        let config_data = get_config_data(&account.data).ok()?;
         let validator_info_string: String =
-            get_config_data(&account.data).and_then(deserialize).ok()?;
+            wincode::config::deserialize(config_data, WINCODE_CONFIG).ok()?;
         let validator_info: Map<_, _> = serde_json::from_str(&validator_info_string).ok()?;
         Some((validator_pubkey, is_signed, validator_info))
     } else {
@@ -282,7 +295,9 @@ pub async fn process_publish_validator_info(
     // Validate keybase username
     if let Some(string) = validator_info.get("keybaseUsername") {
         if force_keybase {
-            println!("--force supplied, skipping Keybase verification");
+            writeln_stdout(format_args!(
+                "--force supplied, skipping Keybase verification"
+            ))?;
         } else {
             let result = verify_keybase(&config.signers[0].pubkey(), string);
             if result.is_err() {
@@ -310,12 +325,12 @@ pub async fn process_publish_validator_info(
         .await?;
     let existing_account = all_config
         .iter()
-        .filter(
-            |(_, account)| match deserialize::<ConfigKeys>(&account.data) {
-                Ok(key_list) => key_list.keys.contains(&(validator_info::id(), false)),
+        .filter(|(_, account)| {
+            match wincode::config::deserialize::<ConfigKeys, _>(&account.data, WINCODE_CONFIG) {
+                Ok(key_list) => key_list.keys.contains(&(VALIDATOR_INFO_ID, false)),
                 Err(_) => false,
-            },
-        )
+            }
+        })
         .find(|(_, account)| {
             let Some((validator_pubkey, true, _)) = parse_validator_info(account) else {
                 return false;
@@ -337,7 +352,7 @@ pub async fn process_publish_validator_info(
     let balance = rpc_client.get_balance(&info_pubkey).await.unwrap_or(0);
 
     let keys = vec![
-        (validator_info::id(), false),
+        (VALIDATOR_INFO_ID, false),
         (config.signers[0].pubkey(), true),
     ];
     let data_len = MAX_VALIDATOR_INFO
@@ -349,7 +364,9 @@ pub async fn process_publish_validator_info(
 
     let signers = if balance == 0 {
         if info_pubkey != info_keypair.pubkey() {
-            println!("Account {info_pubkey:?} does not exist. Generating new keypair...");
+            writeln_stdout(format_args!(
+                "Account {info_pubkey:?} does not exist. Generating new keypair..."
+            ))?;
             info_pubkey = info_keypair.pubkey();
         }
         vec![config.signers[0], &info_keypair]
@@ -358,49 +375,54 @@ pub async fn process_publish_validator_info(
     };
 
     let compute_unit_limit = ComputeUnitLimit::Simulated;
+    if balance == 0 {
+        writeln_stdout(format_args!(
+            "Publishing info for Validator {:?}",
+            config.signers[0].pubkey()
+        ))?;
+    } else {
+        writeln_stdout(format_args!(
+            "Updating Validator {:?} info at: {:?}",
+            config.signers[0].pubkey(),
+            info_pubkey
+        ))?;
+    }
     let build_message = |lamports| {
         let keys = keys.clone();
         if balance == 0 {
-            println!(
-                "Publishing info for Validator {:?}",
-                config.signers[0].pubkey()
-            );
-            let mut instructions =
-                config_instruction::create_account_with_max_config_space::<ValidatorInfo>(
+            let instructions =
+                MessageBuilder::new(config_instruction::create_account_with_max_config_space::<
+                    ValidatorInfo,
+                >(
                     &config.signers[0].pubkey(),
                     &info_pubkey,
                     lamports,
                     MAX_VALIDATOR_INFO,
                     keys.clone(),
-                )
+                ))
                 .with_compute_unit_config(&ComputeUnitConfig {
                     compute_unit_price,
                     compute_unit_limit,
                 });
-            instructions.extend_from_slice(&[config_instruction::store(
+            let instructions = instructions.with_instruction(config_instruction::store(
                 &info_pubkey,
                 true,
                 keys,
                 &validator_info,
-            )]);
-            Message::new(&instructions, Some(&config.signers[0].pubkey()))
+            ));
+            instructions.build(&config.signers[0].pubkey())
         } else {
-            println!(
-                "Updating Validator {:?} info at: {:?}",
-                config.signers[0].pubkey(),
-                info_pubkey
-            );
-            let instructions = vec![config_instruction::store(
+            let instructions = MessageBuilder::new(vec![config_instruction::store(
                 &info_pubkey,
                 false,
                 keys,
                 &validator_info,
-            )]
+            )])
             .with_compute_unit_config(&ComputeUnitConfig {
                 compute_unit_price,
                 compute_unit_limit,
             });
-            Message::new(&instructions, Some(&config.signers[0].pubkey()))
+            instructions.build(&config.signers[0].pubkey())
         }
     };
 
@@ -412,13 +434,15 @@ pub async fn process_publish_validator_info(
         SpendAmount::Some(lamports),
         &latest_blockhash,
         &config.signers[0].pubkey(),
-        compute_unit_limit,
+        &ComputeUnitConfig {
+            compute_unit_limit,
+            compute_unit_price,
+        },
         build_message,
         config.commitment,
     )
     .await?;
-    let mut tx = Transaction::new_unsigned(message);
-    tx.try_sign(&signers, latest_blockhash)?;
+    let tx = message_into_signed_transaction(message, &signers, latest_blockhash, false)?;
     let signature_str = rpc_client
         .send_and_confirm_transaction_with_spinner_and_config(
             &tx,
@@ -427,8 +451,10 @@ pub async fn process_publish_validator_info(
         )
         .await?;
 
-    println!("Success! Validator info published at: {info_pubkey:?}");
-    println!("{signature_str}");
+    writeln_stdout(format_args!(
+        "Success! Validator info published at: {info_pubkey:?}"
+    ))?;
+    writeln_stdout(format_args!("{signature_str}"))?;
     Ok("".to_string())
 }
 
@@ -449,8 +475,11 @@ pub async fn process_get_validator_info(
         all_config
             .into_iter()
             .filter(|(_, validator_info_account)| {
-                match deserialize::<ConfigKeys>(&validator_info_account.data) {
-                    Ok(key_list) => key_list.keys.contains(&(validator_info::id(), false)),
+                match wincode::config::deserialize::<ConfigKeys, _>(
+                    &validator_info_account.data,
+                    WINCODE_CONFIG,
+                ) {
+                    Ok(key_list) => key_list.keys.contains(&(VALIDATOR_INFO_ID, false)),
                     Err(_) => false,
                 }
             })
@@ -485,8 +514,9 @@ mod tests {
     use {
         super::*,
         crate::clap_app::get_clap_app,
-        bincode::{serialize, serialized_size},
         serde_json::json,
+        solana_account::state_traits::StateMutWincode as _,
+        wincode::{deserialize, serialize, serialized_size},
     };
 
     #[test]
@@ -591,22 +621,19 @@ mod tests {
     #[test]
     fn test_parse_validator_info() {
         let pubkey = solana_pubkey::new_rand();
-        let keys = vec![(validator_info::id(), false), (pubkey, true)];
+        let keys = vec![(VALIDATOR_INFO_ID, false), (pubkey, true)];
         let config = ConfigKeys { keys };
 
         let mut info = Map::new();
         info.insert("name".to_string(), Value::String("Alice".to_string()));
         let info_string = serde_json::to_string(&Value::Object(info.clone())).unwrap();
         let validator_info = ValidatorInfo { info: info_string };
-        let data = serialize(&(config, validator_info)).unwrap();
+        let account =
+            Account::new_data(0, &(config, validator_info), &solana_config_interface::id())
+                .unwrap();
 
         assert_eq!(
-            parse_validator_info(&Account {
-                owner: solana_config_interface::id(),
-                data,
-                ..Account::default()
-            })
-            .unwrap(),
+            parse_validator_info(&account).unwrap(),
             (pubkey, true, info)
         );
     }
@@ -628,16 +655,11 @@ mod tests {
         let validator_info = ValidatorInfo {
             info: String::new(),
         };
-        let data = serialize(&(config, validator_info)).unwrap();
+        let account =
+            Account::new_data(0, &(config, validator_info), &solana_config_interface::id())
+                .unwrap();
 
-        assert!(
-            parse_validator_info(&Account {
-                owner: solana_config_interface::id(),
-                data,
-                ..Account::default()
-            },)
-            .is_none()
-        );
+        assert!(parse_validator_info(&account).is_none());
     }
 
     #[test]

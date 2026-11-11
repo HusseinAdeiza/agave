@@ -5,17 +5,17 @@ use {
     solana_epoch_schedule::{EpochSchedule, MINIMUM_SLOTS_PER_EPOCH},
     solana_hash::Hash,
     solana_keypair::Keypair,
+    solana_leader_schedule::SlotLeader,
     solana_ledger::{
         genesis_utils::create_genesis_config,
         shred::{
-            DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, ReedSolomonCache, Shred, ShredData,
-            Shredder, filter::ShredRecoveryContext, max_entries_per_n_shred,
-            max_entries_per_n_shred_last_or_not, verify_test_data_shred,
+            DATA_SHREDS_PER_FEC_BLOCK, ProcessShredsStats, Shred, ShredData, Shredder,
+            filter::{ShredRecoveryContext, new_dummy_retransmit_sender},
+            max_entries_per_n_shred, verify_test_data_shred,
         },
     },
     solana_runtime::bank::Bank,
     solana_signer::Signer,
-    solana_streamer::evicting_sender::EvictingSender,
     solana_system_transaction as system_transaction,
     std::{
         collections::{BTreeMap, HashSet},
@@ -32,10 +32,18 @@ fn new_shred_recovery_context(shreds: &[Shred]) -> ShredRecoveryContext {
     let shred_slot = shreds.first().map(Shred::slot).unwrap_or_default();
     let slots_per_epoch = shred_slot.max(MINIMUM_SLOTS_PER_EPOCH);
     genesis_config.epoch_schedule = EpochSchedule::custom(slots_per_epoch, slots_per_epoch, false);
-    let root_bank = Arc::new(Bank::new_for_tests(&genesis_config));
-    let (dummy_retransmit_sender, _) = EvictingSender::new_bounded(0);
+    let (genesis_bank, _bank_forks) =
+        Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
+    // Set the root bank close to the shred slot to avoid the recovery filter
+    // from discarding the shreds for being too far in the future.
+    let warp_slot = shred_slot.saturating_sub(10).max(1);
+    let root_bank = Arc::new(Bank::warp_from_parent(
+        genesis_bank,
+        SlotLeader::default(),
+        warp_slot,
+    ));
+    let dummy_retransmit_sender = new_dummy_retransmit_sender();
     ShredRecoveryContext::new(
-        ReedSolomonCache::default(),
         dummy_retransmit_sender,
         root_bank,
         shreds.first().map(Shred::version).unwrap_or_default(),
@@ -46,7 +54,7 @@ fn new_shred_recovery_context(shreds: &[Shred]) -> ShredRecoveryContext {
 #[test_case(true)]
 fn test_multi_fec_block_coding(is_last_in_slot: bool) {
     let keypair = Arc::new(Keypair::new());
-    let slot = 0x1234_5678_9abc_def0;
+    let slot = 10000;
     let shredder = Shredder::new(slot, slot - 5, 0, 0).unwrap();
     let num_fec_sets = 100;
     let num_data_shreds = DATA_SHREDS_PER_FEC_BLOCK * num_fec_sets;
@@ -54,8 +62,7 @@ fn test_multi_fec_block_coding(is_last_in_slot: bool) {
     let keypair1 = Keypair::new();
     let tx0 = system_transaction::transfer(&keypair0, &keypair1.pubkey(), 1, Hash::default());
     let entry = Entry::new(&Hash::default(), 1, vec![tx0]);
-    let num_entries =
-        max_entries_per_n_shred_last_or_not(&entry, num_data_shreds as u64, is_last_in_slot);
+    let num_entries = max_entries_per_n_shred(&entry, num_data_shreds as u64, None);
 
     let entries: Vec<_> = (0..num_entries)
         .map(|_| {
@@ -67,7 +74,6 @@ fn test_multi_fec_block_coding(is_last_in_slot: bool) {
         })
         .collect();
 
-    let reed_solomon_cache = ReedSolomonCache::default();
     let serialized_entries = wincode::serialize(&entries).unwrap();
 
     let (data_shreds, coding_shreds) = shredder.entries_to_merkle_shreds_for_tests(
@@ -77,7 +83,6 @@ fn test_multi_fec_block_coding(is_last_in_slot: bool) {
         Hash::default(), // chained_merkle_root
         0,               // next_shred_index
         0,               // next_code_index
-        &reed_solomon_cache,
         &mut ProcessShredsStats::default(),
     );
     let next_index = data_shreds.last().unwrap().index() + 1;
@@ -145,7 +150,7 @@ fn test_multi_fec_block_coding(is_last_in_slot: bool) {
 
 #[test]
 fn test_multi_fec_block_different_size_coding() {
-    let slot = 0x1234_5678_9abc_def0;
+    let slot = 10000;
     let parent_slot = slot - 5;
     let keypair = Arc::new(Keypair::new());
     let (fec_data, fec_coding, num_shreds_per_iter) =
@@ -226,7 +231,7 @@ fn setup_different_sized_fec_blocks(
     let keypair1 = Keypair::new();
     let tx0 = system_transaction::transfer(&keypair0, &keypair1.pubkey(), 1, Hash::default());
     let entry = Entry::new(&Hash::default(), 1, vec![tx0]);
-    let merkle_capacity = ShredData::capacity(/*proof_size:*/ 6, /*resigned:*/ true).unwrap();
+    let merkle_capacity = ShredData::capacity(/*proof_size:*/ 6, /*resigned:*/ false).unwrap();
     let chained_merkle_root = Hash::default();
 
     assert!(DATA_SHREDS_PER_FEC_BLOCK > 2);
@@ -253,7 +258,6 @@ fn setup_different_sized_fec_blocks(
     let mut coding_slot_and_index = HashSet::new();
 
     let total_num_data_shreds: usize = 2 * num_shreds_per_iter;
-    let reed_solomon_cache = ReedSolomonCache::default();
     for i in 0..2 {
         let is_last = i == 1;
 
@@ -264,7 +268,6 @@ fn setup_different_sized_fec_blocks(
             chained_merkle_root,
             next_shred_index,
             next_code_index,
-            &reed_solomon_cache,
             &mut ProcessShredsStats::default(),
         );
         for shred in &data_shreds {

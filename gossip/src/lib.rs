@@ -1,5 +1,4 @@
 #![cfg(feature = "agave-unstable-api")]
-#![cfg_attr(feature = "frozen-abi", feature(min_specialization))]
 #![allow(clippy::arithmetic_side_effects)]
 
 pub mod cluster_info;
@@ -19,7 +18,6 @@ pub mod crds_value;
 pub mod duplicate_shred;
 pub mod duplicate_shred_handler;
 pub mod duplicate_shred_listener;
-pub mod epoch_slots;
 pub mod epoch_specs;
 pub mod gossip_error;
 pub mod gossip_service;
@@ -31,26 +29,16 @@ mod protocol;
 mod push_active_set;
 mod received_cache;
 pub mod restart_crds_values;
+mod sigverify_cache;
 pub mod weighted_shuffle;
 
 #[macro_use]
 extern crate log;
 
-#[cfg(test)]
-#[macro_use]
-extern crate assert_matches;
-
-#[cfg_attr(feature = "frozen-abi", macro_use)]
-#[cfg(feature = "frozen-abi")]
-extern crate solana_frozen_abi_macro;
-
 #[macro_use]
 extern crate solana_metrics;
 
-#[cfg(feature = "conformance")]
-pub use protocol::gossip_decode_to_effects;
-
-#[cfg(feature = "conformance")]
-mod harness;
+#[cfg(feature = "dev-context-only-utils")]
+pub use protocol::{Ping, Protocol, PruneData, deserialize_protocol};
 
 mod wire_format_tests;

@@ -1,20 +1,22 @@
 use {
     crate::{
-        bit_vec::BitVec,
+        bit_vec::{BitVec, BitVecRef},
         blockstore::ParentInfo,
         shred::{
             self, DATA_SHREDS_PER_FEC_BLOCK, MAX_DATA_SHREDS_PER_SLOT, Shred, ShredType,
-            merkle_tree::{SIZE_OF_MERKLE_PROOF_ENTRY, get_proof_size},
+            merkle_tree::get_proof_size,
         },
     },
+    agave_shred_wire_format::constants::SIZE_OF_MERKLE_PROOF_ENTRY,
     bitflags::bitflags,
+    smallvec::SmallVec,
     solana_clock::{Slot, UnixTimestamp},
     solana_hash::{HASH_BYTES, Hash},
     std::{
         fmt::{self, Debug, Display},
         ops::{Range, RangeBounds},
     },
-    wincode::{SchemaRead, SchemaWrite},
+    wincode::{SchemaRead, SchemaWrite, adapter::DefaultOnEmptyRead},
 };
 
 bitflags! {
@@ -95,6 +97,20 @@ impl CompletedDataIndexes {
         let end = bounds.end_bound().map(|&b| b as usize);
         self.index.range((start, end)).iter_ones().map(|i| i as u32)
     }
+
+    /// Equivalent to `range(..bound).next_back()`.
+    #[inline]
+    pub(crate) fn previous_completed_index(&self, bound: u32) -> Option<u32> {
+        self.index.prev_set_bit(bound as usize).map(|i| i as u32)
+    }
+
+    /// Equivalent to `range(from..end).next()`.
+    #[inline]
+    pub(crate) fn next_completed_index(&self, from: u32, end: u32) -> Option<u32> {
+        self.index
+            .next_set_bit_in_range(from as usize..end as usize)
+            .map(|i| i as u32)
+    }
 }
 
 impl FromIterator<u32> for CompletedDataIndexes {
@@ -110,6 +126,17 @@ impl Debug for CompletedDataIndexes {
         write!(f, "{:?}", self.iter().collect::<Vec<_>>())
     }
 }
+
+/// Inline storage for [`SlotMeta::next_slots`].
+///
+/// On a chain with little forking, [`SlotMeta::next_slots`] usually contains
+/// one child (occasionally two), but its size is not strictly bounded.
+///
+/// On 64-bit targets, inline capacities 1 and 2 produce the same `SmallVec` size,
+/// so consume that space with an extra inline `Slot` which would otherwise be
+/// padding bytes. This also avoids a heap spill for intermittent cases where
+/// [`SlotMeta::next_slots`] contains two children.
+pub type NextSlots = SmallVec<[Slot; 2]>;
 
 #[derive(Clone, Debug, Default, SchemaRead, SchemaWrite, Eq, PartialEq)]
 /// The Meta column family
@@ -137,7 +164,7 @@ pub struct SlotMetaBase<T> {
     pub parent_slot: Option<Slot>,
     /// The list of slots, each of which contains a block that derives
     /// from this one.
-    pub next_slots: Vec<Slot>,
+    pub next_slots: NextSlots,
     /// Connected status flags of this slot
     #[wincode(with = "PodConnectedFlags")]
     pub connected_flags: ConnectedFlags,
@@ -164,7 +191,7 @@ pub struct SlotMetaV3 {
     pub last_index: Option<u64>,
     #[wincode(with = "wincode_compat::OptionCompat")]
     pub parent_slot: Option<Slot>,
-    pub next_slots: Vec<Slot>,
+    pub next_slots: NextSlots,
     #[wincode(with = "PodConnectedFlags")]
     pub connected_flags: ConnectedFlags,
     pub completed_data_indexes: CompletedDataIndexes,
@@ -172,29 +199,68 @@ pub struct SlotMetaV3 {
     ///
     /// Populated by the block header initially, then replaced if an UpdateParent
     /// marker changes the replay parent for this slot.
-    #[wincode(with = "wincode_compat::DefaultOnEmptyRead<Hash>")]
+    #[wincode(with = "DefaultOnEmptyRead<Hash>")]
     pub parent_block_id: Hash,
     /// Shred/FEC-set index where replay should start for this slot.
     ///
     /// A value of zero means replay starts from the block header. A non-zero
     /// value means an UpdateParent marker was observed and replay must skip the
     /// optimistic-parent prefix before this FEC set.
-    #[wincode(with = "wincode_compat::DefaultOnEmptyRead<u32>")]
+    #[wincode(with = "DefaultOnEmptyRead<u32>")]
     pub replay_fec_set_index: u32,
 }
 
 pub type SlotMeta = SlotMetaV3;
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct UpdateParentInfo {
+    pub slot: Slot,
+    pub update_parent_fec_set_index: u32,
+    pub parent_slot: Slot,
+    pub parent_block_id: Hash,
+}
+
+impl UpdateParentInfo {
+    pub fn from_slot_meta(slot: Slot, slot_meta: &SlotMeta) -> Option<Self> {
+        Some(Self {
+            slot,
+            update_parent_fec_set_index: slot_meta
+                .has_update_parent()
+                .then_some(slot_meta.replay_fec_set_index)?,
+            parent_slot: slot_meta.parent_slot?,
+            parent_block_id: slot_meta.parent_block_id,
+        })
+    }
+}
+
+/// Lighter-weight version of [`SlotMeta`] containing just the set
+/// of fields needed for repair.
+///
+/// wincode deserializes in field declaration order, so [`SlotMetaRepair`]
+/// can always be deserialized from [`SlotMeta`].
+#[derive(Clone, Debug, Default, SchemaRead, Eq, PartialEq)]
+pub struct SlotMetaRepair {
+    pub slot: Slot,
+    pub consumed: u64,
+    pub received: u64,
+    pub first_shred_timestamp: u64,
+    #[wincode(with = "wincode_compat::OptionCompat")]
+    pub last_index: Option<u64>,
+    #[wincode(with = "wincode_compat::OptionCompat")]
+    pub parent_slot: Option<Slot>,
+    pub next_slots: NextSlots,
+}
 
 // Wincode implementation of serialize and deserialize for Option<u64>
 // where None is represented as u64::MAX; for backward compatibility.
 mod wincode_compat {
     use {
         super::*,
-        std::{marker::PhantomData, mem::MaybeUninit},
+        std::mem::MaybeUninit,
         wincode::{
-            ReadError, ReadResult, WriteResult,
+            ReadResult, WriteResult,
             config::ConfigCore,
-            io::{ReadError as IoReadError, Reader, Writer},
+            io::{Reader, Writer},
         },
     };
 
@@ -225,49 +291,6 @@ mod wincode_compat {
             <Slot as SchemaWrite<C>>::write(writer, &src.unwrap_or(Slot::MAX))
         }
     }
-
-    /// Deserializes using `T` normally, but returns `T::Dst::default()` if the
-    /// reader is exhausted (EOF). Useful for backward compatibility when
-    /// trailing fields are appended to persisted structs.
-    pub(crate) struct DefaultOnEmptyRead<T>(PhantomData<T>);
-
-    // TYPE_META intentionally left dynamic: decoding may read either 0 bytes
-    // (EOF fallback) or the full encoded representation.
-    unsafe impl<'de, C: ConfigCore, T> SchemaRead<'de, C> for DefaultOnEmptyRead<T>
-    where
-        T: SchemaRead<'de, C>,
-        T::Dst: Default,
-    {
-        type Dst = T::Dst;
-
-        fn read(reader: impl Reader<'de>, dst: &mut MaybeUninit<Self::Dst>) -> ReadResult<()> {
-            match <T as SchemaRead<'de, C>>::read(reader, dst) {
-                Ok(()) => Ok(()),
-                Err(ReadError::Io(IoReadError::ReadSizeLimit(_))) => {
-                    dst.write(Self::Dst::default());
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
-        }
-    }
-
-    unsafe impl<C: ConfigCore, T> SchemaWrite<C> for DefaultOnEmptyRead<T>
-    where
-        T: SchemaWrite<C>,
-    {
-        type Src = T::Src;
-
-        const TYPE_META: wincode::TypeMeta = T::TYPE_META;
-
-        fn size_of(src: &Self::Src) -> WriteResult<usize> {
-            <T as SchemaWrite<C>>::size_of(src)
-        }
-
-        fn write(writer: impl Writer, src: &Self::Src) -> WriteResult<()> {
-            <T as SchemaWrite<C>>::write(writer, src)
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, SchemaRead, SchemaWrite, PartialEq, Eq)]
@@ -275,6 +298,13 @@ pub struct Index {
     pub slot: Slot,
     data: ShredIndex,
     coding: ShredIndex,
+}
+
+#[derive(Debug, SchemaRead, PartialEq, Eq)]
+pub struct IndexRef<'a> {
+    pub slot: Slot,
+    data: ShredIndexRef<'a>,
+    coding: ShredIndexRef<'a>,
 }
 
 #[derive(Clone, Copy, Debug, SchemaRead, SchemaWrite, Eq, PartialEq)]
@@ -448,6 +478,12 @@ impl Index {
     }
 }
 
+impl IndexRef<'_> {
+    pub fn data(&self) -> &ShredIndexRef<'_> {
+        &self.data
+    }
+}
+
 /// A bitvec (`Box<[u8]>`) of shred indices, where each u8 represents 8 shred indices.
 ///
 /// Bit vec implementation provides:
@@ -494,6 +530,14 @@ impl ShredIndex {
         self.index.range((start, end)).count_ones()
     }
 
+    /// Returns true when every index in `bounds` is present.
+    /// Empty and reversed ranges are vacuously true.
+    pub(crate) fn contains_range(&self, bounds: Range<u64>) -> bool {
+        let width = bounds.end.saturating_sub(bounds.start);
+        width <= self.num_shreds as u64 && self.count_range(bounds) as u64 == width
+    }
+
+    #[cfg(test)]
     pub(crate) fn range<R>(&self, bounds: R) -> impl Iterator<Item = u64> + '_
     where
         R: RangeBounds<u64>,
@@ -517,32 +561,58 @@ impl FromIterator<u64> for ShredIndex {
     }
 }
 
-impl SlotMeta {
-    pub fn is_full(&self) -> bool {
-        // last_index is None when it has no information about how
-        // many shreds will fill this slot.
-        // Note: A full slot with zero shreds is not possible.
-        // Should never happen
-        if self
-            .last_index
-            .map(|ix| self.consumed > ix + 1)
-            .unwrap_or_default()
-        {
-            datapoint_error!(
-                "blockstore_error",
-                (
-                    "error",
-                    format!(
-                        "Observed a slot meta with consumed: {} > meta.last_index + 1: {:?}",
-                        self.consumed,
-                        self.last_index.map(|ix| ix + 1),
-                    ),
-                    String
-                )
-            );
-        }
+/// A reference to a [`ShredIndex`].
+#[derive(Debug, SchemaRead, PartialEq, Eq)]
+pub struct ShredIndexRef<'a> {
+    index: BitVecRef<'a, MAX_DATA_SHREDS_PER_SLOT>,
+    num_shreds: usize,
+}
 
-        Some(self.consumed) == self.last_index.map(|ix| ix + 1)
+impl ShredIndexRef<'_> {
+    pub fn num_shreds(&self) -> usize {
+        self.num_shreds
+    }
+
+    pub(crate) fn range<R>(&self, bounds: R) -> impl Iterator<Item = u64> + '_
+    where
+        R: RangeBounds<u64>,
+    {
+        let start = bounds.start_bound().map(|&b| b as usize);
+        let end = bounds.end_bound().map(|&b| b as usize);
+        self.index
+            .range((start, end))
+            .iter_ones()
+            .map(|idx| idx as u64)
+    }
+}
+
+fn slot_meta_is_full(last_index: Option<u64>, consumed: u64) -> bool {
+    // last_index is None when it has no information about how
+    // many shreds will fill this slot.
+    // Note: A full slot with zero shreds is not possible.
+    // Should never happen
+    if last_index.map(|ix| consumed > ix + 1).unwrap_or_default() {
+        datapoint_error!(
+            "blockstore_error",
+            (
+                "error",
+                format!(
+                    "Observed a slot meta with consumed: {} > meta.last_index + 1: {:?}",
+                    consumed,
+                    last_index.map(|ix| ix + 1),
+                ),
+                String
+            )
+        );
+    }
+
+    Some(consumed) == last_index.map(|ix| ix + 1)
+}
+
+impl SlotMeta {
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        slot_meta_is_full(self.last_index, self.consumed)
     }
 
     /// Returns a boolean indicating whether this meta's parent slot is known.
@@ -629,8 +699,8 @@ impl SlotMeta {
     }
 
     pub(crate) fn update_from_parent_info(&mut self, parent_info: ParentInfo) {
-        self.parent_slot = Some(parent_info.parent_slot);
-        self.parent_block_id = parent_info.parent_block_id;
+        self.parent_slot = Some(parent_info.parent_block.slot);
+        self.parent_block_id = parent_info.parent_block.block_id.to_hash();
         self.replay_fec_set_index = parent_info.replay_fec_set_index;
     }
 
@@ -642,6 +712,13 @@ impl SlotMeta {
     /// `UpdateParent` marker.
     pub fn has_update_parent(&self) -> bool {
         self.replay_fec_set_index > 0
+    }
+}
+
+impl SlotMetaRepair {
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        slot_meta_is_full(self.last_index, self.consumed)
     }
 }
 
@@ -690,16 +767,6 @@ impl ErasureMeta {
         self.config
     }
 
-    pub(crate) fn fec_set_index(&self) -> u32 {
-        self.fec_set_index
-    }
-
-    pub(crate) fn data_shreds_indices(&self) -> Range<u64> {
-        let num_data = self.config.num_data as u64;
-        let fec_set_index = u64::from(self.fec_set_index);
-        fec_set_index..fec_set_index + num_data
-    }
-
     pub(crate) fn coding_shreds_indices(&self) -> Range<u64> {
         let num_coding = self.config.num_coding as u64;
         self.first_coding_index..self.first_coding_index + num_coding
@@ -708,44 +775,14 @@ impl ErasureMeta {
     pub(crate) fn first_received_coding_shred_index(&self) -> Option<u32> {
         u32::try_from(self.first_received_coding_index).ok()
     }
-
-    pub(crate) fn next_fec_set_index(&self) -> Option<u32> {
-        let num_data = u32::try_from(self.config.num_data).ok()?;
-        self.fec_set_index.checked_add(num_data)
-    }
-
-    // Returns true if some data shreds are missing, but there are enough data
-    // and coding shreds to recover the erasure batch.
-    // TODO: In order to retransmit all shreds from the erasure batch, we need
-    // to always recover the batch as soon as possible, even if no data shreds
-    // are missing. But because we currently do not store recovered coding
-    // shreds into the blockstore we cannot identify if the batch was already
-    // recovered (and retransmitted) or not.
-    pub(crate) fn should_recover_shreds(&self, index: &Index) -> bool {
-        let num_data = index.data().range(self.data_shreds_indices()).count();
-        if num_data >= self.config.num_data {
-            return false; // No data shreds is missing.
-        }
-        let num_coding = index.coding().range(self.coding_shreds_indices()).count();
-        self.config.num_data <= num_data + num_coding
-    }
-
-    #[cfg(test)]
-    pub(crate) fn clear_first_received_coding_shred_index(&mut self) {
-        self.first_received_coding_index = 0;
-    }
 }
 
 impl MerkleRootMeta {
-    pub(crate) fn from_shred(shred: &Shred) -> Self {
+    // `merkle_root` is the shred's Merkle root, optionally precomputed by the caller.
+    // A `None` means that merkle root will be computed by this function.
+    pub(crate) fn from_shred(shred: &Shred, merkle_root: Option<Hash>) -> Self {
         Self {
-            // An error here after the shred has already sigverified
-            // can only indicate that the leader is sending
-            // legacy or malformed shreds. We should still store
-            // `None` for those cases in blockstore, as a later
-            // shred that contains a proper merkle root would constitute
-            // a valid duplicate shred proof.
-            merkle_root: shred.merkle_root().ok(),
+            merkle_root: merkle_root.or_else(|| shred.merkle_root().ok()),
             first_received_shred_index: shred.index(),
             first_received_shred_type: shred.shred_type(),
         }
@@ -886,72 +923,36 @@ impl DoubleMerkleMeta {
 
 #[cfg(test)]
 mod test {
-    use {
-        super::*,
-        proptest::prelude::*,
-        rand::{prelude::IndexedRandom as _, rng},
-    };
+    use {super::*, proptest::prelude::*};
+
+    #[test]
+    #[allow(clippy::reversed_empty_ranges)]
+    fn test_shred_index_contains_range() {
+        let index: ShredIndex = [2u64, 3, 4, 7].into_iter().collect();
+        // Exhaustively cross-check against the iterator definition over every
+        // window, including empty (start == end) and reversed (end < start).
+        for start in 0..10u64 {
+            for end in 0..10u64 {
+                assert_eq!(
+                    index.contains_range(start..end),
+                    index.range(start..end).eq(start..end),
+                    "window {start}..{end}"
+                );
+            }
+        }
+        assert!(index.contains_range(2..5));
+        assert!(!index.contains_range(2..6));
+        assert!(!index.contains_range(1..3));
+        assert!(index.contains_range(7..8));
+        assert!(index.contains_range(5..5));
+        assert!(index.contains_range(5..2));
+    }
 
     #[test]
     fn test_slot_meta_slot_zero_connected() {
         let meta = SlotMeta::new(0 /* slot */, None /* parent */);
         assert!(meta.is_parent_connected());
         assert!(!meta.is_connected());
-    }
-
-    #[test]
-    fn test_should_recover_shreds() {
-        let fec_set_index = 0;
-        let erasure_config = ErasureConfig {
-            num_data: 8,
-            num_coding: 16,
-        };
-        let e_meta = ErasureMeta {
-            fec_set_index,
-            first_coding_index: u64::from(fec_set_index),
-            config: erasure_config,
-            first_received_coding_index: 0,
-        };
-        let mut rng = rng();
-        let mut index = Index::new(0);
-
-        let data_indexes = 0..erasure_config.num_data as u64;
-        let coding_indexes = 0..erasure_config.num_coding as u64;
-
-        assert!(!e_meta.should_recover_shreds(&index));
-
-        for ix in data_indexes.clone() {
-            index.data_mut().insert(ix);
-        }
-
-        assert!(!e_meta.should_recover_shreds(&index));
-
-        for ix in coding_indexes.clone() {
-            index.coding_mut().insert(ix);
-        }
-
-        for &idx in data_indexes
-            .clone()
-            .collect::<Vec<_>>()
-            .choose_multiple(&mut rng, erasure_config.num_data)
-        {
-            index.data_mut().remove(idx);
-
-            assert!(e_meta.should_recover_shreds(&index));
-        }
-
-        for ix in data_indexes {
-            index.data_mut().insert(ix);
-        }
-
-        for &idx in coding_indexes
-            .collect::<Vec<_>>()
-            .choose_multiple(&mut rng, erasure_config.num_coding)
-        {
-            index.coding_mut().remove(idx);
-
-            assert!(!e_meta.should_recover_shreds(&index));
-        }
     }
 
     /// Generate a random Range<u64>.
@@ -980,6 +981,112 @@ mod test {
                 index.range(indices.clone()).collect::<Vec<_>>(),
                 indices.into_iter().collect::<Vec<_>>()
             );
+        }
+    }
+
+    fn arb_slot_meta() -> impl Strategy<Value = SlotMeta> {
+        (
+            any::<Slot>(),
+            any::<u64>(),
+            any::<u64>(),
+            any::<u64>(),
+            proptest::option::of(any::<u64>()),
+            proptest::option::of(any::<Slot>()),
+            proptest::collection::vec(any::<Slot>(), 0..32),
+            any::<u8>(),
+            proptest::collection::vec(0..MAX_DATA_SHREDS_PER_SLOT as u32, 0..64),
+            any::<[u8; HASH_BYTES]>(),
+            any::<u32>(),
+        )
+            .prop_map(
+                |(
+                    slot,
+                    consumed,
+                    received,
+                    first_shred_timestamp,
+                    last_index,
+                    parent_slot,
+                    next_slots,
+                    connected_flags,
+                    completed_data_indexes,
+                    parent_block_id,
+                    replay_fec_set_index,
+                )| SlotMeta {
+                    slot,
+                    consumed,
+                    received,
+                    first_shred_timestamp,
+                    last_index,
+                    parent_slot,
+                    next_slots: next_slots.into(),
+                    connected_flags: ConnectedFlags::from_bits_truncate(connected_flags),
+                    completed_data_indexes: completed_data_indexes.into_iter().collect(),
+                    parent_block_id: Hash::new_from_array(parent_block_id),
+                    replay_fec_set_index,
+                },
+            )
+    }
+
+    fn arb_index() -> impl Strategy<Value = Index> {
+        (
+            any::<Slot>(),
+            proptest::collection::vec(0..MAX_DATA_SHREDS_PER_SLOT as u64, 0..128),
+            proptest::collection::vec(0..MAX_DATA_SHREDS_PER_SLOT as u64, 0..128),
+        )
+            .prop_map(|(slot, data_indexes, coding_indexes)| {
+                let mut index = Index::new(slot);
+                for index_to_insert in data_indexes {
+                    index.data_mut().insert(index_to_insert);
+                }
+                for index_to_insert in coding_indexes {
+                    index.coding_mut().insert(index_to_insert);
+                }
+                index
+            })
+    }
+
+    proptest! {
+        // Property: `SlotMetaRepair` is always deserializable from serialized `SlotMeta`.
+        #[test]
+        fn test_slot_meta_repair_deserialization(
+            slot_meta in arb_slot_meta(),
+        ) {
+            let serialized = wincode::serialize(&slot_meta).unwrap();
+            let deserialized: SlotMetaRepair = wincode::deserialize(&serialized).unwrap();
+
+            prop_assert_eq!(deserialized.slot, slot_meta.slot);
+            prop_assert_eq!(deserialized.consumed, slot_meta.consumed);
+            prop_assert_eq!(deserialized.received, slot_meta.received);
+            prop_assert_eq!(
+                deserialized.first_shred_timestamp,
+                slot_meta.first_shred_timestamp
+            );
+            prop_assert_eq!(deserialized.last_index, slot_meta.last_index);
+            prop_assert_eq!(deserialized.parent_slot, slot_meta.parent_slot);
+            prop_assert_eq!(deserialized.next_slots, slot_meta.next_slots);
+        }
+    }
+
+    proptest! {
+        // Property: `IndexRef` is always deserializable from `Index`.
+        #[test]
+        fn test_index_ref_deserialization(
+            index in arb_index(),
+        ) {
+            let serialized = wincode::serialize(&index).unwrap();
+            let deserialized: IndexRef = wincode::deserialize(&serialized).unwrap();
+
+            prop_assert_eq!(deserialized.slot, index.slot);
+            prop_assert_eq!(
+                deserialized.data().range(..).collect::<Vec<_>>(),
+                index.data().range(..).collect::<Vec<_>>()
+            );
+            prop_assert_eq!(
+                deserialized.coding.range(..).collect::<Vec<_>>(),
+                index.coding().range(..).collect::<Vec<_>>()
+            );
+            prop_assert_eq!(deserialized.data().num_shreds(), index.data().num_shreds());
+            prop_assert_eq!(deserialized.coding.num_shreds(), index.coding().num_shreds());
         }
     }
 
@@ -1154,11 +1261,11 @@ mod test {
         let mut slot_meta = SlotMeta::new_orphan(5);
         slot_meta.consumed = 5;
         slot_meta.received = 5;
-        slot_meta.next_slots = vec![6, 7];
+        slot_meta.next_slots = smallvec::smallvec![6, 7];
         slot_meta.clear_unconfirmed_slot();
 
         let mut expected = SlotMeta::new_orphan(5);
-        expected.next_slots = vec![6, 7];
+        expected.next_slots = smallvec::smallvec![6, 7];
         assert_eq!(slot_meta, expected);
     }
 

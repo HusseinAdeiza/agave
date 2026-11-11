@@ -12,23 +12,74 @@
 
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
+#[cfg(feature = "stable-abi")]
+use solana_frozen_abi_macro::{StableAbi, StableAbiSample, frozen_abi};
 #[cfg(test)]
 use solana_vote_interface::authorized_voters::AuthorizedVoters;
 use {
-    solana_clock::{Clock, Epoch, Slot, UnixTimestamp},
-    solana_instruction::error::InstructionError,
+    solana_clock::{Clock, Epoch, Slot},
+    solana_instruction_error::InstructionError,
     solana_pubkey::Pubkey,
     solana_transaction_context::instruction_accounts::BorrowedInstructionAccount,
     solana_vote_interface::{
         error::VoteError,
         state::{
             BLS_PUBLIC_KEY_COMPRESSED_SIZE, BlockTimestamp, LandedVote, Lockout,
-            MAX_EPOCH_CREDITS_HISTORY, MAX_LOCKOUT_HISTORY, VOTE_CREDITS_GRACE_SLOTS,
-            VOTE_CREDITS_MAXIMUM_PER_SLOT, VoteInit, VoteInitV2, VoteStateV4, VoteStateVersions,
+            MAX_EPOCH_CREDITS_HISTORY, VoteInit, VoteInitV2, VoteState1_14_11, VoteStateV3,
+            VoteStateV4,
         },
     },
     std::collections::VecDeque,
+    wincode::{SchemaRead, SchemaWrite},
 };
+
+/// Copy of `VoteStateVersions` except that state is without a `Box`.
+/// Eliminates the cost of the `Box` when deserializing a `VoteAccount`.
+#[cfg_attr(
+    feature = "stable-abi",
+    frozen_abi(
+        abi_digest = "292pqhdmS6k7yrk5pUSQBpiQq1MLHb15pu6oM5WnWcug",
+        abi_serializer = "wincode"
+    ),
+    derive(StableAbi, StableAbiSample, SchemaWrite)
+)]
+#[derive(Debug, PartialEq, Eq, SchemaRead)]
+pub enum VoteStateVersionsInline {
+    Uninitialized,
+    V1_14_11(VoteState1_14_11),
+    V3(VoteStateV3),
+    V4(VoteStateV4),
+}
+
+impl VoteStateVersionsInline {
+    pub(crate) fn deserialize(input: &[u8]) -> Result<Self, InstructionError> {
+        let versioned =
+            wincode::deserialize(input).map_err(|_| InstructionError::InvalidAccountData)?;
+        match versioned {
+            // Preserve VoteStateVersions::deserialize's rejection of discriminant 0.
+            Self::Uninitialized => Err(InstructionError::InvalidAccountData),
+            _ => Ok(versioned),
+        }
+    }
+
+    pub fn is_uninitialized(&self) -> bool {
+        match self {
+            Self::Uninitialized => true,
+            Self::V1_14_11(vote_state) => vote_state.is_uninitialized(),
+            Self::V3(vote_state) => vote_state.is_uninitialized(),
+            // As per SIMD-0185, v4 is always initialized.
+            Self::V4(_) => false,
+        }
+    }
+}
+
+/// Copy of `VoteStateVersions` except that references to state are stored.
+/// Allows for faster serialization as data doesn't have to be moved around.
+#[derive(SchemaWrite)]
+enum VoteStateVersionsRef<'a> {
+    #[wincode(tag = 3)]
+    V4(&'a VoteStateV4),
+}
 
 /// The target version to convert all deserialized vote state into.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -131,6 +182,7 @@ impl VoteStateHandler {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn commission(&self) -> u8 {
         match &self.target_state {
             TargetVoteState::V4(v4) => {
@@ -163,7 +215,7 @@ impl VoteStateHandler {
         }
     }
 
-    pub(crate) fn node_pubkey(&self) -> &Pubkey {
+    pub fn node_pubkey(&self) -> &Pubkey {
         match &self.target_state {
             TargetVoteState::V4(v4) => &v4.node_pubkey,
         }
@@ -208,6 +260,7 @@ impl VoteStateHandler {
         }
     }
 
+    #[cfg(any(test, feature = "dev-context-only-utils"))]
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn votes(&self) -> &VecDeque<LandedVote> {
         match &self.target_state {
@@ -215,24 +268,9 @@ impl VoteStateHandler {
         }
     }
 
-    pub(crate) fn votes_mut(&mut self) -> &mut VecDeque<LandedVote> {
-        match &mut self.target_state {
-            TargetVoteState::V4(v4) => &mut v4.votes,
-        }
-    }
-
     pub fn set_votes(&mut self, votes: VecDeque<LandedVote>) {
         match &mut self.target_state {
             TargetVoteState::V4(v4) => v4.votes = votes,
-        }
-    }
-
-    pub(crate) fn contains_slot(&self, candidate_slot: Slot) -> bool {
-        match &self.target_state {
-            TargetVoteState::V4(v4) => v4
-                .votes
-                .binary_search_by(|vote| vote.slot().cmp(&candidate_slot))
-                .is_ok(),
         }
     }
 
@@ -258,18 +296,6 @@ impl VoteStateHandler {
         }
     }
 
-    pub(crate) fn current_epoch(&self) -> Epoch {
-        match &self.target_state {
-            TargetVoteState::V4(v4) => {
-                if v4.epoch_credits.is_empty() {
-                    0
-                } else {
-                    v4.epoch_credits.last().unwrap().0
-                }
-            }
-        }
-    }
-
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     pub(crate) fn epoch_credits(&self) -> &Vec<(Epoch, u64, u64)> {
         match &self.target_state {
@@ -277,29 +303,29 @@ impl VoteStateHandler {
         }
     }
 
-    pub(crate) fn epoch_credits_mut(&mut self) -> &mut Vec<(Epoch, u64, u64)> {
+    pub fn epoch_credits_mut(&mut self) -> &mut Vec<(Epoch, u64, u64)> {
         match &mut self.target_state {
             TargetVoteState::V4(v4) => &mut v4.epoch_credits,
         }
     }
 
-    pub(crate) fn last_timestamp(&self) -> &BlockTimestamp {
+    pub fn last_timestamp(&self) -> &BlockTimestamp {
         match &self.target_state {
             TargetVoteState::V4(v4) => &v4.last_timestamp,
         }
     }
 
-    pub(crate) fn set_last_timestamp(&mut self, timestamp: BlockTimestamp) {
+    pub fn set_last_timestamp(&mut self, timestamp: BlockTimestamp) {
         match &mut self.target_state {
             TargetVoteState::V4(v4) => v4.last_timestamp = timestamp,
         }
     }
 
     pub(crate) fn set_vote_account_state(
-        self,
+        &self,
         vote_account: &mut BorrowedInstructionAccount,
     ) -> Result<(), InstructionError> {
-        match self.target_state {
+        match &self.target_state {
             TargetVoteState::V4(v4) => {
                 // If the account is not large enough to store the vote state, then attempt a realloc to make it large enough.
                 // The realloc can only proceed if the vote account has balance sufficient for rent exemption at the new size.
@@ -314,7 +340,7 @@ impl VoteStateHandler {
                     return Err(InstructionError::AccountNotRentExempt);
                 }
                 // Vote account is large enough to store the newest version of vote state
-                vote_account.set_state(&VoteStateVersions::V4(Box::new(v4)))
+                vote_account.set_state(&VoteStateVersionsRef::V4(v4))
             }
         }
     }
@@ -391,37 +417,6 @@ impl VoteStateHandler {
         }
     }
 
-    pub(crate) fn credits_for_vote_at_index(&self, index: usize) -> u64 {
-        let latency = self
-            .votes()
-            .get(index)
-            .map_or(0, |landed_vote| landed_vote.latency);
-
-        // If latency is 0, this means that the Lockout was created and stored from a software version that did not
-        // store vote latencies; in this case, 1 credit is awarded
-        if latency == 0 {
-            1
-        } else {
-            match latency.checked_sub(VOTE_CREDITS_GRACE_SLOTS) {
-                None | Some(0) => {
-                    // latency was <= VOTE_CREDITS_GRACE_SLOTS, so maximum credits are awarded
-                    VOTE_CREDITS_MAXIMUM_PER_SLOT as u64
-                }
-
-                Some(diff) => {
-                    // diff = latency - VOTE_CREDITS_GRACE_SLOTS, and diff > 0
-                    // Subtract diff from VOTE_CREDITS_MAXIMUM_PER_SLOT which is the number of credits to award
-                    match VOTE_CREDITS_MAXIMUM_PER_SLOT.checked_sub(diff) {
-                        // If diff >= VOTE_CREDITS_MAXIMUM_PER_SLOT, 1 credit is awarded
-                        None | Some(0) => 1,
-
-                        Some(credits) => credits as u64,
-                    }
-                }
-            }
-        }
-    }
-
     pub fn increment_credits(&mut self, epoch: Epoch, credits: u64) {
         // increment credits, record by epoch
 
@@ -454,103 +449,12 @@ impl VoteStateHandler {
             .saturating_add(credits);
     }
 
-    pub(crate) fn process_timestamp(
-        &mut self,
-        slot: Slot,
-        timestamp: UnixTimestamp,
-    ) -> Result<(), VoteError> {
-        let last_timestamp = self.last_timestamp();
-        if (slot < last_timestamp.slot || timestamp < last_timestamp.timestamp)
-            || (slot == last_timestamp.slot
-                && &BlockTimestamp { slot, timestamp } != last_timestamp
-                && last_timestamp.slot != 0)
-        {
-            return Err(VoteError::TimestampTooOld);
-        }
-        self.set_last_timestamp(BlockTimestamp { slot, timestamp });
-        Ok(())
-    }
-
-    fn pop_expired_votes(&mut self, next_vote_slot: Slot) {
-        while let Some(vote) = self.last_lockout() {
-            if !vote.is_locked_out_at_slot(next_vote_slot) {
-                self.votes_mut().pop_back();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn double_lockouts(&mut self) {
-        let stack_depth = self.votes().len();
-        for (i, v) in self.votes_mut().iter_mut().enumerate() {
-            // Don't increase the lockout for this vote until we get more confirmations
-            // than the max number of confirmations this vote has seen
-            if stack_depth
-                > i.checked_add(v.confirmation_count() as usize).expect(
-                    "`confirmation_count` and tower_size should be bounded by \
-                     `MAX_LOCKOUT_HISTORY`",
-                )
-            {
-                v.lockout.increase_confirmation_count(1);
-            }
-        }
-    }
-
-    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-    pub(crate) fn process_next_vote_slot(
-        &mut self,
-        next_vote_slot: Slot,
-        epoch: Epoch,
-        current_slot: Slot,
-    ) {
-        // Ignore votes for slots earlier than we already have votes for
-        if self
-            .last_voted_slot()
-            .is_some_and(|last_voted_slot| next_vote_slot <= last_voted_slot)
-        {
-            return;
-        }
-
-        self.pop_expired_votes(next_vote_slot);
-
-        let landed_vote = LandedVote {
-            latency: compute_vote_latency(next_vote_slot, current_slot),
-            lockout: Lockout::new(next_vote_slot),
-        };
-
-        // Once the stack is full, pop the oldest lockout and distribute rewards
-        if self.votes().len() == MAX_LOCKOUT_HISTORY {
-            let credits = self.credits_for_vote_at_index(0);
-            let landed_vote = self.votes_mut().pop_front().unwrap();
-            self.set_root_slot(Some(landed_vote.slot()));
-
-            self.increment_credits(epoch, credits);
-        }
-        self.votes_mut().push_back(landed_vote);
-        self.double_lockouts();
-    }
-
     #[cfg(test)]
     pub(crate) fn credits(&self) -> u64 {
         if self.epoch_credits().is_empty() {
             0
         } else {
             self.epoch_credits().last().unwrap().1
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn nth_recent_lockout(&self, position: usize) -> Option<&Lockout> {
-        if position < self.votes().len() {
-            let pos = self
-                .votes()
-                .len()
-                .checked_sub(position)
-                .and_then(|pos| pos.checked_sub(1))?;
-            self.votes().get(pos).map(|vote| &vote.lockout)
-        } else {
-            None
         }
     }
 
@@ -566,13 +470,13 @@ impl VoteStateHandler {
     /// Returns `Err(InstructionError::InvalidAccountData)` if the version of the input
     /// `VoteStateVersions` is not supported by `VoteStateHandler`.
     pub fn try_new_from_vote_state_versions(
-        versions: VoteStateVersions,
+        versions: VoteStateVersionsInline,
     ) -> Result<Self, InstructionError> {
         match versions {
-            VoteStateVersions::V4(state) => Ok(Self::new_v4(*state)),
-            VoteStateVersions::V3(_)
-            | VoteStateVersions::V1_14_11(_)
-            | VoteStateVersions::Uninitialized => Err(InstructionError::InvalidAccountData),
+            VoteStateVersionsInline::V4(state) => Ok(Self::new_v4(state)),
+            VoteStateVersionsInline::V3(_)
+            | VoteStateVersionsInline::V1_14_11(_)
+            | VoteStateVersionsInline::Uninitialized => Err(InstructionError::InvalidAccountData),
         }
     }
 
@@ -598,36 +502,49 @@ impl VoteStateHandler {
     /// Serializes `self` into the provided `data` buffer.
     ///
     /// Returns `Err(InstructionError::InvalidAccountData)` if serialization fails.
-    pub fn serialize_into(self, data: &mut [u8]) -> Result<(), InstructionError> {
-        match self.target_state {
+    pub fn serialize_into(&self, data: &mut [u8]) -> Result<(), InstructionError> {
+        match &self.target_state {
             TargetVoteState::V4(v4) => {
-                let versioned = VoteStateVersions::V4(Box::new(v4));
-                bincode::serialize_into(data, &versioned)
+                let versioned = VoteStateVersionsRef::V4(v4);
+                wincode::serialize_into(data, &versioned)
                     .map_err(|_e| InstructionError::InvalidAccountData)
             }
         }
     }
 
+    /// Serializes `self` into a new buffer of `len` bytes, zero-filling the bytes past the
+    /// encoding.
+    ///
+    /// Returns `Err(InstructionError::InvalidAccountData)` if the encoding exceeds `len` bytes.
+    pub fn serialize_padded(&self, len: usize) -> Result<Vec<u8>, InstructionError> {
+        let mut data = Vec::with_capacity(len);
+        match &self.target_state {
+            TargetVoteState::V4(v4) => {
+                let versioned = VoteStateVersionsRef::V4(v4);
+                wincode::serialize_into(&mut data, &versioned)
+                    .map_err(|_e| InstructionError::InvalidAccountData)?;
+            }
+        }
+        if data.len() > len {
+            return Err(InstructionError::InvalidAccountData);
+        }
+        data.resize(len, 0);
+        Ok(data)
+    }
+
     #[cfg(test)]
     pub fn serialize(self) -> Vec<u8> {
-        let mut data = vec![0; VoteStateV4::size_of()];
-        self.serialize_into(&mut data).unwrap();
-        data
+        self.serialize_padded(VoteStateV4::size_of()).unwrap()
     }
 }
 
-// Computes the vote latency for vote on voted_for_slot where the vote itself landed in current_slot
-pub(crate) fn compute_vote_latency(voted_for_slot: Slot, current_slot: Slot) -> u8 {
-    std::cmp::min(current_slot.saturating_sub(voted_for_slot), u8::MAX as u64) as u8
-}
-
 pub(crate) fn try_convert_to_vote_state_v4(
-    versioned: VoteStateVersions,
+    versioned: VoteStateVersionsInline,
     vote_pubkey: &Pubkey,
 ) -> Result<VoteStateV4, InstructionError> {
     match versioned {
-        VoteStateVersions::Uninitialized => Err(InstructionError::UninitializedAccount),
-        VoteStateVersions::V1_14_11(state) => Ok(VoteStateV4 {
+        VoteStateVersionsInline::Uninitialized => Err(InstructionError::UninitializedAccount),
+        VoteStateVersionsInline::V1_14_11(state) => Ok(VoteStateV4 {
             node_pubkey: state.node_pubkey,
             authorized_withdrawer: state.authorized_withdrawer,
             inflation_rewards_collector: *vote_pubkey,
@@ -642,7 +559,7 @@ pub(crate) fn try_convert_to_vote_state_v4(
             epoch_credits: state.epoch_credits,
             last_timestamp: state.last_timestamp,
         }),
-        VoteStateVersions::V3(state) => Ok(VoteStateV4 {
+        VoteStateVersionsInline::V3(state) => Ok(VoteStateV4 {
             node_pubkey: state.node_pubkey,
             authorized_withdrawer: state.authorized_withdrawer,
             inflation_rewards_collector: *vote_pubkey,
@@ -657,7 +574,7 @@ pub(crate) fn try_convert_to_vote_state_v4(
             epoch_credits: state.epoch_credits,
             last_timestamp: state.last_timestamp,
         }),
-        VoteStateVersions::V4(state) => Ok(*state),
+        VoteStateVersionsInline::V4(state) => Ok(state),
     }
 }
 
@@ -685,7 +602,7 @@ mod tests {
             authorized_voters::AuthorizedVoters,
             state::{
                 BLS_PROOF_OF_POSSESSION_COMPRESSED_SIZE, BlockTimestamp, MAX_EPOCH_CREDITS_HISTORY,
-                MAX_LOCKOUT_HISTORY, VoteInit, VoteState1_14_11, VoteStateV3,
+                MAX_LOCKOUT_HISTORY, VoteInit, VoteState1_14_11, VoteStateV3, VoteStateVersions,
             },
         },
         std::collections::VecDeque,
@@ -695,12 +612,43 @@ mod tests {
     /// Default block revenue commission rate in basis points (100%) per SIMD-0185.
     const DEFAULT_BLOCK_REVENUE_COMMISSION_BPS: u16 = 10_000;
 
+    #[test]
+    fn test_vote_state_handler_compatibility() {
+        let v4 = get_max_sized_vote_state_v4();
+        let expected = wincode::serialize(&VoteStateVersions::V4(Box::new(v4.clone()))).unwrap();
+        let handler = VoteStateHandler::new_v4(v4);
+        let mut data = vec![0; VoteStateV4::size_of()];
+        handler.serialize_into(&mut data).unwrap();
+        assert_eq!(&data[..expected.len()], expected);
+        let decoded = VoteStateVersionsInline::deserialize(&data).unwrap();
+        assert_eq!(
+            VoteStateHandler::try_new_from_vote_state_versions(decoded).unwrap(),
+            handler,
+        );
+
+        let mut undersized_data = vec![0; expected.len() - 1];
+        assert_eq!(
+            handler.serialize_into(&mut undersized_data),
+            Err(InstructionError::InvalidAccountData),
+        );
+
+        assert_eq!(handler.serialize_padded(data.len()), Ok(data));
+        assert_eq!(
+            handler.serialize_padded(expected.len()).as_ref(),
+            Ok(&expected)
+        );
+        assert_eq!(
+            handler.serialize_padded(expected.len() - 1),
+            Err(InstructionError::InvalidAccountData),
+        );
+    }
+
     fn mock_transaction_context(
         vote_pubkey: Pubkey,
         vote_account: AccountSharedData,
         rent: Rent,
     ) -> TransactionContext<'static> {
-        let program_account = AccountSharedData::new(0, 0, &native_loader::id());
+        let program_account = AccountSharedData::empty(0, &native_loader::id());
         let mut transaction_context = TransactionContext::new(
             vec![(id(), program_account), (vote_pubkey, vote_account)],
             rent,
@@ -1117,57 +1065,6 @@ mod tests {
         assert!(vote_state.epoch_credits().len() <= MAX_EPOCH_CREDITS_HISTORY);
     }
 
-    #[test_case(VoteStateHandler::new_v4(VoteStateV4::default()) ; "VoteStateV4")]
-    fn test_vote_process_timestamp(mut vote_state: VoteStateHandler) {
-        let (slot, timestamp) = (15, 1_575_412_285);
-        vote_state.set_last_timestamp(BlockTimestamp { slot, timestamp });
-
-        assert_eq!(
-            vote_state.process_timestamp(slot - 1, timestamp + 1),
-            Err(VoteError::TimestampTooOld)
-        );
-        assert_eq!(
-            vote_state.last_timestamp(),
-            &BlockTimestamp { slot, timestamp }
-        );
-        assert_eq!(
-            vote_state.process_timestamp(slot + 1, timestamp - 1),
-            Err(VoteError::TimestampTooOld)
-        );
-        assert_eq!(
-            vote_state.process_timestamp(slot, timestamp + 1),
-            Err(VoteError::TimestampTooOld)
-        );
-        assert_eq!(vote_state.process_timestamp(slot, timestamp), Ok(()));
-        assert_eq!(
-            vote_state.last_timestamp(),
-            &BlockTimestamp { slot, timestamp }
-        );
-        assert_eq!(vote_state.process_timestamp(slot + 1, timestamp), Ok(()));
-        assert_eq!(
-            vote_state.last_timestamp(),
-            &BlockTimestamp {
-                slot: slot + 1,
-                timestamp
-            }
-        );
-        assert_eq!(
-            vote_state.process_timestamp(slot + 2, timestamp + 1),
-            Ok(())
-        );
-        assert_eq!(
-            vote_state.last_timestamp(),
-            &BlockTimestamp {
-                slot: slot + 2,
-                timestamp: timestamp + 1
-            }
-        );
-
-        // Test initial vote
-        vote_state.set_last_timestamp(BlockTimestamp::default());
-        assert_eq!(vote_state.process_timestamp(0, timestamp), Ok(()));
-    }
-
     fn init_vote_account_state_v4_and_assert(
         vote_pubkey: Pubkey,
         vote_account: AccountSharedData,
@@ -1277,7 +1174,8 @@ mod tests {
         // First create a vote account that's too small for v4.
         let v1_14_11_size = VoteState1_14_11::size_of();
         let lamports = rent.minimum_balance(v1_14_11_size);
-        let vote_account = AccountSharedData::new(lamports, v1_14_11_size, &id());
+        let vote_account =
+            AccountSharedData::new_with_data(lamports, vec![0; v1_14_11_size], &id());
 
         // Initialize - should fail.
         init_vote_account_state_v4_and_assert(
@@ -1293,7 +1191,8 @@ mod tests {
         // lamports for resize.
         let v4_size = VoteStateV4::size_of();
         let lamports = rent.minimum_balance(v4_size);
-        let vote_account = AccountSharedData::new(lamports, v1_14_11_size, &id());
+        let vote_account =
+            AccountSharedData::new_with_data(lamports, vec![0; v1_14_11_size], &id());
 
         // Initialize - should resize and create v4.
         init_vote_account_state_v4_and_assert(
@@ -1307,7 +1206,7 @@ mod tests {
 
         // Now create a vote account that's large enough for v4.
         let lamports = rent.minimum_balance(v4_size);
-        let vote_account = AccountSharedData::new(lamports, v4_size, &id());
+        let vote_account = AccountSharedData::new_with_data(lamports, vec![0; v4_size], &id());
 
         // Initialize - should create v4.
         init_vote_account_state_v4_and_assert(
@@ -1328,7 +1227,8 @@ mod tests {
         // First create a vote account that's too small for v4.
         let v1_14_11_size = VoteState1_14_11::size_of();
         let lamports = rent.minimum_balance(v1_14_11_size);
-        let vote_account = AccountSharedData::new(lamports, v1_14_11_size, &id());
+        let vote_account =
+            AccountSharedData::new_with_data(lamports, vec![0; v1_14_11_size], &id());
 
         // Deinitialize - should fail.
         deinit_vote_account_state_v4_and_assert(vote_pubkey, vote_account, rent.clone());
@@ -1337,14 +1237,15 @@ mod tests {
         // lamports for resize.
         let v4_size = VoteStateV4::size_of();
         let lamports = rent.minimum_balance(v4_size);
-        let vote_account = AccountSharedData::new(lamports, v1_14_11_size, &id());
+        let vote_account =
+            AccountSharedData::new_with_data(lamports, vec![0; v1_14_11_size], &id());
 
         // Deinitialize - should resize and create v4.
         deinit_vote_account_state_v4_and_assert(vote_pubkey, vote_account, rent.clone());
 
         // Now create a vote account that's large enough for v4.
         let lamports = rent.minimum_balance(v4_size);
-        let vote_account = AccountSharedData::new(lamports, v4_size, &id());
+        let vote_account = AccountSharedData::new_with_data(lamports, vec![0; v4_size], &id());
 
         // Deinitialize - should create v4.
         deinit_vote_account_state_v4_and_assert(vote_pubkey, vote_account, rent);
@@ -1408,7 +1309,7 @@ mod tests {
                 ..Default::default()
             };
 
-            let versioned = VoteStateVersions::V3(Box::new(v3));
+            let versioned = VoteStateVersionsInline::V3(v3);
             let migrated = try_convert_to_vote_state_v4(versioned, &vote_pubkey).unwrap();
             let migrated_handler = VoteStateHandler::new_v4(migrated);
             assert_eq!(migrated_handler.commission(), n);
@@ -1468,7 +1369,7 @@ mod tests {
                 ..VoteState1_14_11::default()
             };
 
-            let versioned = VoteStateVersions::V1_14_11(Box::new(vote_state_v2.clone()));
+            let versioned = VoteStateVersionsInline::V1_14_11(vote_state_v2.clone());
             let vote_state_v4 = try_convert_to_vote_state_v4(versioned, &vote_pubkey).unwrap();
 
             // Compare fields that were already present in V1_14_11.
@@ -1507,7 +1408,7 @@ mod tests {
             vote_state_v3.epoch_credits = epoch_credits.clone();
             vote_state_v3.root_slot = root_slot;
 
-            let versioned = VoteStateVersions::V3(Box::new(vote_state_v3.clone()));
+            let versioned = VoteStateVersionsInline::V3(vote_state_v3.clone());
             let vote_state_v4 = try_convert_to_vote_state_v4(versioned, &vote_pubkey).unwrap();
 
             // Compare fields that were already present in V3.
@@ -1549,7 +1450,7 @@ mod tests {
                 });
             }
 
-            let versioned = VoteStateVersions::V4(Box::new(initial_vote_state_v4.clone()));
+            let versioned = VoteStateVersionsInline::V4(initial_vote_state_v4.clone());
             let vote_state_v4 = try_convert_to_vote_state_v4(versioned, &vote_pubkey).unwrap();
 
             // Should be an exact copy.
@@ -1604,7 +1505,7 @@ mod tests {
                 authorized_voters: build_voters(),
                 ..Default::default()
             };
-            let versioned = VoteStateVersions::V1_14_11(Box::new(v1));
+            let versioned = VoteStateVersionsInline::V1_14_11(v1);
             let v4 = try_convert_to_vote_state_v4(versioned, &vote_pubkey).unwrap();
             let mut handler = VoteStateHandler::new_v4(v4);
             assert_purge(&mut handler);
@@ -1616,7 +1517,7 @@ mod tests {
                 authorized_voters: build_voters(),
                 ..Default::default()
             };
-            let versioned = VoteStateVersions::V3(Box::new(v3));
+            let versioned = VoteStateVersionsInline::V3(v3);
             let v4 = try_convert_to_vote_state_v4(versioned, &vote_pubkey).unwrap();
             let mut handler = VoteStateHandler::new_v4(v4);
             assert_purge(&mut handler);
@@ -1672,8 +1573,7 @@ mod tests {
             rent.minimum_balance(account_size)
         };
 
-        let mut vote_account = AccountSharedData::new(lamports, account_size, &id());
-        vote_account.set_data_from_slice(&vec![0; account_size]);
+        let vote_account = AccountSharedData::new_with_data(lamports, vec![0; account_size], &id());
 
         let transaction_context = mock_transaction_context(vote_pubkey, vote_account, rent);
         let instruction_context = transaction_context.get_next_instruction_context().unwrap();
@@ -1775,22 +1675,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_vote_latency() {
-        for (voted_for_slot, current_slot, expected) in [
-            (0, 0, 0),                   // zero latency
-            (0, 1, 1),                   // normal
-            (0, 255, 255),               // max u8
-            (0, 256, 255),               // clamped to u8::MAX
-            (0, 1_000, 255),             // large gap, clamped
-            (u64::MAX - 1, u64::MAX, 1), // near-max slots
-            (5, 5, 0),                   // same slot
-            (10, 5, 0),                  // current < voted, saturating_sub → 0
-        ] {
-            assert_eq!(compute_vote_latency(voted_for_slot, current_slot), expected);
-        }
-    }
-
-    #[test]
     fn test_init_vote_account_state_v2() {
         let vote_pubkey = Pubkey::new_unique();
         let inflation_rewards_collector = Pubkey::new_unique();
@@ -1810,7 +1694,7 @@ mod tests {
 
         let v4_size = VoteStateV4::size_of();
         let lamports = rent.minimum_balance(v4_size);
-        let vote_account = AccountSharedData::new(lamports, v4_size, &id());
+        let vote_account = AccountSharedData::new_with_data(lamports, vec![0; v4_size], &id());
 
         let transaction_context = mock_transaction_context(vote_pubkey, vote_account, rent);
         let instruction_context = transaction_context.get_next_instruction_context().unwrap();

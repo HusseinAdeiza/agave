@@ -1,19 +1,25 @@
 //! Information about stake and voter rewards based on stake state.
-
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
 use {
     self::points::{
         CalculatedStakePoints, CalculationEnvironment, DelegatedVoteState,
         InflationPointCalculationEvent, SkippedReason, calculate_stake_points_and_credits,
     },
-    solana_clock::Epoch,
-    solana_instruction::error::InstructionError,
+    crate::alpenglow_epoch_type::AlpenglowEpochType,
+    solana_instruction_error::InstructionError,
     solana_stake_interface::{
         error::StakeError,
-        state::{Delegation, Stake},
+        state::{Stake, StakeActivationStatus},
     },
 };
 
 pub mod points;
+
+/// Maximum commission, in basis points.
+pub(crate) const MAX_BPS: u16 = 10_000;
+/// Maximum commission, in basis points, expressed as a u128
+pub(crate) const MAX_BPS_U128: u128 = MAX_BPS as u128;
 
 #[derive(Debug, PartialEq, Eq)]
 struct CalculatedStakeRewards {
@@ -34,6 +40,7 @@ pub(crate) fn redeem_rewards<'a>(
     vote_state: DelegatedVoteState,
     calculation_environment: CalculationEnvironment<'a>,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    ag_epoch_type: &AlpenglowEpochType,
     current_lamports: u64,
     minimum_lamports: u64,
 ) -> Result<(u64, u64, Stake), InstructionError> {
@@ -42,29 +49,21 @@ pub(crate) fn redeem_rewards<'a>(
             rewarded_epoch,
             stake_history,
             new_rate_activation_epoch,
-            commission_rate_in_basis_points,
             ..
         } = calculation_environment;
+        let effective_stake_at_rewarded_epoch =
+            stake.stake_v2(rewarded_epoch, stake_history, new_rate_activation_epoch);
         inflation_point_calc_tracer(
-            &InflationPointCalculationEvent::EffectiveStakeAtRewardedEpoch(stake.stake(
-                rewarded_epoch,
-                stake_history,
-                new_rate_activation_epoch,
-            )),
+            &InflationPointCalculationEvent::EffectiveStakeAtRewardedEpoch(
+                effective_stake_at_rewarded_epoch,
+            ),
         );
         inflation_point_calc_tracer(&InflationPointCalculationEvent::PriorTotalLamports(
             current_lamports,
         ));
-        // Choose which trace to emit based on the `commission_rate_in_basis_points` feature.
-        if commission_rate_in_basis_points {
-            inflation_point_calc_tracer(&InflationPointCalculationEvent::CommissionBps(
-                voter_commission_bps,
-            ));
-        } else {
-            inflation_point_calc_tracer(&InflationPointCalculationEvent::Commission(
-                (voter_commission_bps / 100) as u8,
-            ));
-        }
+        inflation_point_calc_tracer(&InflationPointCalculationEvent::CommissionBps(
+            voter_commission_bps,
+        ));
     }
 
     if let Some((stakers_reward, voters_reward)) = redeem_stake_rewards(
@@ -73,6 +72,7 @@ pub(crate) fn redeem_rewards<'a>(
         vote_state,
         calculation_environment,
         inflation_point_calc_tracer,
+        ag_epoch_type,
         current_lamports,
         minimum_lamports,
     ) {
@@ -88,6 +88,7 @@ fn redeem_stake_rewards<'a>(
     vote_state: DelegatedVoteState,
     calculation_environment: CalculationEnvironment<'a>,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    ag_epoch_type: &AlpenglowEpochType,
     current_lamports: u64,
     minimum_lamports: u64,
 ) -> Option<(u64, u64)> {
@@ -98,14 +99,20 @@ fn redeem_stake_rewards<'a>(
         ));
     }
 
-    let rewarded_epoch = calculation_environment.rewarded_epoch;
-    let adjust_delegations_for_rent = calculation_environment.adjust_delegations_for_rent;
+    let status = stake.delegation.stake_activating_and_deactivating_v2(
+        calculation_environment.rewarded_epoch,
+        calculation_environment.stake_history,
+        calculation_environment.new_rate_activation_epoch,
+    );
+
     let maybe_rewards = calculate_stake_rewards(
         stake,
         voter_commission_bps,
         vote_state,
         calculation_environment,
         inflation_point_calc_tracer.as_ref(),
+        ag_epoch_type,
+        status.clone(),
     )
     .map(|calculated_stake_rewards| {
         if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer {
@@ -122,58 +129,48 @@ fn redeem_stake_rewards<'a>(
     });
 
     let staker_rewards = maybe_rewards.map(|x| x.0).unwrap_or(0);
-    if adjust_delegations_for_rent {
-        let new_delegation_with_rewards = stake.delegation.stake.saturating_add(staker_rewards);
-        let stake_was_adjusted = adjust_delegation_for_rent(
-            &mut stake.delegation,
-            rewarded_epoch,
-            new_delegation_with_rewards,
-            current_lamports.saturating_add(staker_rewards),
-            minimum_lamports,
-        );
-        // If `maybe_rewards.is_some()`, need to drive forward credits, even
-        // if rewards are zero
-        if stake_was_adjusted || maybe_rewards.is_some() {
-            let voter_rewards = maybe_rewards.map(|x| x.1).unwrap_or(0);
-            Some((staker_rewards, voter_rewards))
-        } else {
-            None
-        }
+    let new_delegation_with_rewards = stake.delegation.stake.saturating_add(staker_rewards);
+    let needs_adjustment = delegation_may_need_adjustment(
+        stake.delegation.stake,
+        new_delegation_with_rewards,
+        current_lamports.saturating_add(staker_rewards),
+        minimum_lamports,
+        status,
+    );
+    // If `maybe_rewards.is_some()`, need to drive forward credits, even
+    // if rewards are zero
+    if needs_adjustment || maybe_rewards.is_some() {
+        stake.delegation.stake = new_delegation_with_rewards;
+        let voter_rewards = maybe_rewards.map(|x| x.1).unwrap_or(0);
+        Some((staker_rewards, voter_rewards))
     } else {
-        stake.delegation.stake += staker_rewards;
-        maybe_rewards
+        None
     }
 }
 
-/// Adjusts stake delegation based on Rent sysvar parameters at epoch boundary
+/// Returns `true` if stake delegation needs to be adjusted during distribution
+/// based on Rent sysvar parameters at epoch boundary
 ///
-/// As part of SIMD-0392, if Rent is ever increased, we need to make sure that
-/// lamports are not double-counted for the rent-exempt minimum and the stake
-/// delegation. This function adjusts the delegation in a Stake if needed.
-pub(crate) fn adjust_delegation_for_rent(
-    delegation: &mut Delegation,
-    rewarded_epoch: Epoch,
+/// The actual adjustment happens at distribution, to account for any lamports
+/// credited to the account during partitioned epoch rewards, before the
+/// distribution has occurred.
+pub(crate) fn delegation_may_need_adjustment(
+    current_delegation: u64,
     new_delegation_with_rewards: u64,
     lamports_with_rewards: u64,
     minimum_lamports: u64,
+    status: StakeActivationStatus,
 ) -> bool {
+    if status.effective == 0 && status.activating == 0 {
+        return false;
+    }
+
     let new_delegation = std::cmp::min(
         new_delegation_with_rewards,
         lamports_with_rewards.saturating_sub(minimum_lamports),
     );
 
-    if new_delegation != delegation.stake {
-        delegation.stake = new_delegation;
-        // Deactivate stake if needed. This deactivation is immediate,
-        // unlike a requested deactivation which happens at the next epoch
-        // boundary
-        if new_delegation == 0 {
-            delegation.deactivation_epoch = rewarded_epoch;
-        }
-        true
-    } else {
-        false
-    }
+    new_delegation != current_delegation
 }
 
 /// for a given stake and vote_state, calculate what distributions and what updates should be made
@@ -189,6 +186,8 @@ fn calculate_stake_rewards<'a>(
     vote_state: DelegatedVoteState,
     calculation_environment: CalculationEnvironment<'a>,
     inflation_point_calc_tracer: Option<impl Fn(&InflationPointCalculationEvent)>,
+    ag_epoch_type: &AlpenglowEpochType,
+    status: StakeActivationStatus,
 ) -> Option<CalculatedStakeRewards> {
     let CalculationEnvironment {
         stake_history,
@@ -197,9 +196,11 @@ fn calculate_stake_rewards<'a>(
         rewarded_epoch,
         ..
     } = calculation_environment;
+
     // ensure to run to trigger (optional) inflation_point_calc_tracer
     let CalculatedStakePoints {
-        points,
+        tower_points,
+        ag_points,
         new_credits_observed,
         mut force_credits_update_with_skipped_reward,
     } = calculate_stake_points_and_credits(
@@ -208,6 +209,7 @@ fn calculate_stake_rewards<'a>(
         stake_history,
         inflation_point_calc_tracer.as_ref(),
         new_rate_activation_epoch,
+        ag_epoch_type,
     );
 
     // Drive credits_observed forward unconditionally when rewards are disabled
@@ -225,44 +227,101 @@ fn calculate_stake_rewards<'a>(
         force_credits_update_with_skipped_reward = true;
     }
 
-    if force_credits_update_with_skipped_reward {
-        return Some(CalculatedStakeRewards {
+    // Once alpenglow is active we no longer allow for epochs where rewards are not redeemed.
+    let is_tower_epoch = matches!(ag_epoch_type, AlpenglowEpochType::Tower);
+    let has_activating_or_effective = status.effective != 0 || status.activating != 0;
+    let advance_credits_for_skipped_reward = !is_tower_epoch
+        && has_activating_or_effective
+        && new_credits_observed != stake.credits_observed;
+    let skipped_reward = || {
+        Some(CalculatedStakeRewards {
             staker_rewards: 0,
             voter_rewards: 0,
             new_credits_observed,
-        });
+        })
+    };
+
+    let skip_reward = |reason: SkippedReason| {
+        if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+            inflation_point_calc_tracer(&reason.into());
+        }
+        if advance_credits_for_skipped_reward {
+            skipped_reward()
+        } else {
+            None
+        }
+    };
+
+    if force_credits_update_with_skipped_reward {
+        return skipped_reward();
     }
 
-    if points == 0 {
-        if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
-            inflation_point_calc_tracer(&SkippedReason::ZeroPoints.into());
+    let rewards = match ag_epoch_type {
+        AlpenglowEpochType::Alpenglow { .. } => {
+            if ag_points == 0 {
+                return skip_reward(SkippedReason::ZeroPoints);
+            }
+            // In alpenglow, `points` represents the actual reward that this `stake` earned.
+            ag_points
         }
-        return None;
-    }
-    if point_value.points == 0 {
-        if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
-            inflation_point_calc_tracer(&SkippedReason::ZeroPointValue.into());
+        AlpenglowEpochType::Tower => {
+            if tower_points == 0 {
+                if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                    inflation_point_calc_tracer(&SkippedReason::ZeroPoints.into());
+                }
+                return None;
+            }
+            if point_value.points == 0 {
+                if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
+                    inflation_point_calc_tracer(&SkippedReason::ZeroPointValue.into());
+                }
+                return None;
+            }
+            // In tower, `points` still needs to be scaled by `point_value` to calculate this
+            // `vote_state` earned.
+            // The final unwrap is safe, as points_value.points is guaranteed to be non zero above.
+            tower_points
+                .checked_mul(u128::from(point_value.rewards))
+                .expect("Rewards intermediate calculation should fit within u128")
+                .checked_div(point_value.points)
+                .unwrap()
         }
-        return None;
-    }
-
-    // The final unwrap is safe, as points_value.points is guaranteed to be non zero above.
-    let rewards = points
-        .checked_mul(u128::from(point_value.rewards))
-        .expect("Rewards intermediate calculation should fit within u128")
-        .checked_div(point_value.points)
-        .unwrap();
+        AlpenglowEpochType::MigrationEpoch {
+            num_tower_slots,
+            num_ag_slots,
+            ..
+        } => {
+            if tower_points == 0 && ag_points == 0 {
+                return skip_reward(SkippedReason::ZeroPoints);
+            }
+            if ag_points == 0 && point_value.points == 0 {
+                return skip_reward(SkippedReason::ZeroPointValue);
+            }
+            let total_slots = (num_tower_slots + num_ag_slots) as u128;
+            let tower_points = tower_points
+                .checked_mul(u128::from(point_value.rewards))
+                .expect("Rewards intermediate calculation should fit within u128")
+                .checked_div(point_value.points)
+                .unwrap()
+                .checked_mul(*num_tower_slots as u128)
+                .unwrap()
+                .checked_div(total_slots)
+                .unwrap();
+            tower_points + ag_points
+        }
+    };
 
     let rewards = u64::try_from(rewards).expect("Rewards should fit within u64");
 
     // don't bother trying to split if fractional lamports got truncated
     if rewards == 0 {
-        if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
-            inflation_point_calc_tracer(&SkippedReason::ZeroReward.into());
-        }
-        return None;
+        return skip_reward(SkippedReason::ZeroReward);
     }
-    let (voter_rewards, staker_rewards, is_split) = commission_split(voter_commission_bps, rewards);
+    let (voter_rewards, staker_rewards, is_split) = if is_tower_epoch {
+        commission_split(voter_commission_bps, rewards)
+    } else {
+        commission_split_preserve_lamports(voter_commission_bps, rewards)
+    };
     if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
         inflation_point_calc_tracer(&InflationPointCalculationEvent::SplitRewards(
             rewards,
@@ -272,10 +331,10 @@ fn calculate_stake_rewards<'a>(
         ));
     }
 
-    if (voter_rewards == 0 || staker_rewards == 0) && is_split {
-        // don't collect if we lose a whole lamport somewhere
-        //  is_split means there should be tokens on both sides,
-        //  uncool to move credits_observed if one side didn't get paid
+    if (voter_rewards == 0 || staker_rewards == 0) && is_split && is_tower_epoch {
+        // In Tower, don't collect if we lose a whole lamport somewhere.
+        // is_split means there should be tokens on both sides; don't move
+        // credits_observed if one side didn't get paid.
         if let Some(inflation_point_calc_tracer) = inflation_point_calc_tracer.as_ref() {
             inflation_point_calc_tracer(&SkippedReason::TooEarlyUnfairSplit.into());
         }
@@ -295,9 +354,8 @@ fn calculate_stake_rewards<'a>(
 ///   indicate with false for was_split
 ///
 /// DEVELOPER NOTE:  This function used to be a method on VoteState, but was moved here
+#[cfg_attr(any(test, feature = "dev-context-only-utils"), qualifiers(pub(crate)))]
 fn commission_split(commission_bps: u16, on: u64) -> (u64, u64, bool) {
-    const MAX_BPS: u16 = 10_000;
-    const MAX_BPS_U128: u128 = MAX_BPS as u128;
     match commission_bps.min(MAX_BPS) {
         0 => (0, on, false),
         MAX_BPS => (on, 0, false),
@@ -305,7 +363,7 @@ fn commission_split(commission_bps: u16, on: u64) -> (u64, u64, bool) {
             let on = u128::from(on);
             // Calculate mine and theirs independently and symmetrically instead of
             // using the remainder of the other to treat them strictly equally.
-            // This is also to cancel the rewarding if either of the parties
+            // In Tower, this is also to cancel the rewarding if either of the parties
             // should receive only fractional lamports, resulting in not being rewarded at all.
             // Thus, note that we intentionally discard any residual fractional lamports.
             let mine = on
@@ -326,22 +384,47 @@ fn commission_split(commission_bps: u16, on: u64) -> (u64, u64, bool) {
     }
 }
 
+/// returns commission split as (voter_portion, staker_portion, was_split) tuple,
+/// assigning any fractional-lamport remainder to the voter so no lamports are lost.
+///
+/// This is used only for non-Tower epochs, where small unfair splits no longer defer redemption.
+#[cfg_attr(any(test, feature = "dev-context-only-utils"), qualifiers(pub(crate)))]
+fn commission_split_preserve_lamports(commission_bps: u16, on: u64) -> (u64, u64, bool) {
+    match commission_bps.min(MAX_BPS) {
+        0 => (0, on, false),
+        MAX_BPS => (on, 0, false),
+        split => {
+            let staker_bps = MAX_BPS
+                .checked_sub(split)
+                .expect("commission cannot be greater than MAX_BPS");
+            let staker_rewards = u128::from(on)
+                .checked_mul(u128::from(staker_bps))
+                .expect("multiplication of a u64 and u16 should not overflow")
+                / MAX_BPS_U128;
+            let staker_rewards = staker_rewards as u64;
+            let voter_rewards = on
+                .checked_sub(staker_rewards)
+                .expect("staker rewards cannot exceed total rewards");
+
+            (voter_rewards, staker_rewards, true)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
         self::points::{PointValue, null_tracer},
         super::*,
+        crate::alpenglow_epoch_type::RewardEpochDelegatedStakes,
         proptest::prelude::*,
         solana_clock::Epoch,
         solana_native_token::LAMPORTS_PER_SOL,
         solana_pubkey::Pubkey,
         solana_rent::Rent,
-        solana_stake_interface::{
-            stake_history::StakeHistory,
-            state::{Delegation, StakeStateV2},
-        },
+        solana_stake_history::StakeHistory,
+        solana_stake_interface::state::{Delegation, StakeStateV2},
         solana_vote_program::vote_state::{VoteStateV4, handler::VoteStateHandler},
-        test_case::test_case,
     };
 
     fn new_stake(
@@ -356,9 +439,58 @@ mod tests {
         }
     }
 
-    #[test_case(true; "adjust_delegations_for_rent")]
-    #[test_case(false; "no_adjust_delegations_for_rent")]
-    fn test_stake_state_redeem_rewards(adjust_delegations_for_rent: bool) {
+    fn get_reward_epoch_delegated_stakes() -> RewardEpochDelegatedStakes {
+        RewardEpochDelegatedStakes {
+            epoch: 1,
+            delegated_stakes: [(Pubkey::default(), 1_000)].into_iter().collect(),
+        }
+    }
+
+    /// Returns an instance of `AlpenglowEpochType`, total stake, and first AG epoch.
+    fn get_ag_epoch_type<'a>(
+        reward_epoch_delegated_stakes: &'a RewardEpochDelegatedStakes,
+    ) -> (AlpenglowEpochType<'a>, u64, Epoch) {
+        let total_stake = reward_epoch_delegated_stakes
+            .delegated_stakes
+            .values()
+            .sum::<u64>();
+        (
+            AlpenglowEpochType::Alpenglow {
+                migration_epoch: reward_epoch_delegated_stakes.epoch - 1,
+                reward_epoch_delegated_stakes,
+            },
+            total_stake,
+            reward_epoch_delegated_stakes.epoch,
+        )
+    }
+
+    fn make_reward_epoch_delegated_stakes_for_test(
+        vote_state: &VoteStateV4,
+        ag_total_stake_multiplier: u64,
+    ) -> RewardEpochDelegatedStakes {
+        RewardEpochDelegatedStakes {
+            epoch: vote_state
+                .epoch_credits
+                .last()
+                .map(|(epoch, _final_epoch_credits, _initial_epoch_credits)| *epoch)
+                .unwrap_or(1),
+            delegated_stakes: [(Pubkey::default(), ag_total_stake_multiplier)]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn make_ag_epoch_type_for_test<'a>(
+        reward_epoch_delegated_stakes: &'a RewardEpochDelegatedStakes,
+    ) -> AlpenglowEpochType<'a> {
+        AlpenglowEpochType::Alpenglow {
+            migration_epoch: 0,
+            reward_epoch_delegated_stakes,
+        }
+    }
+
+    #[test]
+    fn test_stake_state_redeem_rewards() {
         let mut vote_state = VoteStateHandler::new_v4(VoteStateV4::default());
         // assume stake.stake() is right
         // bootstrap means fully-vested stake at epoch 0
@@ -371,18 +503,26 @@ mod tests {
         );
         let stake_history = &StakeHistory::default();
         let new_rate_activation_epoch = None;
-        let commission_rate_in_basis_points = true;
 
+        let reward_epoch_delegated_stakes = get_reward_epoch_delegated_stakes();
+        let (_, ag_total_stake_multiplier, _) = get_ag_epoch_type(&reward_epoch_delegated_stakes);
+
+        let inc_credits = |handler: &mut VoteStateHandler, epoch: Epoch, credits: u64| {
+            let (_, _, first_ag_epoch) = get_ag_epoch_type(&reward_epoch_delegated_stakes);
+            handler.increment_credits(epoch + first_ag_epoch, credits * ag_total_stake_multiplier);
+        };
         let mut rent = Rent::default();
         let minimum_balance = rent.minimum_balance(StakeStateV2::size_of());
 
         // Adjust rent down, no impact
-        if adjust_delegations_for_rent {
-            rent.lamports_per_byte /= 2;
-        }
+        rent.lamports_per_byte /= 2;
         let new_minimum_balance = rent.minimum_balance(StakeStateV2::size_of());
 
         // this one can't collect now, credits_observed == vote_state.credits()
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             None,
             redeem_stake_rewards(
@@ -397,20 +537,22 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
                 stake_lamports + minimum_balance,
                 new_minimum_balance,
             )
         );
 
         // put 2 credits in at epoch 0
-        vote_state.increment_credits(0, 1);
-        vote_state.increment_credits(0, 1);
+        inc_credits(&mut vote_state, 0, 2);
 
         // this one should be able to collect exactly 2
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some((stake_lamports * 2, 0)),
             redeem_stake_rewards(
@@ -425,10 +567,9 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
                 stake_lamports + minimum_balance,
                 new_minimum_balance,
             )
@@ -438,7 +579,7 @@ mod tests {
             stake.delegation.stake,
             stake_lamports + (stake_lamports * 2)
         );
-        assert_eq!(stake.credits_observed, 2);
+        assert_eq!(stake.credits_observed, 2 * ag_total_stake_multiplier);
     }
 
     #[test]
@@ -450,10 +591,19 @@ mod tests {
 
         let stake_history = &StakeHistory::default();
         let new_rate_activation_epoch = None;
-        let commission_rate_in_basis_points = true;
-        let adjust_delegations_for_rent = true;
 
+        let reward_epoch_delegated_stakes = get_reward_epoch_delegated_stakes();
+        let (_, ag_total_stake_multiplier, _) = get_ag_epoch_type(&reward_epoch_delegated_stakes);
+
+        let inc_credits = |handler: &mut VoteStateHandler, epoch: Epoch, credits: u64| {
+            let (_, _, first_ag_epoch) = get_ag_epoch_type(&reward_epoch_delegated_stakes);
+            handler.increment_credits(epoch + first_ag_epoch, credits * ag_total_stake_multiplier);
+        };
         // this one can't collect now, credits_observed == vote_state.credits()
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             None,
             calculate_stake_rewards(
@@ -468,23 +618,26 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
         // put 2 credits in at epoch 0
-        vote_state.increment_credits(0, 1);
-        vote_state.increment_credits(0, 1);
+        inc_credits(&mut vote_state, 0, 2);
 
         // this one should be able to collect exactly 2
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake * 2,
                 voter_rewards: 0,
-                new_credits_observed: 2,
+                new_credits_observed: 2 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -498,20 +651,24 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
-        stake.credits_observed = 1;
+        stake.credits_observed = ag_total_stake_multiplier;
         // this one should be able to collect exactly 1 (already observed one)
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake,
                 voter_rewards: 0,
-                new_credits_observed: 2,
+                new_credits_observed: 2 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -525,23 +682,27 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
         // put 1 credit in epoch 1
-        vote_state.increment_credits(1, 1);
+        inc_credits(&mut vote_state, 1, 1);
 
-        stake.credits_observed = 2;
+        stake.credits_observed = 2 * ag_total_stake_multiplier;
         // this one should be able to collect the one just added
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake,
                 voter_rewards: 0,
-                new_credits_observed: 3,
+                new_credits_observed: 3 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -555,21 +716,26 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
         // put 1 credit in epoch 2
-        vote_state.increment_credits(2, 1);
-        // this one should be able to collect 2 now
+        inc_credits(&mut vote_state, 2, 1);
+        // AG only considers the latest epoch credit entry.
+        let expected_staker_rewards = stake.delegation.stake;
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
-                staker_rewards: stake.delegation.stake * 2,
+                staker_rewards: expected_staker_rewards,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -583,23 +749,25 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
         stake.credits_observed = 0;
-        // this one should be able to collect everything from t=0 a warmed up stake of 2
-        // (2 credits at stake of 1) + (1 credit at a stake of 2)
+        // Full AG only considers the latest epoch credit entry.
+        let expected_staker_rewards = stake.delegation.stake;
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
-                staker_rewards: stake.delegation.stake * 2 // epoch 0
-                    + stake.delegation.stake // epoch 1
-                    + stake.delegation.stake, // epoch 2
+                staker_rewards: expected_staker_rewards,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -613,18 +781,29 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
-        // same as above, but is a really small commission out of 32 bits,
-        //  verify that None comes back on small redemptions where no one gets paid
+        let small_redemption_result = Some(CalculatedStakeRewards {
+            staker_rewards: 0,
+            voter_rewards: 1,
+            new_credits_observed: 4 * ag_total_stake_multiplier,
+        });
+
+        // same as above, but is a small enough reward that both sides round to
+        // zero after the Tower commission split. Tower defers; AG assigns the
+        // remainder to the voter and advances credits.
         vote_state.set_inflation_rewards_commission_bps(100);
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
-            None, // would be Some((0, 2 * 1 + 1 * 2, 4)),
+            small_redemption_result,
             calculate_stake_rewards(
                 &stake,
                 vote_state.as_ref_v4().inflation_rewards_commission_bps,
@@ -637,15 +816,19 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
         vote_state.set_inflation_rewards_commission_bps(9900);
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
-            None, // would be Some((0, 2 * 1 + 1 * 2, 4)),
+            small_redemption_result,
             calculate_stake_rewards(
                 &stake,
                 vote_state.as_ref_v4().inflation_rewards_commission_bps,
@@ -658,21 +841,25 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes,),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
         // now one with inflation disabled. no one gets paid, but we still need
         // to advance the stake state's credits_observed field to prevent back-
         // paying rewards when inflation is turned on.
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: 0,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -686,21 +873,25 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes,),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
         // credits_observed remains at previous level when vote_state credits are
         // not advancing and inflation is disabled
-        stake.credits_observed = 4;
+        stake.credits_observed = 4 * ag_total_stake_multiplier;
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: 0,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -714,17 +905,22 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes,),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: 4,
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
                 force_credits_update_with_skipped_reward: false,
             },
             calculate_stake_points_and_credits(
@@ -732,18 +928,24 @@ mod tests {
                 DelegatedVoteState::from(vote_state.as_ref_v4()),
                 &StakeHistory::default(),
                 null_tracer(),
-                None
+                None,
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes,),
             )
         );
 
         // credits_observed is auto-rewound when vote_state credits are assumed to have been
         // recreated
-        stake.credits_observed = 1000;
+        stake.credits_observed = 1000 * ag_total_stake_multiplier;
         // this is new behavior 1; return the post-recreation rewound credits from the vote account
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: 4,
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
                 force_credits_update_with_skipped_reward: true,
             },
             calculate_stake_points_and_credits(
@@ -751,15 +953,21 @@ mod tests {
                 DelegatedVoteState::from(vote_state.as_ref_v4()),
                 &StakeHistory::default(),
                 null_tracer(),
-                None
+                None,
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes,),
             )
         );
         // this is new behavior 2; don't hint when credits both from stake and vote are identical
-        stake.credits_observed = 4;
+        stake.credits_observed = 4 * ag_total_stake_multiplier;
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             CalculatedStakePoints {
-                points: 0,
-                new_credits_observed: 4,
+                tower_points: 0,
+                ag_points: 0,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
                 force_credits_update_with_skipped_reward: false,
             },
             calculate_stake_points_and_credits(
@@ -767,19 +975,24 @@ mod tests {
                 DelegatedVoteState::from(vote_state.as_ref_v4()),
                 &StakeHistory::default(),
                 null_tracer(),
-                None
+                None,
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes,),
             )
         );
 
         // get rewards and credits observed when not the activation epoch
         vote_state.set_inflation_rewards_commission_bps(0);
-        stake.credits_observed = 3;
+        stake.credits_observed = 3 * ag_total_stake_multiplier;
         stake.delegation.activation_epoch = 1;
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: stake.delegation.stake, // epoch 2
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -793,22 +1006,26 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes,),
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
 
         // credits_observed is moved forward for the stake's activation epoch,
         // and no rewards are perceived
         stake.delegation.activation_epoch = 2;
-        stake.credits_observed = 3;
+        stake.credits_observed = 3 * ag_total_stake_multiplier;
+        let reward_epoch_delegated_stakes = make_reward_epoch_delegated_stakes_for_test(
+            vote_state.as_ref_v4(),
+            ag_total_stake_multiplier,
+        );
         assert_eq!(
             Some(CalculatedStakeRewards {
                 staker_rewards: 0,
                 voter_rewards: 0,
-                new_credits_observed: 4,
+                new_credits_observed: 4 * ag_total_stake_multiplier,
             }),
             calculate_stake_rewards(
                 &stake,
@@ -822,305 +1039,11 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &make_ag_epoch_type_for_test(&reward_epoch_delegated_stakes),
+                StakeActivationStatus::with_effective_and_activating(0, stake.delegation.stake),
             )
-        );
-    }
-
-    fn check_rent_adjusted_stake_delegation(
-        rewarded_epoch: u64,
-        mut pre_stake: Stake,
-        pre_lamports: u64,
-        new_minimum_balance: u64,
-        total_rewards: u64,
-        post_stake: Stake,
-        staker_rewards: Option<u64>,
-    ) {
-        let mut vote_state = VoteStateHandler::new_v4(VoteStateV4::default());
-        // put 1 credit to create rewards
-        vote_state.increment_credits(rewarded_epoch, 1);
-        let stake_history: &StakeHistory = &StakeHistory::default();
-        let new_rate_activation_epoch = None;
-        let commission_rate_in_basis_points = true;
-        let adjust_delegations_for_rent = true;
-
-        let maybe_rewards = redeem_stake_rewards(
-            &mut pre_stake,
-            vote_state.as_ref_v4().inflation_rewards_commission_bps,
-            DelegatedVoteState::from(vote_state.as_ref_v4()),
-            CalculationEnvironment {
-                rewarded_epoch,
-                point_value: &PointValue {
-                    rewards: total_rewards,
-                    points: 1,
-                },
-                stake_history,
-                new_rate_activation_epoch,
-                commission_rate_in_basis_points,
-                adjust_delegations_for_rent,
-            },
-            null_tracer(),
-            pre_lamports,
-            new_minimum_balance,
-        );
-        assert_eq!(pre_stake, post_stake);
-        assert_eq!(maybe_rewards.map(|x| x.0), staker_rewards)
-    }
-
-    #[test]
-    fn rent_adjusted_stake_delegation_calculations() {
-        let old_minimum_balance = 8;
-        let new_minimum_balance = 9;
-        let rewarded_epoch = 1;
-
-        // No rewards at all -> updated (all stakes get driven forward if
-        // inflation is disabled)
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            new_minimum_balance + 1,
-            new_minimum_balance,
-            0,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            Some(0),
-        );
-
-        // Stake receives no rewards or delegation adjustment -> no update
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            new_minimum_balance + 1,
-            new_minimum_balance,
-            1,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            None,
-        );
-
-        // Already destaked -> no update
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 0,
-                    deactivation_epoch: 0,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            old_minimum_balance - 1,
-            new_minimum_balance,
-            1,
-            Stake {
-                delegation: Delegation {
-                    stake: 0,
-                    deactivation_epoch: 0,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            None,
-        );
-
-        // Staked, already below minimum, go further below minimum
-        // -> destaked, still one lamport of rewards though
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            old_minimum_balance - 1,
-            new_minimum_balance,
-            1,
-            Stake {
-                delegation: Delegation {
-                    stake: 0,
-                    deactivation_epoch: rewarded_epoch,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            Some(1),
-        );
-
-        // Delegation hits exactly 0 -> destaked, no rewards
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            new_minimum_balance,
-            new_minimum_balance,
-            0,
-            Stake {
-                delegation: Delegation {
-                    stake: 0,
-                    deactivation_epoch: rewarded_epoch,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            Some(0),
-        );
-
-        // Delegation decreases to 1 -> still staked
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 2,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            new_minimum_balance + 1,
-            new_minimum_balance,
-            0,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            Some(0),
-        );
-
-        // Rewards partially cover minimum balance change
-        // -> decrease stake
-        // This case is confusing because it pays out 2 lamports in rewards,
-        // so we adjust minimum up so that even with 2 lamports in rewards, the
-        // delegation goes down.
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 2,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            new_minimum_balance,
-            new_minimum_balance + 1,
-            1,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            Some(2),
-        );
-
-        // Rewards cover minimum balance change -> no change in stake
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            new_minimum_balance,
-            new_minimum_balance,
-            1,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            Some(1),
-        );
-
-        // Well above new minimum balance -> delegation change capped to rewards
-        check_rent_adjusted_stake_delegation(
-            rewarded_epoch,
-            Stake {
-                delegation: Delegation {
-                    stake: 1,
-                    ..Default::default()
-                },
-                credits_observed: 0,
-            },
-            new_minimum_balance + 2,
-            new_minimum_balance,
-            1,
-            Stake {
-                delegation: Delegation {
-                    stake: 2,
-                    ..Default::default()
-                },
-                credits_observed: 1,
-            },
-            Some(1),
-        );
-    }
-
-    #[test_case(u64::MAX, 1_000, u64::MAX => panics "Rewards intermediate calculation should fit within u128")]
-    #[test_case(1, u64::MAX, u64::MAX => panics "Rewards should fit within u64")]
-    fn calculate_rewards_tests(stake: u64, rewards: u64, credits: u64) {
-        let mut vote_state = VoteStateHandler::new_v4(VoteStateV4::default());
-
-        let stake = new_stake(stake, &Pubkey::default(), vote_state.as_ref_v4(), u64::MAX);
-
-        vote_state.increment_credits(0, credits);
-
-        let stake_history = &StakeHistory::default();
-        let new_rate_activation_epoch = None;
-        let commission_rate_in_basis_points = true;
-        let adjust_delegations_for_rent = true;
-
-        calculate_stake_rewards(
-            &stake,
-            vote_state.as_ref_v4().inflation_rewards_commission_bps,
-            DelegatedVoteState::from(vote_state.as_ref_v4()),
-            CalculationEnvironment {
-                rewarded_epoch: 0,
-                point_value: &PointValue { rewards, points: 1 },
-                stake_history,
-                new_rate_activation_epoch,
-                commission_rate_in_basis_points,
-                adjust_delegations_for_rent,
-            },
-            null_tracer(),
         );
     }
 
@@ -1138,8 +1061,8 @@ mod tests {
         );
         let stake_history = &StakeHistory::default();
         let new_rate_activation_epoch = None;
-        let commission_rate_in_basis_points = true;
-        let adjust_delegations_for_rent = true;
+        let reward_epoch_delegated_stakes = get_reward_epoch_delegated_stakes();
+        let (ag_stake_state, _, _) = get_ag_epoch_type(&reward_epoch_delegated_stakes);
 
         // this one can't collect now, credits_observed == vote_state.credits()
         assert_eq!(
@@ -1156,120 +1079,142 @@ mod tests {
                     },
                     stake_history,
                     new_rate_activation_epoch,
-                    commission_rate_in_basis_points,
-                    adjust_delegations_for_rent,
                 },
                 null_tracer(),
+                &ag_stake_state,
+                StakeActivationStatus::with_effective(stake.delegation.stake),
             )
         );
     }
 
     #[test]
-    fn test_commission_split_bps() {
+    fn test_alpenglow_excludes_inactive_stake() {
+        let reward_epoch_delegated_stakes = get_reward_epoch_delegated_stakes();
+        let (ag_epoch_type, _, first_ag_epoch) = get_ag_epoch_type(&reward_epoch_delegated_stakes);
+        let vote_state = VoteStateV4 {
+            epoch_credits: vec![(first_ag_epoch, 4, 0)],
+            ..VoteStateV4::default()
+        };
+        let stake = Stake {
+            delegation: Delegation {
+                voter_pubkey: Pubkey::default(),
+                stake: 1,
+                activation_epoch: 0,
+                deactivation_epoch: 0,
+                ..Delegation::default()
+            },
+            credits_observed: 0,
+        };
+        let point_value = PointValue {
+            rewards: 1_000_000_000,
+            points: 1,
+        };
+        let stake_history = StakeHistory::default();
+
+        // inactive stake does not have credits_observed advanced
+        assert_eq!(
+            None,
+            calculate_stake_rewards(
+                &stake,
+                vote_state.inflation_rewards_commission_bps,
+                DelegatedVoteState::from(&vote_state),
+                CalculationEnvironment {
+                    rewarded_epoch: first_ag_epoch,
+                    point_value: &point_value,
+                    stake_history: &stake_history,
+                    new_rate_activation_epoch: None,
+                },
+                null_tracer(),
+                &ag_epoch_type,
+                StakeActivationStatus::default(),
+            )
+        );
+    }
+
+    #[test]
+    fn test_commission_split_preserve_lamports_bps() {
         // 0% commission
-        assert_eq!(commission_split(0, 1), (0, 1, false));
-        assert_eq!(commission_split(0, 10), (0, 10, false));
-        assert_eq!(commission_split(0, 100), (0, 100, false));
-        assert_eq!(commission_split(0, 1_000), (0, 1_000, false));
-        assert_eq!(commission_split(0, u64::MAX), (0, u64::MAX, false));
+        assert_eq!(commission_split_preserve_lamports(0, 1), (0, 1, false));
+        assert_eq!(commission_split_preserve_lamports(0, 10), (0, 10, false));
+        assert_eq!(commission_split_preserve_lamports(0, 100), (0, 100, false));
+        assert_eq!(
+            commission_split_preserve_lamports(0, u64::MAX),
+            (0, u64::MAX, false)
+        );
 
         // 100% commission (10,000 bps)
-        assert_eq!(commission_split(10_000, 1), (1, 0, false));
-        assert_eq!(commission_split(10_000, 10), (10, 0, false));
-        assert_eq!(commission_split(10_000, 100), (100, 0, false));
-        assert_eq!(commission_split(10_000, 1_000), (1_000, 0, false));
-        assert_eq!(commission_split(10_000, u64::MAX), (u64::MAX, 0, false));
+        assert_eq!(commission_split_preserve_lamports(10_000, 1), (1, 0, false));
+        assert_eq!(
+            commission_split_preserve_lamports(10_000, 10),
+            (10, 0, false)
+        );
+        assert_eq!(
+            commission_split_preserve_lamports(10_000, 100),
+            (100, 0, false)
+        );
+        assert_eq!(
+            commission_split_preserve_lamports(10_000, u64::MAX),
+            (u64::MAX, 0, false)
+        );
 
         // Values > 10,000 bps are capped at 100%
-        assert_eq!(commission_split(u16::MAX, 1), (1, 0, false));
-        assert_eq!(commission_split(u16::MAX, 10), (10, 0, false));
-        assert_eq!(commission_split(u16::MAX, 100), (100, 0, false));
-        assert_eq!(commission_split(u16::MAX, 1_000), (1_000, 0, false));
-        assert_eq!(commission_split(u16::MAX, u64::MAX), (u64::MAX, 0, false));
-
-        // 99% commission (9,900 bps)
-        assert_eq!(commission_split(9_900, 1), (0, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(9_900, 10), (9, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(9_900, 100), (99, 1, true));
-        assert_eq!(commission_split(9_900, 1_000), (990, 10, true));
         assert_eq!(
-            commission_split(9_900, u64::MAX),
-            (
-                (u64::MAX as u128 * 9_900 / 10_000) as u64,
-                (u64::MAX as u128 * 100 / 10_000) as u64,
-                true
-            )
-        ); // 1-lamport truncation
-
-        // 99.99% commission (9,999 bps)
-        assert_eq!(commission_split(9_999, 1), (0, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(9_999, 10), (9, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(9_999, 100), (99, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(9_999, 1_000), (999, 0, true)); // 1-lamport truncation
+            commission_split_preserve_lamports(u16::MAX, 1),
+            (1, 0, false)
+        );
         assert_eq!(
-            commission_split(9_999, u64::MAX),
-            (
-                (u64::MAX as u128 * 9_999 / 10_000) as u64,
-                (u64::MAX as u128 / 10_000) as u64,
-                true
-            )
-        ); // 1-lamport truncation
+            commission_split_preserve_lamports(u16::MAX, u64::MAX),
+            (u64::MAX, 0, false)
+        );
 
-        // 1% commission (100 bps)
-        assert_eq!(commission_split(100, 1), (0, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(100, 10), (0, 9, true)); // 1-lamport truncation
-        assert_eq!(commission_split(100, 100), (1, 99, true));
-        assert_eq!(commission_split(100, 1_000), (10, 990, true));
+        // Remainder lamports go to the voter.
+        assert_eq!(commission_split_preserve_lamports(9_900, 1), (1, 0, true));
+        assert_eq!(commission_split_preserve_lamports(9_900, 10), (10, 0, true));
         assert_eq!(
-            commission_split(100, u64::MAX),
-            (
-                (u64::MAX as u128 * 100 / 10_000) as u64,
-                (u64::MAX as u128 * 9_900 / 10_000) as u64,
-                true
-            )
-        ); // 1-lamport truncation
+            commission_split_preserve_lamports(9_900, 100),
+            (99, 1, true)
+        );
+        assert_eq!(
+            commission_split_preserve_lamports(9_900, 1_000),
+            (990, 10, true)
+        );
 
-        // 50% commission (5,000 bps)
-        assert_eq!(commission_split(5_000, 1), (0, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(5_000, 10), (5, 5, true));
-        assert_eq!(commission_split(5_000, 100), (50, 50, true));
-        assert_eq!(commission_split(5_000, 1_000), (500, 500, true));
+        assert_eq!(commission_split_preserve_lamports(100, 1), (1, 0, true));
+        assert_eq!(commission_split_preserve_lamports(100, 10), (1, 9, true));
+        assert_eq!(commission_split_preserve_lamports(100, 100), (1, 99, true));
         assert_eq!(
-            commission_split(5_000, u64::MAX),
-            (
-                (u64::MAX as u128 * 5_000 / 10_000) as u64,
-                (u64::MAX as u128 * 5_000 / 10_000) as u64,
-                true
-            )
-        ); // 1-lamport truncation
+            commission_split_preserve_lamports(100, 1_000),
+            (10, 990, true)
+        );
 
-        // 12.34% commission (1,234 bps)
-        assert_eq!(commission_split(1_234, 1), (0, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(1_234, 10), (1, 8, true)); // 1-lamport truncation
-        assert_eq!(commission_split(1_234, 1_000), (123, 876, true)); // 1-lamport truncation
-        assert_eq!(commission_split(1_234, 10_000), (1_234, 8_766, true));
+        assert_eq!(commission_split_preserve_lamports(5_000, 1), (1, 0, true));
+        assert_eq!(commission_split_preserve_lamports(5_000, 10), (5, 5, true));
         assert_eq!(
-            commission_split(1_234, u64::MAX),
-            (
-                (u64::MAX as u128 * 1_234 / 10_000) as u64,
-                (u64::MAX as u128 * 8_766 / 10_000) as u64,
-                true
-            )
-        ); // 1-lamport truncation
+            commission_split_preserve_lamports(5_000, 100),
+            (50, 50, true)
+        );
 
-        // 33.33% commission (3,333 bps)
-        assert_eq!(commission_split(3_333, 1), (0, 0, true)); // 1-lamport truncation
-        assert_eq!(commission_split(3_333, 10), (3, 6, true)); // 1-lamport truncation
-        assert_eq!(commission_split(3_333, 1_000), (333, 666, true)); // 1-lamport truncation
-        assert_eq!(commission_split(3_333, 10_000), (3_333, 6_667, true));
+        assert_eq!(commission_split_preserve_lamports(1_234, 1), (1, 0, true));
+        assert_eq!(commission_split_preserve_lamports(1_234, 10), (2, 8, true));
         assert_eq!(
-            commission_split(3_333, u64::MAX),
-            (
-                (u64::MAX as u128 * 3_333 / 10_000) as u64,
-                (u64::MAX as u128 * 6_667 / 10_000) as u64,
-                true
-            )
-        ); // 1-lamport truncation
+            commission_split_preserve_lamports(1_234, 1_000),
+            (124, 876, true)
+        );
+        assert_eq!(
+            commission_split_preserve_lamports(1_234, 10_000),
+            (1_234, 8_766, true)
+        );
+
+        assert_eq!(commission_split_preserve_lamports(3_333, 1), (1, 0, true));
+        assert_eq!(commission_split_preserve_lamports(3_333, 10), (4, 6, true));
+        assert_eq!(
+            commission_split_preserve_lamports(3_333, 1_000),
+            (334, 666, true)
+        );
+        assert_eq!(
+            commission_split_preserve_lamports(3_333, 10_000),
+            (3_333, 6_667, true)
+        );
     }
 
     proptest! {
@@ -1278,15 +1223,13 @@ mod tests {
             commission_bps in 0..=u16::MAX,
             rewards in 0..=u64::MAX,
         ) {
-            let (voter, staker, was_split) = commission_split(commission_bps, rewards);
+            let (voter, staker, was_split) =
+                commission_split_preserve_lamports(commission_bps, rewards);
 
-            // Invariant 1: No overflow — voter + staker never exceeds rewards.
-            prop_assert!(voter + staker <= rewards);
+            // Invariant 1: The full reward amount is assigned.
+            prop_assert_eq!(voter + staker, rewards);
 
-            // Invariant 2: At most 1 lamport lost to truncation.
-            prop_assert!(rewards - voter - staker <= 1);
-
-            // Invariant 3: was_split is false only at the 0% and 100% boundaries.
+            // Invariant 2: was_split is false only at the 0% and 100% boundaries.
             let effective_bps = commission_bps.min(10_000);
             if effective_bps == 0 || effective_bps == 10_000 {
                 prop_assert!(!was_split);
@@ -1294,41 +1237,39 @@ mod tests {
                 prop_assert!(was_split);
             }
 
-            // Invariant 4: Boundary — 0% commission gives everything to staker.
+            // Invariant 3: Boundary - 0% commission gives everything to staker.
             if effective_bps == 0 {
                 prop_assert_eq!(voter, 0);
                 prop_assert_eq!(staker, rewards);
             }
 
-            // Invariant 5: Boundary — 100% commission gives everything to voter.
+            // Invariant 4: Boundary - 100% commission gives everything to voter.
             if effective_bps == 10_000 {
                 prop_assert_eq!(voter, rewards);
                 prop_assert_eq!(staker, 0);
             }
 
-            // Invariant 6: Clamping — values above 10,000 bps behave as 10,000.
+            // Invariant 5: Clamping - values above 10,000 bps behave as 10,000.
             if commission_bps > 10_000 {
                 let (clamped_voter, clamped_staker, clamped_ws) =
-                    commission_split(10_000, rewards);
+                    commission_split_preserve_lamports(10_000, rewards);
                 prop_assert_eq!(voter, clamped_voter);
                 prop_assert_eq!(staker, clamped_staker);
                 prop_assert_eq!(was_split, clamped_ws);
             }
 
-            // Invariant 7: Monotonicity — higher commission means voter >= what
-            // they'd get with a lower commission (for the same rewards).
+            // Invariant 6: Higher commission does not decrease the voter amount.
             if commission_bps > 0 {
                 let lower_bps = commission_bps - 1;
-                let (lower_voter, _, _) = commission_split(lower_bps, rewards);
+                let (lower_voter, _, _) = commission_split_preserve_lamports(lower_bps, rewards);
                 prop_assert!(voter >= lower_voter);
             }
 
-            // Invariant 8: Exact split when bps divides evenly.
-            // voter == rewards * effective_bps / 10_000 (using u128 math).
-            let expected_voter =
-                (u128::from(rewards) * u128::from(effective_bps) / 10_000) as u64;
+            // Invariant 7: The staker side is floored, and the voter gets the remainder.
+            let staker_bps = 10_000 - effective_bps;
             let expected_staker =
-                (u128::from(rewards) * u128::from(10_000 - effective_bps) / 10_000) as u64;
+                (u128::from(rewards) * u128::from(staker_bps) / 10_000) as u64;
+            let expected_voter = rewards - expected_staker;
             prop_assert_eq!(voter, expected_voter);
             prop_assert_eq!(staker, expected_staker);
         }

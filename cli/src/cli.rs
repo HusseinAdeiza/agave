@@ -13,7 +13,9 @@ use {
     },
     solana_clock::{Epoch, Slot},
     solana_commitment_config::CommitmentConfig,
-    solana_instruction::error::InstructionError,
+    solana_hash::Hash,
+    solana_instruction_error::InstructionError,
+    solana_message::VersionedMessage,
     solana_offchain_message::OffchainMessage,
     solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
@@ -28,7 +30,7 @@ use {
     solana_stake_interface::{instruction::LockupArgs, state::Lockup},
     solana_transaction::versioned::VersionedTransaction,
     solana_transaction_error::TransactionError,
-    solana_vote_program::vote_state::VoteAuthorize,
+    solana_vote_program::{vote_instruction::CommissionKind, vote_state::VoteAuthorize},
     std::{
         collections::HashMap, error, io::stdout, rc::Rc, str::FromStr, sync::Arc, time::Duration,
     },
@@ -38,6 +40,21 @@ use {
 pub const DEFAULT_RPC_TIMEOUT_SECONDS: &str = "30";
 pub const DEFAULT_CONFIRM_TX_TIMEOUT_SECONDS: &str = "5";
 const CHECKED: bool = true;
+
+/// Sign a message, allowing missing signatures only for offline sign-only output.
+pub(crate) fn message_into_signed_transaction(
+    message: VersionedMessage,
+    signers: &[&dyn Signer],
+    blockhash: Hash,
+    sign_only: bool,
+) -> Result<VersionedTransaction, SignerError> {
+    let mut transaction = VersionedTransaction::new_unsigned(message);
+    transaction.try_partial_sign(signers, blockhash)?;
+    if !sign_only && !transaction.is_signed() {
+        return Err(SignerError::NotEnoughSigners);
+    }
+    Ok(transaction)
+}
 
 #[derive(Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -80,6 +97,7 @@ pub enum CliCommand {
     },
     LeaderSchedule {
         epoch: Option<Epoch>,
+        key_by_vote_account: bool,
     },
     LiveSlots,
     Logs {
@@ -337,6 +355,7 @@ pub enum CliCommand {
         destination_account_pubkey: Pubkey,
         withdraw_authority: SignerIndex,
         withdraw_amount: SpendAmount,
+        allow_vat_withdrawal: bool,
         sign_only: bool,
         dump_transaction_message: bool,
         blockhash_query: BlockhashQuery,
@@ -386,6 +405,34 @@ pub enum CliCommand {
     VoteUpdateCommission {
         vote_account_pubkey: Pubkey,
         commission: u8,
+        withdraw_authority: SignerIndex,
+        sign_only: bool,
+        dump_transaction_message: bool,
+        blockhash_query: BlockhashQuery,
+        nonce_account: Option<Pubkey>,
+        nonce_authority: SignerIndex,
+        memo: Option<String>,
+        fee_payer: SignerIndex,
+        compute_unit_price: Option<u64>,
+    },
+    VoteUpdateCommissionBps {
+        vote_account_pubkey: Pubkey,
+        commission_kind: CommissionKind,
+        commission_bps: u16,
+        withdraw_authority: SignerIndex,
+        sign_only: bool,
+        dump_transaction_message: bool,
+        blockhash_query: BlockhashQuery,
+        nonce_account: Option<Pubkey>,
+        nonce_authority: SignerIndex,
+        memo: Option<String>,
+        fee_payer: SignerIndex,
+        compute_unit_price: Option<u64>,
+    },
+    VoteUpdateCommissionCollector {
+        vote_account_pubkey: Pubkey,
+        commission_kind: CommissionKind,
+        new_collector: Pubkey,
         withdraw_authority: SignerIndex,
         sign_only: bool,
         dump_transaction_message: bool,
@@ -449,6 +496,7 @@ pub enum CliCommand {
         signature: Signature,
         message: OffchainMessage,
     },
+    GetAgGenesisInfo,
 }
 
 #[derive(Debug, PartialEq)]
@@ -490,6 +538,8 @@ pub enum CliError {
     KeypairFileNotFound(String),
     #[error("Invalid signature")]
     InvalidSignature,
+    #[error("Invalid alpenglow genesis cert")]
+    InvalidAgGenesisCert,
 }
 
 impl From<Box<dyn error::Error>> for CliError {
@@ -617,6 +667,7 @@ pub fn parse_command(
         }
         ("epoch", Some(matches)) => parse_get_epoch(matches),
         ("epoch-info", Some(matches)) => parse_get_epoch_info(matches),
+        ("alpenglow-genesis-info", Some(matches)) => parse_get_ag_genesis_info(matches),
         ("feature", Some(matches)) => {
             parse_feature_subcommand(matches, default_signer, wallet_manager)
         }
@@ -741,6 +792,12 @@ pub fn parse_command(
         ("vote-update-commission", Some(matches)) => {
             parse_vote_update_commission(matches, default_signer, wallet_manager)
         }
+        ("vote-update-commission-bps", Some(matches)) => {
+            parse_vote_update_commission_bps(matches, default_signer, wallet_manager)
+        }
+        ("vote-update-commission-collector", Some(matches)) => {
+            parse_vote_update_commission_collector(matches, default_signer, wallet_manager)
+        }
         ("vote-authorize-voter", Some(matches)) => parse_vote_authorize(
             matches,
             default_signer,
@@ -826,16 +883,16 @@ pub type ProcessResult = Result<String, Box<dyn std::error::Error>>;
 
 pub async fn process_command(config: &CliConfig<'_>) -> ProcessResult {
     if config.verbose && config.output_format == OutputFormat::DisplayVerbose {
-        println_name_value("RPC URL:", &config.json_rpc_url);
-        println_name_value("Default Signer Path:", &config.keypair_path);
+        println_name_value("RPC URL:", &config.json_rpc_url)?;
+        println_name_value("Default Signer Path:", &config.keypair_path)?;
         if config.keypair_path.starts_with("usb://") {
             let pubkey = config
                 .pubkey()
                 .map(|pubkey| format!("{pubkey:?}"))
                 .unwrap_or_else(|_| "Unavailable".to_string());
-            println_name_value("Pubkey:", &pubkey);
+            println_name_value("Pubkey:", &pubkey)?;
         }
-        println_name_value("Commitment:", &config.commitment.commitment.to_string());
+        println_name_value("Commitment:", &config.commitment.commitment.to_string())?;
     }
 
     let rpc_client = if let Some(rpc_client) = config.rpc_client.as_ref() {
@@ -909,9 +966,10 @@ pub async fn process_command(config: &CliConfig<'_>) -> ProcessResult {
         CliCommand::Inflation(inflation_subcommand) => {
             process_inflation_subcommand(&rpc_client, config, inflation_subcommand).await
         }
-        CliCommand::LeaderSchedule { epoch } => {
-            process_leader_schedule(&rpc_client, config, *epoch).await
-        }
+        CliCommand::LeaderSchedule {
+            epoch,
+            key_by_vote_account,
+        } => process_leader_schedule(&rpc_client, config, *epoch, *key_by_vote_account).await,
         CliCommand::LiveSlots => process_live_slots(config),
         CliCommand::Logs { filter } => process_logs(config, filter),
         CliCommand::Rent {
@@ -1501,6 +1559,7 @@ pub async fn process_command(config: &CliConfig<'_>) -> ProcessResult {
             vote_account_pubkey,
             withdraw_authority,
             withdraw_amount,
+            allow_vat_withdrawal,
             destination_account_pubkey,
             sign_only,
             dump_transaction_message,
@@ -1517,6 +1576,7 @@ pub async fn process_command(config: &CliConfig<'_>) -> ProcessResult {
                 vote_account_pubkey,
                 *withdraw_authority,
                 *withdraw_amount,
+                *allow_vat_withdrawal,
                 destination_account_pubkey,
                 *sign_only,
                 *dump_transaction_message,
@@ -1645,6 +1705,70 @@ pub async fn process_command(config: &CliConfig<'_>) -> ProcessResult {
             )
             .await
         }
+        CliCommand::VoteUpdateCommissionBps {
+            vote_account_pubkey,
+            commission_kind,
+            commission_bps,
+            withdraw_authority,
+            sign_only,
+            dump_transaction_message,
+            blockhash_query,
+            nonce_account,
+            nonce_authority,
+            memo,
+            fee_payer,
+            compute_unit_price,
+        } => {
+            process_vote_update_commission_bps(
+                &rpc_client,
+                config,
+                vote_account_pubkey,
+                commission_kind.clone(),
+                *commission_bps,
+                *withdraw_authority,
+                *sign_only,
+                *dump_transaction_message,
+                blockhash_query,
+                *nonce_account,
+                *nonce_authority,
+                memo.as_ref(),
+                *fee_payer,
+                *compute_unit_price,
+            )
+            .await
+        }
+        CliCommand::VoteUpdateCommissionCollector {
+            vote_account_pubkey,
+            commission_kind,
+            new_collector,
+            withdraw_authority,
+            sign_only,
+            dump_transaction_message,
+            blockhash_query,
+            nonce_account,
+            nonce_authority,
+            memo,
+            fee_payer,
+            compute_unit_price,
+        } => {
+            process_vote_update_commission_collector(
+                &rpc_client,
+                config,
+                vote_account_pubkey,
+                commission_kind.clone(),
+                new_collector,
+                *withdraw_authority,
+                *sign_only,
+                *dump_transaction_message,
+                blockhash_query,
+                *nonce_account,
+                *nonce_authority,
+                memo.as_ref(),
+                *fee_payer,
+                *compute_unit_price,
+            )
+            .await
+        }
 
         // Wallet Commands
 
@@ -1726,6 +1850,7 @@ pub async fn process_command(config: &CliConfig<'_>) -> ProcessResult {
             signature,
             message,
         } => process_verify_offchain_signature(config, signer_pubkey, signature, message),
+        CliCommand::GetAgGenesisInfo => process_get_ag_genesis_info(&rpc_client, config).await,
     }
 }
 
@@ -1797,10 +1922,10 @@ where
     match result {
         Err(err) => {
             let maybe_tx_err = err.get_transaction_error();
-            if let Some(TransactionError::InstructionError(_, ix_error)) = maybe_tx_err {
-                if let Some(specific_error) = error_adapter(&ix_error) {
-                    return Err(specific_error.into());
-                }
+            if let Some(TransactionError::InstructionError(_, ix_error)) = maybe_tx_err
+                && let Some(specific_error) = error_adapter(&ix_error)
+            {
+                return Err(specific_error.into());
             }
             Err(err.into())
         }
@@ -1818,6 +1943,7 @@ mod tests {
     use {
         super::*,
         serde_json::json,
+        solana_instruction::Instruction,
         solana_keypair::{Keypair, keypair_from_seed, read_keypair_file, write_keypair_file},
         solana_presigner::Presigner,
         solana_pubkey::Pubkey,
@@ -1831,6 +1957,66 @@ mod tests {
         solana_transaction_error::TransactionError,
         solana_transaction_status::TransactionConfirmationStatus,
     };
+
+    fn legacy_message(instructions: &[Instruction], payer: &Pubkey) -> VersionedMessage {
+        VersionedMessage::Legacy(solana_message::Message::new(instructions, Some(payer)))
+    }
+
+    fn v0_message(instructions: &[Instruction], payer: &Pubkey) -> VersionedMessage {
+        VersionedMessage::V0(
+            solana_message::v0::Message::try_compile(payer, instructions, &[], Hash::default())
+                .unwrap(),
+        )
+    }
+
+    fn v1_message(instructions: &[Instruction], payer: &Pubkey) -> VersionedMessage {
+        VersionedMessage::V1(
+            solana_message::v1::Message::try_compile_with_config(
+                payer,
+                instructions,
+                Hash::default(),
+                solana_message::v1::TransactionConfig::empty(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test_case::test_case(legacy_message; "legacy")]
+    #[test_case::test_case(v0_message; "v0")]
+    #[test_case::test_case(v1_message; "v1")]
+    fn test_sign_transaction(create_message: fn(&[Instruction], &Pubkey) -> VersionedMessage) {
+        let payer = Keypair::new();
+        let from = Keypair::new();
+        let instructions = [solana_system_interface::instruction::transfer(
+            &from.pubkey(),
+            &Pubkey::new_unique(),
+            1,
+        )];
+        let blockhash = Hash::new_unique();
+        let message = create_message(&instructions, &payer.pubkey());
+        let partial =
+            message_into_signed_transaction(message.clone(), &[&from], blockhash, true).unwrap();
+        let output = solana_cli_output::return_signers_data(
+            &partial,
+            &solana_cli_output::ReturnSignersConfig::default(),
+        );
+        assert_eq!(output.absent, vec![payer.pubkey().to_string()]);
+        assert_eq!(output.signers.len(), 1);
+        assert!(output.bad_sig.is_empty());
+        assert_eq!(*partial.message.recent_blockhash(), blockhash);
+        assert!(matches!(
+            message_into_signed_transaction(message.clone(), &[&from], blockhash, false),
+            Err(SignerError::NotEnoughSigners)
+        ));
+        assert!(matches!(
+            message_into_signed_transaction(message.clone(), &[&Keypair::new()], blockhash, true),
+            Err(SignerError::KeypairPubkeyMismatch)
+        ));
+        let tx =
+            message_into_signed_transaction(message, &[&from, &payer, &payer], blockhash, false)
+                .unwrap();
+        tx.verify_and_hash_message().unwrap();
+    }
 
     fn make_tmp_path(name: &str) -> String {
         let out_dir = std::env::var("FARF_DIR").unwrap_or_else(|_| "farf".to_string());

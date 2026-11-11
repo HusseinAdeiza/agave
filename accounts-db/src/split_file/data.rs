@@ -1,0 +1,646 @@
+//! data file layout:
+//!
+//!  +-------------+-------------------+-----------------------+
+//!  |      Offset | Region            |                  Size |
+//!  +-------------+-------------------+-----------------------+
+//!  |           0 | data header       |                  64 B |
+//!  +-------------+-------------------+-----------------------+
+//!  |          64 | alignment padding |                4032 B |
+//!  +-------------+-------------------+-----------------------+
+//!  |        4096 | data entry 0      |       data_len + 36 B |
+//!  +-------------+-------------------+-----------------------+
+//!  |             | alignment padding | to 4096-byte boundary |
+//!  +-------------+-------------------+-----------------------+
+//!  | align(4096) | data entry 1      |       data_len + 36 B |
+//!  +-------------+-------------------+-----------------------+
+//!  |             | alignment padding | to 4096-byte boundary |
+//!  +-------------+-------------------+-----------------------+
+//!  | align(4096) | data entry 2      |       data_len + 36 B |
+//!  +-------------+-------------------+-----------------------+
+//!  |             | ...               |                       |
+//!  +-------------+-------------------+-----------------------+
+//!
+//! data header layout:
+//!
+//!  +--------+---------------+----------+-------+
+//!  | Offset | Field         | Type     |  Size |
+//!  +--------+---------------+----------+-------+
+//!  |      0 | magic         | [u8; 16] |  16 B |
+//!  +--------+----------------+----------+-------+
+//!  |     16 | major_version | u64      |   8 B |
+//!  +--------+----------------+----------+-------+
+//!  |     24 | minor_version | u64      |   8 B |
+//!  +--------+----------------+----------+-------+
+//!  |     32 | patch_version | u64      |   8 B |
+//!  +--------+----------------+----------+-------+
+//!  |     40 | uid           | u64      |   8 B |
+//!  +--------+---------------+----------+-------+
+//!  |     48 | reserved      | [u8; 16] |  16 B |
+//!  +--------+---------------+----------+-------+
+//!
+//!  - total size: 64 B
+//!  - the version fields combine to follow semver
+//!
+//! data entry layout:
+//!
+//!  +--------------+----------+----------------+----------+
+//!  |       Offset | Field    | Type           |     Size |
+//!  +--------------+----------+----------------+----------+
+//!  |            0 | data     | [u8; data_len] | data_len |
+//!  +--------------+----------+----------------+----------+
+//!  |     data_len | data_len | u32            |      4 B |
+//!  +--------------+----------+----------------+----------+
+//!  | data_len + 4 | address  | Pubkey         |     32 B |
+//!  +--------------+----------+----------------+----------+
+//!
+//!  - data entries are written at file offsets aligned to 4,096
+//!  - data_len and address fields are used for validation with meta entry
+//!  - data_len is *not* required to be stored aligned
+
+use {
+    super::{
+        SplitFileError,
+        as_bytes::{AsBytesMut, AsBytesRef, as_bytes_mut, as_bytes_ref},
+        common::{DataLen, FileOffset, WriteInfo},
+        error::{
+            ReadDataEntryError, ReadDataHeaderError, WriteDataEntryError, WriteDataHeaderError,
+        },
+        utils,
+    },
+    agave_fs::{FileSize, file_io},
+    semver::Version,
+    solana_pubkey::Pubkey,
+    std::{
+        convert::TryFrom,
+        fs::File,
+        io::{IoSliceMut, Write},
+        path::{Path, PathBuf},
+        ptr, slice,
+    },
+};
+
+pub const DATA_HEADER_SIZE: usize = 64;
+
+const DATA_MAGIC: &[u8; 16] = b"agave data file\0";
+const DATA_FORMAT_VERSION: Version = Version::new(1, 0, 0);
+
+/// data entries are always written at offsets that are multiples of this alignment
+pub const DATA_ENTRY_OFFSET_ALIGNMENT: usize = 1 << DATA_ENTRY_OFFSET_ALIGNMENT_LOG2;
+pub const DATA_ENTRY_OFFSET_ALIGNMENT_LOG2: u32 = 12;
+
+/// Size, in bytes, of a data entry's fixed portion (i.e. *not* the actual account data).
+pub const DATA_ENTRY_FIXED_SIZE: usize = 36;
+
+// byte-offsets of the fields within the data entry's fixed portion
+const DATA_ENTRY_OFFSET_OF_DATA_LEN: usize = 0;
+const DATA_ENTRY_OFFSET_OF_ADDRESS: usize = 4;
+
+/// Creates a new data file based on `base_path`.
+pub fn create_data_file(
+    base_path: impl AsRef<Path>,
+    uid: u64,
+) -> Result<(PathBuf, File, usize), SplitFileError> {
+    let data_path = data_path_from_base(&base_path);
+    let mut data_file = utils::create_new_file(&data_path)?;
+    let header_size = write_data_header(&mut data_file, uid)?;
+    Ok((data_path, data_file, header_size))
+}
+
+fn data_path_from_base(base_path: impl AsRef<Path>) -> PathBuf {
+    base_path.as_ref().with_added_extension("data")
+}
+
+/// Writes the file header.
+fn write_data_header(file: &mut File, uid: u64) -> Result<usize, WriteDataHeaderError> {
+    let header = DataHeaderSerde {
+        magic: *DATA_MAGIC,
+        major_version: DATA_FORMAT_VERSION.major,
+        minor_version: DATA_FORMAT_VERSION.minor,
+        patch_version: DATA_FORMAT_VERSION.patch,
+        uid,
+        _unused: [0; 16],
+    };
+    let header_bytes = as_bytes_ref(&header);
+    file_io::write_buffer_to_file(file, header_bytes, /*offset*/ 0)?;
+    Ok(DATA_HEADER_SIZE)
+}
+
+/// Reads and returns the file's header.
+pub fn read_data_header(
+    file: &File,
+    file_len: FileSize,
+) -> Result<DataHeader, ReadDataHeaderError> {
+    let mut header = DataHeaderSerde {
+        magic: [0; 16],
+        major_version: 0,
+        minor_version: 0,
+        patch_version: 0,
+        uid: 0,
+        _unused: [0; 16],
+    };
+    let header_bytes = as_bytes_mut(&mut header);
+    let num_bytes_read =
+        file_io::read_into_buffer(file, file_len, /*offset*/ 0, header_bytes)?;
+    if num_bytes_read != size_of::<DataHeaderSerde>() {
+        return Err(ReadDataHeaderError::ShortRead {
+            expected: DATA_HEADER_SIZE,
+            actual: num_bytes_read,
+        });
+    }
+
+    if header.magic != *DATA_MAGIC {
+        return Err(ReadDataHeaderError::InvalidMagic);
+    }
+    let format_version = Version::new(
+        header.major_version,
+        header.minor_version,
+        header.patch_version,
+    );
+    if format_version != DATA_FORMAT_VERSION {
+        return Err(ReadDataHeaderError::InvalidFormatVersion(format_version));
+    }
+
+    Ok(DataHeader {
+        size: DATA_HEADER_SIZE,
+        format_version,
+        uid: header.uid,
+    })
+}
+
+/// Writes `data` entry to `writer` at `offset`.
+///
+/// - `offset` to write at, does not need to be aligned; the fn will do it.
+///   This is to support calling the fn with the current file len as the offset.
+///
+/// Returns information about the write.
+pub fn write_data_entry(
+    writer: &mut impl Write,
+    offset: FileOffset,
+    address: &Pubkey,
+    data: &[u8],
+) -> Result<WriteInfo, WriteDataEntryError> {
+    let start_offset = offset
+        .0
+        .checked_next_multiple_of(DATA_ENTRY_OFFSET_ALIGNMENT as u64)
+        .ok_or(WriteDataEntryError::OffsetOverrun(offset))?;
+    // Entries must start aligned, so write any padding from the previous entry as needed.
+    writer.write_all(&[0; DATA_ENTRY_OFFSET_ALIGNMENT][..(start_offset - offset.0) as usize])?;
+
+    let num_bytes_written = write_data_entry_bytes(writer, address, data)?;
+
+    Ok(WriteInfo {
+        start: FileOffset(start_offset),
+        num_bytes_written,
+    })
+}
+
+/// Writes a data entry to `writer`.
+///
+/// Returns the number of bytes written.
+fn write_data_entry_bytes(
+    writer: &mut impl Write,
+    address: &Pubkey,
+    data: &[u8],
+) -> Result</* num bytes written: */ usize, WriteDataEntryError> {
+    let data_len = DataLen::try_from(data.len())?;
+    let mut num_bytes_written = 0;
+
+    writer.write_all(data)?;
+    num_bytes_written += data.len();
+
+    writer.write_all(&data_len.0.to_le_bytes())?;
+    num_bytes_written += size_of::<DataLen>();
+
+    writer.write_all(address.as_ref())?;
+    num_bytes_written += size_of::<Pubkey>();
+
+    let expected_stored_size = calculate_data_entry_stored_size(data.len());
+    if num_bytes_written == expected_stored_size {
+        Ok(num_bytes_written)
+    } else {
+        Err(WriteDataEntryError::ShortWrite {
+            expected: expected_stored_size,
+            actual: num_bytes_written,
+        })
+    }
+}
+
+/// Reads data entry from `file` at `offset`.
+///
+/// - `file_len` is the size of the file, and bounds reading.
+/// - `offset` to read from, must be aligned.
+/// - `expected_address` and `expected_data_len` are checked against what is read.
+///   If there is a mismatch, an error is returned.
+///
+/// Returns the account data.
+pub fn read_data_entry(
+    file: &File,
+    file_len: FileSize,
+    offset: FileOffset,
+    expected_address: &Pubkey,
+    expected_data_len: DataLen,
+) -> Result<Vec<u8>, ReadDataEntryError> {
+    validate_data_entry_offset(file_len, offset, expected_data_len)?;
+
+    let mut data_entry = DataEntrySerde {
+        data_len: 0,
+        address: Pubkey::default(),
+    };
+    let data_len = expected_data_len.0 as usize;
+    let mut buffer = Vec::<u8>::with_capacity(data_len);
+    let num_bytes_read = {
+        // SAFETY:
+        // * buffer is non-null, thus the ptr used for creating the slice is non-null
+        // * buffer is at least data_len bytes, thus slice is valid for all bytes
+        // * buffer is aligned for account data, thus so is the slice
+        // * buffer is a single allocation, thus so is the slice
+        // * buffer is not referenced while the slice is alive
+        // * buffer's max size is DataLen::MAX, which is less than isize::MAX, thus so is the slice
+        let buffer_bytes = unsafe {
+            slice::from_raw_parts_mut(
+                buffer.spare_capacity_mut().as_mut_ptr().cast::<u8>(),
+                data_len,
+            )
+        };
+        file_io::read_into_buffers(
+            file,
+            file_len,
+            offset.0,
+            &mut [
+                IoSliceMut::new(buffer_bytes),
+                IoSliceMut::new(as_bytes_mut(&mut data_entry)),
+            ],
+        )
+        .map_err(ReadDataEntryError::Io)?
+    };
+    let expected_num_bytes_read = calculate_data_entry_stored_size(data_len);
+    if num_bytes_read != expected_num_bytes_read {
+        return Err(ReadDataEntryError::ShortRead {
+            expected: expected_num_bytes_read,
+            actual: num_bytes_read,
+        });
+    }
+
+    validate_data_entry(&data_entry, expected_address, expected_data_len)?;
+
+    // SAFETY:
+    // * data_len is <= the buffer's capacity.
+    // * only elements 0..data_len have been written.
+    unsafe {
+        buffer.set_len(data_len);
+    }
+    Ok(buffer)
+}
+
+pub fn validate_data_entry_offset(
+    file_len: FileSize,
+    offset: FileOffset,
+    data_len: DataLen,
+) -> Result<(), ReadDataEntryError> {
+    if !offset.0.is_multiple_of(DATA_ENTRY_OFFSET_ALIGNMENT as u64) {
+        return Err(ReadDataEntryError::OffsetUnaligned(offset));
+    }
+
+    let stored_size = calculate_data_entry_stored_size(data_len.0 as usize);
+    if offset
+        .0
+        .checked_add(stored_size as u64)
+        .is_none_or(|end| end > file_len)
+    {
+        return Err(ReadDataEntryError::OffsetOverrun(offset));
+    }
+    Ok(())
+}
+
+fn validate_data_entry(
+    data_entry: &DataEntrySerde,
+    expected_address: &Pubkey,
+    expected_data_len: DataLen,
+) -> Result<(), ReadDataEntryError> {
+    if data_entry.data_len != expected_data_len.0 {
+        return Err(ReadDataEntryError::DataLenMismatch {
+            expected: expected_data_len.0,
+            actual: data_entry.data_len,
+        });
+    }
+    if data_entry.address != *expected_address {
+        return Err(ReadDataEntryError::AddressMismatch {
+            expected: *expected_address,
+            actual: data_entry.address,
+        });
+    }
+    Ok(())
+}
+
+/// Parses a complete data entry from a buffered-reader slice and returns the account data without
+/// copying it.
+pub fn parse_data_entry<'a>(
+    bytes: &'a [u8],
+    expected_address: &Pubkey,
+    expected_data_len: DataLen,
+) -> Result<&'a [u8], ReadDataEntryError> {
+    let data_len = expected_data_len.0 as usize;
+    let stored_size = calculate_data_entry_stored_size(data_len);
+    if bytes.len() < stored_size {
+        return Err(ReadDataEntryError::ShortRead {
+            expected: stored_size,
+            actual: bytes.len(),
+        });
+    }
+
+    let fixed_bytes = &bytes[data_len..stored_size];
+    let actual_data_len_bytes = &fixed_bytes[DATA_ENTRY_OFFSET_OF_DATA_LEN..][..size_of::<u32>()];
+    let actual_data_len = u32::from_le_bytes(
+        actual_data_len_bytes
+            .try_into()
+            .expect("data_len field has a fixed size"),
+    );
+    if actual_data_len != expected_data_len.0 {
+        return Err(ReadDataEntryError::DataLenMismatch {
+            expected: expected_data_len.0,
+            actual: actual_data_len,
+        });
+    }
+
+    let address_bytes = &fixed_bytes[DATA_ENTRY_OFFSET_OF_ADDRESS..][..size_of::<Pubkey>()];
+    if address_bytes != expected_address.as_ref() {
+        // There is an address mismatch, so now read the stored address and put it in the error.
+        // This way we do not copy the stored address out unnecessarily.
+        let actual: Pubkey = unsafe { ptr::read_unaligned(address_bytes.as_ptr().cast()) };
+        return Err(ReadDataEntryError::AddressMismatch {
+            expected: *expected_address,
+            actual,
+        });
+    }
+
+    Ok(&bytes[..data_len])
+}
+
+/// Returns the number of bytes required to store a data entry for an account with `data_len`.
+pub fn calculate_data_entry_stored_size(data_len: usize) -> usize {
+    DATA_ENTRY_FIXED_SIZE + data_len
+}
+
+/// On-disk representation of the header.
+///
+/// Used for writing to/reading from disk.
+#[repr(C)]
+#[derive(Debug)]
+struct DataHeaderSerde {
+    magic: [u8; 16],
+    major_version: u64,
+    minor_version: u64,
+    patch_version: u64,
+    uid: u64,
+    _unused: [u8; 16],
+}
+const _: () = const {
+    assert!(size_of::<DataHeaderSerde>() == DATA_HEADER_SIZE);
+};
+
+// SAFETY: DataHeaderSerde is POD and safe to read/write as bytes
+unsafe impl AsBytesRef for DataHeaderSerde {}
+unsafe impl AsBytesMut for DataHeaderSerde {}
+
+/// Header for the data file.
+#[derive(Debug)]
+pub struct DataHeader {
+    #[allow(dead_code)] // field currently never read
+    pub size: usize,
+    #[allow(dead_code)] // field currently never read
+    pub format_version: Version,
+    pub uid: u64,
+}
+
+/// On-disk representation of an entry's fixed portion.
+///
+/// Used for writing to/reading from disk.
+/// The account data directly precedes.
+#[repr(C)]
+#[derive(Debug)]
+struct DataEntrySerde {
+    data_len: u32,
+    address: Pubkey,
+}
+const _: () = const {
+    // to safely implement AsBytesRef and AsBytesMut, there can be no bytes from padding
+    assert!(size_of::<DataEntrySerde>() == size_of::<Pubkey>() + size_of::<u32>());
+    assert!(size_of::<DataEntrySerde>() == DATA_ENTRY_FIXED_SIZE);
+};
+
+// SAFETY: DataEntrySerde is POD and safe to read/write as bytes
+unsafe impl AsBytesRef for DataEntrySerde {}
+unsafe impl AsBytesMut for DataEntrySerde {}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        std::{
+            assert_matches,
+            io::{Seek as _, SeekFrom},
+        },
+        tempfile::TempDir,
+        test_case::test_case,
+    };
+
+    fn new_data_entry_bytes(address: &Pubkey, data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(DATA_ENTRY_FIXED_SIZE + data.len());
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(address.as_ref());
+        bytes
+    }
+
+    #[test]
+    fn test_create_data_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().join("base");
+        _ = create_data_file(&base_path, 42).unwrap();
+    }
+
+    #[test]
+    fn test_write_and_read_data_header() {
+        let mut file = tempfile::tempfile().unwrap();
+        let uid = rand::random();
+        let size = write_data_header(&mut file, uid).unwrap();
+        let header = read_data_header(&file, size as FileSize).unwrap();
+        assert_eq!(header.size, DATA_HEADER_SIZE);
+        assert_eq!(header.format_version, DATA_FORMAT_VERSION);
+        assert_eq!(header.uid, uid);
+    }
+
+    #[test]
+    fn test_read_bad_data_header() {
+        let file = tempfile::tempfile().unwrap();
+
+        // test case: truncated header
+        {
+            let bytes = [0; DATA_HEADER_SIZE - 1];
+            file_io::write_buffer_to_file(&file, &bytes, 0).unwrap();
+            let err = read_data_header(&file, bytes.len() as FileSize).unwrap_err();
+            assert_matches!(err, ReadDataHeaderError::ShortRead { .. });
+        }
+
+        // test case: invalid magic
+        {
+            let header = DataHeaderSerde {
+                magic: [0xCD; 16],
+                major_version: DATA_FORMAT_VERSION.major,
+                minor_version: DATA_FORMAT_VERSION.minor,
+                patch_version: DATA_FORMAT_VERSION.patch,
+                uid: 0,
+                _unused: [0; 16],
+            };
+            file_io::write_buffer_to_file(&file, as_bytes_ref(&header), 0).unwrap();
+            let err = read_data_header(&file, DATA_HEADER_SIZE as FileSize).unwrap_err();
+            assert_matches!(err, ReadDataHeaderError::InvalidMagic);
+        }
+
+        // test case: invalid format version
+        {
+            let header = DataHeaderSerde {
+                magic: *DATA_MAGIC,
+                major_version: DATA_FORMAT_VERSION.major + 1,
+                minor_version: 0,
+                patch_version: 0,
+                uid: 0,
+                _unused: [0; 16],
+            };
+            file_io::write_buffer_to_file(&file, as_bytes_ref(&header), 0).unwrap();
+            let err = read_data_header(&file, DATA_HEADER_SIZE as FileSize).unwrap_err();
+            assert_matches!(err, ReadDataHeaderError::InvalidFormatVersion(_));
+        }
+    }
+
+    #[test_case(FileSize::MAX, FileOffset(DATA_ENTRY_OFFSET_ALIGNMENT as u64), DataLen(100) => matches Ok(()); "ok")]
+    #[test_case(FileSize::MAX, FileOffset(DATA_ENTRY_OFFSET_ALIGNMENT as u64 - 1), DataLen(0) => matches Err(ReadDataEntryError::OffsetUnaligned(_)); "unaligned_minus_1")]
+    #[test_case(FileSize::MAX, FileOffset(DATA_ENTRY_OFFSET_ALIGNMENT as u64 + 1), DataLen(0) => matches Err(ReadDataEntryError::OffsetUnaligned(_)); "unaligned_plus_1")]
+    #[test_case(FileSize::MAX, FileOffset(FileSize::MAX - DATA_ENTRY_OFFSET_ALIGNMENT as u64 + 1), DataLen(u32::MAX) => matches Err(ReadDataEntryError::OffsetOverrun(_)); "overflow")]
+    #[test_case(FileSize::MIN, FileOffset(DATA_ENTRY_OFFSET_ALIGNMENT as u64), DataLen(0) => matches Err(ReadDataEntryError::OffsetOverrun(_)); "overrun")]
+    fn test_validate_data_entry_offset(
+        file_len: FileSize,
+        offset: FileOffset,
+        data_len: DataLen,
+    ) -> Result<(), ReadDataEntryError> {
+        validate_data_entry_offset(file_len, offset, data_len)
+    }
+
+    #[test]
+    fn test_parse_data_entry_ok() {
+        let address = Pubkey::new_unique();
+        let account_data = [0xA5; 23];
+        let bytes = new_data_entry_bytes(&address, &account_data);
+        let parsed = parse_data_entry(
+            bytes.as_slice(),
+            &address,
+            DataLen::try_from(account_data.len()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed, account_data);
+    }
+
+    #[test]
+    fn test_parse_data_entry_err_short_read() {
+        const DATA_LEN: usize = 6;
+        let bytes = [0; DATA_ENTRY_FIXED_SIZE + DATA_LEN - 1];
+        let err = parse_data_entry(
+            &bytes,
+            &Pubkey::default(),
+            DataLen::try_from(DATA_LEN).unwrap(),
+        )
+        .unwrap_err();
+        assert_matches!(err, ReadDataEntryError::ShortRead { .. },);
+    }
+
+    #[test]
+    fn test_parse_data_entry_err_address_mismatch() {
+        let address = Pubkey::new_unique();
+        let data = [1, 2, 3, 4, 5];
+        let bytes = new_data_entry_bytes(&address, &data);
+        let data_len = DataLen::try_from(data.len()).unwrap();
+
+        let wrong_address = Pubkey::new_unique();
+        let err = parse_data_entry(&bytes, &wrong_address, data_len).unwrap_err();
+        assert_matches!(err, ReadDataEntryError::AddressMismatch { .. });
+    }
+
+    #[test]
+    fn test_parse_data_entry_err_data_len_mismatch() {
+        let address = Pubkey::new_unique();
+        let data = [1, 2, 3, 4, 5];
+        let bytes = new_data_entry_bytes(&address, &data);
+
+        let wrong_data_len = DataLen::try_from(data.len() - 1).unwrap();
+        let err = parse_data_entry(&bytes, &address, wrong_data_len).unwrap_err();
+        assert_matches!(err, ReadDataEntryError::DataLenMismatch { .. });
+    }
+
+    #[test]
+    fn test_write_and_read_data_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_path = temp_dir.path().join("base");
+        let (_path, mut file, size) = create_data_file(&base_path, 42).unwrap();
+
+        let offset = FileOffset(size as FileSize);
+        let address = Pubkey::new_unique();
+        let data = [0xDA; 123];
+
+        file.seek(SeekFrom::Start(offset.0)).unwrap();
+        let write_info = write_data_entry(&mut file, offset, &address, &data).unwrap();
+        let end = write_info.start.0 + write_info.num_bytes_written as u64;
+        let read_data = read_data_entry(
+            &file,
+            end,
+            write_info.start,
+            &address,
+            DataLen::try_from(data.len()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(read_data, data);
+    }
+
+    #[test]
+    fn test_write_data_entry_bad_offset() {
+        let mut file = tempfile::tempfile().unwrap();
+
+        // offset overflows when aligning
+        let err = write_data_entry(
+            &mut file,
+            FileOffset(FileSize::MAX),
+            &Pubkey::default(),
+            &[],
+        )
+        .unwrap_err();
+        assert_matches!(err, WriteDataEntryError::OffsetOverrun(_));
+    }
+
+    #[test]
+    fn test_read_data_entry_bad_offset() {
+        let file = tempfile::tempfile().unwrap();
+
+        // offset is unaligned
+        let err = read_data_entry(
+            &file,
+            0, // value does not matter
+            FileOffset(DATA_ENTRY_OFFSET_ALIGNMENT as u64 + 1),
+            &Pubkey::default(), // value does not matter
+            DataLen(0),         // value does not matter
+        )
+        .unwrap_err();
+        assert_matches!(err, ReadDataEntryError::OffsetUnaligned(_));
+
+        // offset is past the file len
+        let file_len = 11;
+        let err = read_data_entry(
+            &file,
+            file_len,
+            FileOffset(file_len.next_multiple_of(DATA_ENTRY_OFFSET_ALIGNMENT as u64)),
+            &Pubkey::default(), // value does not matter
+            DataLen(0),         // value does not matter
+        )
+        .unwrap_err();
+        assert_matches!(err, ReadDataEntryError::OffsetOverrun(_));
+    }
+}

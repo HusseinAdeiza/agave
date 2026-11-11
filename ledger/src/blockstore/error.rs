@@ -25,8 +25,6 @@ pub enum BlockstoreError {
     WincodeRead(#[from] wincode::ReadError),
     #[error("serialization wincode error: {0}")]
     WincodeWrite(#[from] wincode::WriteError),
-    #[error("fs extra error: {0}")]
-    FsExtraError(#[from] fs_extra::error::Error),
     #[error("slot cleaned up")]
     SlotCleanedUp,
     #[error("unpack error: {0}")]
@@ -57,6 +55,8 @@ pub enum BlockstoreError {
     MissingTransactionMetadata,
     #[error("transaction-index overflow")]
     TransactionIndexOverflow,
+    #[error("transaction-history purge for slot {0} did not find an UpdateParent marker")]
+    TransactionHistoryPurgeUpdateParentNotFound(Slot),
     #[error("invalid erasure config")]
     InvalidErasureConfig,
     #[error("last shred index missing slot {0}")]
@@ -90,6 +90,8 @@ pub enum BlockstoreError {
         update_parent_slot: Slot,
         shred_parent_slot: Slot,
     },
+    #[error("update parent is only valid in the first slot of a leader window for slot {0}")]
+    UpdateParentNotFirstInLeaderWindow(Slot),
     #[error("unexpected block component")]
     UnexpectedBlockComponent,
     #[error("multiple update parents for slot {0}")]
@@ -111,6 +113,8 @@ pub enum BlockstoreError {
         block_header_parent_slot: Slot,
         shred_parent_slot: Slot,
     },
+    #[error("Block in slot {0} was aborted as leader sent an empty entry batch")]
+    BlockAborted(Slot),
 }
 pub type Result<T> = std::result::Result<T, BlockstoreError>;
 
@@ -119,8 +123,8 @@ pub enum BlockstoreManualPurgeError {
     #[error("purge request sender is unavailable")]
     SenderUnavailable,
 
-    #[error("purge request for slot {request_slot} is newer than the latest root {max_root}")]
-    SlotNewerThanRoot { request_slot: Slot, max_root: Slot },
+    #[error("purge request for slot {request_slot} must be less than the latest root {max_root}")]
+    SlotGreaterThanOrEqualToRoot { request_slot: Slot, max_root: Slot },
 
     #[error("purge request try send error")]
     TrySend,

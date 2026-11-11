@@ -7,6 +7,8 @@
 //! [JSON-RPC]: https://www.jsonrpc.org/specification
 
 pub use crate::mock_sender::Mocks;
+#[allow(deprecated)]
+use crate::rpc_client::SerializableMessage;
 #[cfg(feature = "spinner")]
 use {crate::spinner, solana_clock::MAX_HASH_AGE_IN_SECONDS, std::cmp::min};
 use {
@@ -14,13 +16,12 @@ use {
         http_sender::HttpSender,
         mock_sender::{MockSender, MocksMap, mock_encoded_account},
         rpc_client::{
-            GetConfirmedSignaturesForAddress2Config, RpcClientConfig, SerializableMessage,
-            SerializableTransaction,
+            GetConfirmedSignaturesForAddress2Config, RpcClientConfig, SerializableTransaction,
         },
         rpc_sender::*,
     },
+    agave_votor_messages::wire::WireBlockCertMessage,
     base64::{Engine, prelude::BASE64_STANDARD},
-    bincode::serialize,
     futures::join,
     log::*,
     serde_json::{Value, json},
@@ -34,6 +35,7 @@ use {
     solana_epoch_info::EpochInfo,
     solana_epoch_schedule::EpochSchedule,
     solana_hash::Hash,
+    solana_message::VersionedMessage,
     solana_pubkey::Pubkey,
     solana_rpc_client_api::{
         client_error::{
@@ -56,6 +58,7 @@ use {
         time::{Duration, Instant},
     },
     tokio::time::sleep,
+    wincode::{SchemaWrite, config::DefaultConfig},
 };
 
 /// A client of a remote Solana node.
@@ -1668,6 +1671,24 @@ impl RpcClient {
         .await
     }
 
+    /// Gets the statuses of a list of transaction signatures with the given
+    /// [`RpcSignatureStatusConfig`], which can select a commitment level and a
+    /// minimum context slot.
+    ///
+    /// [`RpcSignatureStatusConfig`]: solana_rpc_client_api::config::RpcSignatureStatusConfig
+    pub async fn get_signature_statuses_with_config(
+        &self,
+        signatures: &[Signature],
+        config: solana_rpc_client_api::config::RpcSignatureStatusConfig,
+    ) -> RpcResult<Vec<Option<TransactionStatus>>> {
+        let signatures: Vec<_> = signatures.iter().map(|s| s.to_string()).collect();
+        self.send(
+            RpcRequest::GetSignatureStatuses,
+            json!([signatures, config]),
+        )
+        .await
+    }
+
     /// Check if a transaction has been processed with the given [commitment level][cl].
     ///
     /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
@@ -2094,6 +2115,99 @@ impl RpcClient {
                     })
                     .collect()
             })
+    }
+
+    /// Returns Alpenglow's genesis certificate.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getAgGenesisCert`] RPC method.
+    ///
+    /// [`getAgGenesisCert`]: https://solana.com/docs/rpc/http/getaggenesiscert
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::client_error::Error;
+    /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+    /// # futures::executor::block_on(async {
+    /// #     let rpc_client = RpcClient::new_mock("succeeds".to_string());
+    /// let cert = rpc_client.get_ag_genesis_cert().await?;
+    /// #     Ok::<(), Error>(())
+    /// # })?;
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub async fn get_ag_genesis_cert(&self) -> ClientResult<Option<WireBlockCertMessage>> {
+        self.send(RpcRequest::GetAgGenesisCert, Value::Null).await
+    }
+
+    /// Returns the Validator Admission Ticket (VAT) active-set rank map for the epoch
+    /// containing `slot`, with an optional identity filter.
+    ///
+    /// Always queries finalized state, regardless of the client's default commitment.
+    /// Returns `None` if the epoch is unavailable.
+    ///
+    /// The filter preserves the validator's rank and the full map's total stake.
+    /// An unknown identity returns an empty validator list when the map is available.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getVatActiveSetRankMap`] RPC method.
+    ///
+    /// [`getVatActiveSetRankMap`]: https://solana.com/docs/rpc/http/getvatactivesetrankmap
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::{client_error::Error, config::RpcVatActiveSetRankMapConfig};
+    /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+    /// # futures::executor::block_on(async {
+    /// # let rpc_client = RpcClient::new_mock("succeeds".to_string());
+    /// let certificate_slot = 100;
+    /// let response = rpc_client.get_vat_active_set_rank_map(
+    ///     certificate_slot,
+    ///     RpcVatActiveSetRankMapConfig::default(),
+    /// ).await?;
+    /// if let Some(rank_map) = response.value {
+    ///     for validator in rank_map.validators {
+    ///         println!("rank {}: {}", validator.rank, validator.node_pubkey);
+    ///     }
+    /// }
+    /// # Ok::<(), Error>(())
+    /// # })?;
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// ```
+    /// # use solana_rpc_client_api::{client_error::Error, config::RpcVatActiveSetRankMapConfig};
+    /// # use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+    /// # futures::executor::block_on(async {
+    /// # let rpc_client = RpcClient::new_mock("succeeds".to_string());
+    /// let certificate_slot = 100;
+    /// let identity = "67omRD8GkXTi8daWceprtQABkDeEm3SZYHUCrthQGB9D";
+    /// let response = rpc_client.get_vat_active_set_rank_map(
+    ///     certificate_slot,
+    ///     RpcVatActiveSetRankMapConfig {
+    ///         identity: Some(identity.to_string()),
+    ///         ..RpcVatActiveSetRankMapConfig::default()
+    ///     },
+    /// ).await?;
+    /// if let Some(rank_map) = response.value {
+    ///     if let Some(validator) = rank_map.validators.first() {
+    ///         println!("rank {}: {}", validator.rank, validator.node_pubkey);
+    ///     }
+    /// }
+    /// # Ok::<(), Error>(())
+    /// # })?;
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub async fn get_vat_active_set_rank_map(
+        &self,
+        slot: Slot,
+        config: RpcVatActiveSetRankMapConfig,
+    ) -> RpcResult<Option<RpcVatActiveSetRankMap>> {
+        self.send(RpcRequest::GetVatActiveSetRankMap, json!([slot, config]))
+            .await
     }
 
     /// Get block production for the current epoch.
@@ -2959,6 +3073,7 @@ impl RpcClient {
     ///     encoding: Some(UiTransactionEncoding::Json),
     ///     commitment: Some(CommitmentConfig::confirmed()),
     ///     max_supported_transaction_version: Some(0),
+    ///     min_context_slot: None,
     /// };
     /// let transaction = rpc_client.get_transaction_with_config(
     ///     &signature,
@@ -3180,6 +3295,7 @@ impl RpcClient {
     /// let config = RpcLeaderScheduleConfig {
     ///     identity: Some(validator_pubkey_str),
     ///     commitment: Some(CommitmentConfig::processed()),
+    ///     ..RpcLeaderScheduleConfig::default()
     /// };
     /// let leader_schedule = rpc_client.get_leader_schedule_with_config(
     ///     Some(slot),
@@ -4383,16 +4499,16 @@ impl RpcClient {
                 } = serde_json::from_value::<Response<Option<UiAccount>>>(result_json)?;
                 trace!("Response account {pubkey:?} {rpc_account:?}");
                 let response = {
-                    if let Some(rpc_account) = rpc_account {
-                        if let UiAccountData::Json(account_data) = rpc_account.data {
-                            let token_account_type: TokenAccountType =
-                                serde_json::from_value(account_data.parsed)?;
-                            if let TokenAccountType::Account(token_account) = token_account_type {
-                                return Ok(Response {
-                                    context,
-                                    value: Some(token_account),
-                                });
-                            }
+                    if let Some(rpc_account) = rpc_account
+                        && let UiAccountData::Json(account_data) = rpc_account.data
+                    {
+                        let token_account_type: TokenAccountType =
+                            serde_json::from_value(account_data.parsed)?;
+                        if let TokenAccountType::Account(token_account) = token_account_type {
+                            return Ok(Response {
+                                context,
+                                value: Some(token_account),
+                            });
                         }
                     }
                     Err(Into::<ClientError>::into(RpcError::ForUser(format!(
@@ -4786,10 +4902,9 @@ impl RpcClient {
                 "wait_for_balance_with_commitment [{run}] {balance_result:?} {expected_balance:?}"
             );
             if let (Some(expected_balance), Ok(balance_result)) = (expected_balance, balance_result)
+                && expected_balance == balance_result
             {
-                if expected_balance == balance_result {
-                    return Ok(balance_result);
-                }
+                return Ok(balance_result);
             }
             run += 1;
         }
@@ -4942,20 +5057,46 @@ impl RpcClient {
         &self,
         commitment: CommitmentConfig,
     ) -> ClientResult<(Hash, u64)> {
-        let RpcBlockhash {
-            blockhash,
-            last_valid_block_height,
+        Ok(self
+            .get_latest_blockhash_with_commitment_and_context(commitment)
+            .await?
+            .value)
+    }
+
+    /// Returns the most recent blockhash and last valid block height along with the response
+    /// context, which includes the slot at which the node observed the blockhash.
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getLatestBlockhash`] RPC method and uses the
+    /// provided [commitment level][cl].
+    ///
+    /// [cl]: https://solana.com/docs/rpc#configuring-state-commitment
+    /// [`getLatestBlockhash`]: https://solana.com/docs/rpc/http/getlatestblockhash
+    pub async fn get_latest_blockhash_with_commitment_and_context(
+        &self,
+        commitment: CommitmentConfig,
+    ) -> RpcResult<(Hash, u64)> {
+        let Response {
+            context,
+            value:
+                RpcBlockhash {
+                    blockhash,
+                    last_valid_block_height,
+                },
         } = self
             .send::<Response<RpcBlockhash>>(RpcRequest::GetLatestBlockhash, json!([commitment]))
-            .await?
-            .value;
+            .await?;
         let blockhash = blockhash.parse().map_err(|_| {
             ClientError::new_with_request(
                 RpcError::ParseError("Hash".to_string()).into(),
                 RpcRequest::GetLatestBlockhash,
             )
         })?;
-        Ok((blockhash, last_valid_block_height))
+        Ok(Response {
+            context,
+            value: (blockhash, last_valid_block_height),
+        })
     }
 
     /// Checks whether a blockhash is still valid for submitting transactions.
@@ -4986,11 +5127,34 @@ impl RpcClient {
     /// This method corresponds directly to the [`getFeeForMessage`] RPC method.
     ///
     /// [`getFeeForMessage`]: https://solana.com/docs/rpc/http/getfeeformessage
+    #[deprecated(since = "4.5.0", note = "Use get_fee_for_versioned_message instead")]
+    #[allow(deprecated)]
     pub async fn get_fee_for_message(
         &self,
         message: &impl SerializableMessage,
     ) -> ClientResult<u64> {
-        let serialized = message.serialize();
+        self.get_fee_for_serialized_message(message.serialize())
+            .await
+    }
+
+    /// Returns the fee that the cluster would charge to process the provided message.
+    ///
+    /// Supports legacy, v0, and v1 messages through [`VersionedMessage`].
+    ///
+    /// # RPC Reference
+    ///
+    /// This method corresponds directly to the [`getFeeForMessage`] RPC method.
+    ///
+    /// [`getFeeForMessage`]: https://solana.com/docs/rpc/http/getfeeformessage
+    pub async fn get_fee_for_versioned_message(
+        &self,
+        message: &VersionedMessage,
+    ) -> ClientResult<u64> {
+        self.get_fee_for_serialized_message(message.serialize())
+            .await
+    }
+
+    async fn get_fee_for_serialized_message(&self, serialized: Vec<u8>) -> ClientResult<u64> {
         let serialized_encoded = BASE64_STANDARD.encode(serialized);
         let result = self
             .send::<Response<Option<u64>>>(
@@ -5014,10 +5178,10 @@ impl RpcClient {
         let mut num_retries = 0;
         let start = Instant::now();
         while start.elapsed().as_secs() < 5 {
-            if let Ok(new_blockhash) = self.get_latest_blockhash().await {
-                if new_blockhash != *blockhash {
-                    return Ok(new_blockhash);
-                }
+            if let Ok(new_blockhash) = self.get_latest_blockhash().await
+                && new_blockhash != *blockhash
+            {
+                return Ok(new_blockhash);
             }
             debug!("Got same blockhash ({blockhash:?}), will retry...");
 
@@ -5060,9 +5224,9 @@ impl RpcClient {
 
 fn serialize_and_encode<T>(input: &T, encoding: UiTransactionEncoding) -> ClientResult<String>
 where
-    T: serde::ser::Serialize,
+    T: SchemaWrite<DefaultConfig, Src = T>,
 {
-    let serialized = serialize(input)
+    let serialized = wincode::serialize(input)
         .map_err(|e| ClientErrorKind::Custom(format!("Serialization failed: {e}")))?;
     let encoded = match encoding {
         UiTransactionEncoding::Base58 => bs58::encode(serialized).into_string(),

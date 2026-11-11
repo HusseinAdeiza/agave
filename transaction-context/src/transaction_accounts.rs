@@ -2,12 +2,13 @@
 use qualifier_attr::qualifiers;
 use {
     crate::{
-        IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION, MAX_ACCOUNT_DATA_LEN,
+        DropOnBailOut, IndexOfAccount, MAX_ACCOUNT_DATA_GROWTH_PER_TRANSACTION,
+        MAX_ACCOUNT_DATA_LEN,
         vm_addresses::{GUEST_ACCOUNT_PAYLOAD_BASE_ADDRESS, GUEST_REGION_SIZE},
         vm_slice::VmSlice,
     },
     solana_account::{AccountSharedData, ReadableAccount, WritableAccount},
-    solana_instruction::error::InstructionError,
+    solana_instruction_error::InstructionError,
     solana_pubkey::Pubkey,
     std::{
         cell::{Cell, UnsafeCell},
@@ -41,6 +42,21 @@ struct AccountPrivateFields {
 impl AccountPrivateFields {
     fn payload_len(&self) -> usize {
         self.payload.len()
+    }
+
+    #[expect(
+        deprecated,
+        reason = "only the deprecated constructor keeps a loaded `rent_epoch` with a shared \
+                  payload"
+    )]
+    fn into_account_shared_data(self, shared_fields: &AccountSharedFields) -> AccountSharedData {
+        AccountSharedData::create_from_existing_shared_data(
+            shared_fields.lamports,
+            self.payload,
+            shared_fields.owner,
+            self.executable,
+            self.rent_epoch,
+        )
     }
 }
 
@@ -98,12 +114,20 @@ impl TransactionAccountViewMut<'_> {
         Arc::make_mut(&mut self.private_fields.payload)
     }
 
+    pub(crate) fn raw_mut_data_slice(&mut self) -> *mut [u8] {
+        &raw mut self.data_mut()[..]
+    }
+
     pub(crate) fn resize(&mut self, new_len: usize, value: u8) {
-        self.data_mut().resize(new_len, value);
-        // SAFETY: We are synchronizing the lengths.
-        unsafe {
-            self.abi_account.payload.set_len(new_len as u64);
+        match self.private_fields.payload.get(..new_len) {
+            // If the buffer is shared and doesn't grow, copy only the retained
+            // prefix instead of cloning the whole buffer and truncating it.
+            Some(prefix) if self.is_shared() => {
+                self.private_fields.payload = Arc::new(prefix.to_vec());
+            }
+            _ => self.data_mut().resize(new_len, value),
         }
+        self.abi_account.payload.set_len(new_len as u64);
     }
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -113,10 +137,7 @@ impl TransactionAccountViewMut<'_> {
             // If the buffer is shared, the cheapest thing to do is to clone the
             // incoming slice and replace the buffer.
             self.private_fields.payload = Arc::new(new_data.to_vec());
-            // SAFETY: We are synchronizing the lengths.
-            unsafe {
-                self.abi_account.payload.set_len(new_data.len() as u64);
-            }
+            self.abi_account.payload.set_len(new_data.len() as u64);
             return;
         };
 
@@ -152,12 +173,9 @@ impl TransactionAccountViewMut<'_> {
 
     pub(crate) fn extend_from_slice(&mut self, data: &[u8]) {
         self.data_mut().extend_from_slice(data);
-        // SAFETY: We are synchronizing the lengths.
-        unsafe {
-            self.abi_account
-                .payload
-                .set_len(self.private_fields.payload_len() as u64);
-        }
+        self.abi_account
+            .payload
+            .set_len(self.private_fields.payload_len() as u64);
     }
 
     pub(crate) fn reserve(&mut self, additional: usize) {
@@ -169,6 +187,28 @@ impl TransactionAccountViewMut<'_> {
             data.extend_from_slice(self.private_fields.payload.as_slice());
             self.private_fields.payload = Arc::new(data);
         }
+    }
+
+    /// Encodes `state` over the start of the data, copying only the tail of a shared buffer.
+    #[cfg(feature = "wincode")]
+    pub(crate) fn set_state<T>(&mut self, state: &T) -> Result<(), InstructionError>
+    where
+        T: wincode::SchemaWrite<solana_account::WincodeConfig, Src = T>,
+    {
+        let Some(data) = Arc::get_mut(&mut self.private_fields.payload) else {
+            let old_data = &self.private_fields.payload;
+            let mut data = Vec::with_capacity(old_data.len());
+            wincode::config::serialize_into(&mut data, state, solana_account::WINCODE_CONFIG)
+                .map_err(|_| InstructionError::GenericError)?;
+            let tail = old_data
+                .get(data.len()..)
+                .ok_or(InstructionError::AccountDataTooSmall)?;
+            data.extend_from_slice(tail);
+            self.private_fields.payload = Arc::new(data);
+            return Ok(());
+        };
+        wincode::config::serialize_into(data.as_mut_slice(), state, solana_account::WINCODE_CONFIG)
+            .map_err(|_| InstructionError::GenericError)
     }
 
     #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -242,12 +282,15 @@ pub struct TransactionAccounts {
     borrow_counters: Box<[BorrowCounter]>,
     touched_flags: Box<[Cell<bool>]>,
     resize_delta: Cell<i64>,
-    lamports_delta: Cell<i128>,
+    _drop_on_bail_out: DropOnBailOut,
 }
 
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl TransactionAccounts {
-    pub(crate) fn new(accounts: Vec<KeyedAccountSharedData>) -> TransactionAccounts {
+    pub(crate) fn new_with_feature_flags(
+        accounts: Vec<KeyedAccountSharedData>,
+        drop_on_bail_out: DropOnBailOut,
+    ) -> TransactionAccounts {
         let touched_flags = vec![Cell::new(false); accounts.len()].into_boxed_slice();
         let borrow_counters = vec![BorrowCounter::default(); accounts.len()].into_boxed_slice();
         let (shared_accounts, private_fields) = accounts
@@ -283,8 +326,13 @@ impl TransactionAccounts {
             borrow_counters,
             touched_flags,
             resize_delta: Cell::new(0),
-            lamports_delta: Cell::new(0),
+            _drop_on_bail_out: drop_on_bail_out,
         }
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn new(accounts: Vec<KeyedAccountSharedData>) -> TransactionAccounts {
+        TransactionAccounts::new_with_feature_flags(accounts, DropOnBailOut::Disabled)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -408,20 +456,6 @@ impl TransactionAccounts {
         })
     }
 
-    pub(crate) fn add_lamports_delta(&self, balance: i128) -> Result<(), InstructionError> {
-        let delta = self.lamports_delta.get();
-        self.lamports_delta.set(
-            delta
-                .checked_add(balance)
-                .ok_or(InstructionError::ArithmeticOverflow)?,
-        );
-        Ok(())
-    }
-
-    pub(crate) fn get_lamports_delta(&self) -> i128 {
-        self.lamports_delta.get()
-    }
-
     fn deconstruct_into_keyed_account_shared_data(&mut self) -> Vec<KeyedAccountSharedData> {
         let shared_account_fields = std::mem::take(&mut self.shared_account_fields);
         let private_account_fields = std::mem::take(&mut self.private_account_fields);
@@ -433,13 +467,7 @@ impl TransactionAccounts {
                 let private_fields = private_fields_cell.into_inner();
                 (
                     shared_fields.key,
-                    AccountSharedData::create_from_existing_shared_data(
-                        shared_fields.lamports,
-                        private_fields.payload.clone(),
-                        shared_fields.owner,
-                        private_fields.executable,
-                        private_fields.rent_epoch,
-                    ),
+                    private_fields.into_account_shared_data(&shared_fields),
                 )
             })
             .collect()
@@ -454,13 +482,7 @@ impl TransactionAccounts {
             .map(|(shared_fields_cell, private_fields_cell)| {
                 let shared_fields = shared_fields_cell.into_inner();
                 let private_fields = private_fields_cell.into_inner();
-                AccountSharedData::create_from_existing_shared_data(
-                    shared_fields.lamports,
-                    private_fields.payload.clone(),
-                    shared_fields.owner,
-                    private_fields.executable,
-                    private_fields.rent_epoch,
-                )
+                private_fields.into_account_shared_data(&shared_fields)
             })
             .collect()
     }
@@ -578,13 +600,10 @@ pub struct AccountRefMut<'a> {
 #[cfg(not(any(target_arch = "bpf", target_arch = "sbf")))]
 impl Drop for AccountRefMut<'_> {
     fn drop(&mut self) {
-        // SAFETY: We are synchronizing the lengths.
-        unsafe {
-            self.account
-                .abi_account
-                .payload
-                .set_len(self.account.private_fields.payload_len() as u64);
-        }
+        self.account
+            .abi_account
+            .payload
+            .set_len(self.account.private_fields.payload_len() as u64);
         self.borrow_counter.release_borrow_mut();
     }
 }
@@ -607,20 +626,54 @@ impl DerefMut for AccountRefMut<'_> {
 #[cfg(all(test, not(target_arch = "sbf"), not(target_arch = "bpf")))]
 mod tests {
     use {
-        crate::transaction_accounts::TransactionAccounts, solana_account::AccountSharedData,
-        solana_instruction::error::InstructionError, solana_pubkey::Pubkey,
+        crate::transaction_accounts::TransactionAccounts,
+        solana_account::{AccountSharedData, ReadableAccount},
+        solana_instruction_error::InstructionError,
+        solana_pubkey::Pubkey,
+        std::sync::Arc,
+        test_case::test_case,
     };
+
+    #[test_case(true, 4; "shrink_shared")]
+    #[test_case(false, 4; "shrink_unshared")]
+    #[test_case(true, 0; "shrink_shared_to_empty")]
+    #[test_case(true, 200; "grow_shared")]
+    #[test_case(false, 200; "grow_unshared")]
+    #[test_case(true, 100; "same_length_shared")]
+    #[test_case(false, 100; "same_length_unshared")]
+    fn test_resize(shared: bool, new_len: usize) {
+        let data = (0..100).collect::<Vec<u8>>();
+        let account = AccountSharedData::new_with_data(1, data.clone(), &Pubkey::new_unique());
+        let original = shared.then(|| account.data_clone());
+        let tx_accounts = TransactionAccounts::new(vec![(Pubkey::new_unique(), account)]);
+        let mut expected = data.clone();
+        expected.resize(new_len, 0);
+
+        let mut acc = tx_accounts.try_borrow_mut(0).unwrap();
+        assert_eq!(acc.is_shared(), shared);
+        acc.resize(new_len, 0);
+        assert_eq!(acc.data(), expected);
+        assert_eq!(acc.account.abi_account.payload.len(), new_len as u64);
+        assert!(!acc.is_shared());
+        if let Some(original) = original {
+            assert!(!Arc::ptr_eq(&original, &acc.account.private_fields.payload));
+            if new_len <= data.len() {
+                assert_eq!(acc.account.private_fields.payload.capacity(), new_len);
+            }
+            assert_eq!(*original, data);
+        }
+    }
 
     #[test]
     fn test_missing_account() {
         let accounts = vec![
             (
                 Pubkey::new_unique(),
-                AccountSharedData::new(2, 1, &Pubkey::new_unique()),
+                AccountSharedData::new_with_data(2, vec![0; 1], &Pubkey::new_unique()),
             ),
             (
                 Pubkey::new_unique(),
-                AccountSharedData::new(2, 1, &Pubkey::new_unique()),
+                AccountSharedData::new_with_data(2, vec![0; 1], &Pubkey::new_unique()),
             ),
         ];
 
@@ -638,11 +691,11 @@ mod tests {
         let accounts = vec![
             (
                 Pubkey::new_unique(),
-                AccountSharedData::new(2, 1, &Pubkey::new_unique()),
+                AccountSharedData::new_with_data(2, vec![0; 1], &Pubkey::new_unique()),
             ),
             (
                 Pubkey::new_unique(),
-                AccountSharedData::new(2, 1, &Pubkey::new_unique()),
+                AccountSharedData::new_with_data(2, vec![0; 1], &Pubkey::new_unique()),
             ),
         ];
 
@@ -715,11 +768,11 @@ mod tests {
         let accounts = vec![
             (
                 Pubkey::new_unique(),
-                AccountSharedData::new(2, 1, &Pubkey::new_unique()),
+                AccountSharedData::new_with_data(2, vec![0; 1], &Pubkey::new_unique()),
             ),
             (
                 Pubkey::new_unique(),
-                AccountSharedData::new(2, 1, &Pubkey::new_unique()),
+                AccountSharedData::new_with_data(2, vec![0; 1], &Pubkey::new_unique()),
             ),
         ];
 

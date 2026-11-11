@@ -48,6 +48,9 @@ pub const DEFAULT_NUM_ENTRIES_OVERHEAD: usize = 5_000;
 /// This value is used to compute the low watermark.
 pub const DEFAULT_NUM_ENTRIES_TO_EVICT: usize = 10_000;
 
+/// Byte threshold used when the deprecated `minimal` index limit is specified.
+pub const MINIMAL_THRESHOLD_NUM_BYTES: u64 = 25_000_000_000;
+
 pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> {
     pub disk: Option<BucketMap<(Slot, U)>>,
 
@@ -91,8 +94,11 @@ pub struct BucketMapHolder<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>>
     pub(crate) startup_stats: Arc<StartupStats>,
 
     /// Precomputed thresholds per bin for flushing and eviction
-    /// None for Minimal/InMemOnly, Some(threshold_entries_per_bin) for Threshold
+    /// None for InMemOnly, Some(threshold_entries_per_bin) for Threshold
     pub(super) threshold_entries_per_bin: Option<ThresholdEntriesPerBin>,
+
+    /// If true, flush dirty entries to disk once `slot_list.len() == 1`, making it evictable
+    should_write_through: bool,
 }
 
 impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> Debug for BucketMapHolder<T, U> {
@@ -106,6 +112,11 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
     /// is the accounts index using disk as a backing store
     pub fn is_disk_index_enabled(&self) -> bool {
         self.disk.is_some()
+    }
+
+    /// If true, flush dirty entries to disk once `slot_list.len() == 1`, making it evictable
+    pub(crate) fn should_write_through(&self) -> bool {
+        self.should_write_through
     }
 
     /// Returns true when a bin's entry count is high enough that eviction should begin.
@@ -133,7 +144,6 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
     }
 
     /// Calculate maximum evictions to perform for threshold-based flushing
-    /// Returns current_entries for Minimal disk index
     /// Returns the max_evictions for Threshold mode to bring count to the low water mark
     pub fn max_evictions_for_threshold(&self, current_entries: usize) -> NonZeroUsize {
         let evictions = match &self.threshold_entries_per_bin {
@@ -275,12 +285,12 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
 
         let disk = match config.index_limit {
             IndexLimit::InMemOnly => None,
-            IndexLimit::Minimal | IndexLimit::Threshold(_) => Some(BucketMap::new(bucket_config)),
+            IndexLimit::Threshold(_) => Some(BucketMap::new(bucket_config)),
         };
 
         // Compute threshold_entries once here
         let threshold_entries_per_bin = match &config.index_limit {
-            IndexLimit::InMemOnly | IndexLimit::Minimal => None,
+            IndexLimit::InMemOnly => None,
             IndexLimit::Threshold(threshold) => {
                 let limit_bytes = threshold.num_bytes;
                 let bytes_per_entry = InMemAccountsIndex::<T, U>::size_of_uninitialized()
@@ -315,17 +325,15 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
             }
         };
 
+        // Write through is currently only used with a memory threshold, to ensure
+        // the memory threshold is not exceeded
+        let should_write_through = match config.index_limit {
+            IndexLimit::InMemOnly => false,
+            IndexLimit::Threshold(_) => true,
+        };
+
         // The age interval, `age_ms`, varies depending on `config.index_limit`
         let age_ms = match config.index_limit {
-            IndexLimit::Minimal => {
-                // - 400 milliseconds was causing excessive disk iops due to
-                //   flushing the index to disk very often.
-                // - 4 seconds was tried and showed a large reduction in disk iops,
-                //   almost as good as when the disk index is entirely disabled!
-                //   But there were concerns about the in-mem index growth behavior.
-                // - 2 seconds is much faster, and does also reduce disk iops quite a lot.
-                2_000
-            }
             IndexLimit::InMemOnly => {
                 // the disk index is disabled, thus this value doesn't actually matter
                 2_000
@@ -359,6 +367,7 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
             _phantom: PhantomData,
             startup_stats: Arc::default(),
             threshold_entries_per_bin,
+            should_write_through,
         }
     }
 
@@ -379,10 +388,9 @@ impl<T: IndexValue, U: DiskIndexValue + From<T> + Into<T>> BucketMapHolder<T, U>
     // is perhaps being flushed by another thread already.
     pub fn next_bucket_to_flush(&self) -> usize {
         self.next_bucket_to_flush
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bucket| {
-                Some((bucket + 1) % self.bins)
+            .update(Ordering::AcqRel, Ordering::Acquire, |bucket| {
+                (bucket + 1) % self.bins
             })
-            .unwrap()
     }
 
     /// prepare for this to be dynamic if necessary
@@ -530,13 +538,15 @@ pub struct ThresholdEntriesPerBin {
 #[cfg(test)]
 mod tests {
     use {
-        super::*, crate::accounts_index::IndexLimitThreshold, rayon::prelude::*,
-        std::time::Instant, test_case::test_case,
+        super::*,
+        crate::accounts_index::{INDEX_LIMIT_THRESHOLD_FOR_TESTING, IndexLimitThreshold},
+        rayon::prelude::*,
+        std::time::Instant,
+        test_case::test_case,
     };
 
     #[test]
     fn test_next_bucket_to_flush() {
-        agave_logger::setup();
         let bins = 4;
         let test = BucketMapHolder::<u64, u64>::new(bins, &AccountsIndexConfig::default(), 1);
         let visited = (0..bins)
@@ -559,7 +569,6 @@ mod tests {
 
     #[test]
     fn test_ages() {
-        agave_logger::setup();
         let bins = 4;
         let test = BucketMapHolder::<u64, u64>::new(bins, &AccountsIndexConfig::default(), 1);
         assert_eq!(0, test.current_age());
@@ -579,7 +588,6 @@ mod tests {
 
     #[test]
     fn test_age_increment() {
-        agave_logger::setup();
         let bins = 4;
         let test = BucketMapHolder::<u64, u64>::new(bins, &AccountsIndexConfig::default(), 1);
         for age in 0..513 {
@@ -600,7 +608,6 @@ mod tests {
 
     #[test]
     fn test_throttle() {
-        agave_logger::setup();
         let bins = 128;
         let test = BucketMapHolder::<u64, u64>::new(bins, &AccountsIndexConfig::default(), 1);
         let bins = test.bins as u64;
@@ -631,7 +638,7 @@ mod tests {
     fn test_disk_index_enabled() {
         let bins = 1;
         let config = AccountsIndexConfig {
-            index_limit: IndexLimit::Minimal,
+            index_limit: INDEX_LIMIT_THRESHOLD_FOR_TESTING,
             ..Default::default()
         };
         let test = BucketMapHolder::<u64, u64>::new(bins, &config, 1);
@@ -668,21 +675,6 @@ mod tests {
         assert!(!test.should_evict_based_on_count(thresholds.high_water_mark - 1));
         assert!(!test.should_evict_based_on_count(thresholds.high_water_mark));
         assert!(test.should_evict_based_on_count(thresholds.high_water_mark + 1));
-    }
-
-    /// Ensure that should_evict_based_on_count() is always true when using IndexLimit::Minimal
-    #[test]
-    fn test_should_evict_based_on_count_minimal() {
-        let bins = 1;
-        let config = AccountsIndexConfig {
-            index_limit: IndexLimit::Minimal,
-            ..Default::default()
-        };
-        let test = BucketMapHolder::<u64, u64>::new(bins, &config, 1);
-
-        assert!(test.should_evict_based_on_count(0));
-        assert!(test.should_evict_based_on_count(1000));
-        assert!(test.should_evict_based_on_count(usize::MAX));
     }
 
     /// Ensure that should_evict_based_on_count() is always false when using IndexLimit::InMemOnly
@@ -732,21 +724,6 @@ mod tests {
         assert!(!test.should_evict_based_on_free_entries(overhead + 1));
     }
 
-    /// Ensure that should_evict_based_on_free_entries() is always true when using IndexLimit::Minimal
-    #[test]
-    fn test_should_evict_based_on_free_entries_minimal() {
-        let bins = 1;
-        let config = AccountsIndexConfig {
-            index_limit: IndexLimit::Minimal,
-            ..Default::default()
-        };
-        let test = BucketMapHolder::<u64, u64>::new(bins, &config, 1);
-
-        assert!(test.should_evict_based_on_free_entries(0));
-        assert!(test.should_evict_based_on_free_entries(1000));
-        assert!(test.should_evict_based_on_free_entries(usize::MAX));
-    }
-
     /// Ensure that should_evict_based_on_free_entries() is always false when using IndexLimit::InMemOnly
     #[test]
     fn test_should_evict_based_on_free_entries_in_mem_only() {
@@ -760,25 +737,6 @@ mod tests {
         assert!(!test.should_evict_based_on_free_entries(0));
         assert!(!test.should_evict_based_on_free_entries(1000));
         assert!(!test.should_evict_based_on_free_entries(usize::MAX));
-    }
-
-    #[test]
-    fn test_max_evictions_minimal() {
-        let bins = 1;
-        let config = AccountsIndexConfig {
-            index_limit: IndexLimit::Minimal,
-            ..Default::default()
-        };
-        let test = BucketMapHolder::<u64, u64>::new(bins, &config, 1);
-
-        assert_eq!(
-            test.max_evictions_for_threshold(0),
-            NonZeroUsize::new(1).unwrap()
-        );
-        assert_eq!(
-            test.max_evictions_for_threshold(1000),
-            NonZeroUsize::new(1000).unwrap()
-        );
     }
 
     #[test_case(1; "bins=1")]
@@ -811,7 +769,6 @@ mod tests {
 
     #[test]
     fn test_age_time() {
-        agave_logger::setup();
         let bins = 1;
         let test = BucketMapHolder::<u64, u64>::new(bins, &AccountsIndexConfig::default(), 1);
         let threads = 2;
@@ -844,7 +801,6 @@ mod tests {
 
     #[test]
     fn test_age_broad() {
-        agave_logger::setup();
         let bins = 4;
         let test = BucketMapHolder::<u64, u64>::new(bins, &AccountsIndexConfig::default(), 1);
         assert_eq!(test.current_age(), 0);

@@ -11,7 +11,6 @@ source "$here"/common.sh
 program=$agave_validator
 
 no_restart=0
-maybeRequireTower=true
 
 args=()
 while [[ -n $1 ]]; do
@@ -29,6 +28,9 @@ while [[ -n $1 ]]; do
       args+=("$1" "$2")
       shift 2
     elif [[ $1 = --limit-ledger-size ]]; then
+      args+=("$1" "$2")
+      shift 2
+    elif [[ $1 = --limit-blockstore-size ]]; then
       args+=("$1" "$2")
       shift 2
     elif [[ $1 = --no-rocksdb-compaction ]]; then
@@ -88,9 +90,6 @@ while [[ -n $1 ]]; do
     elif [[ $1 == --accounts-db-skip-shrink ]]; then
       args+=("$1")
       shift
-    elif [[ $1 == --skip-require-tower ]]; then
-      maybeRequireTower=false
-      shift
     elif [[ $1 = --log-messages-bytes-limit ]]; then
       args+=("$1" "$2")
       shift 2
@@ -127,10 +126,6 @@ ledger_dir="$SOLANA_CONFIG_DIR"/bootstrap-validator
   exit 1
 }
 
-if [[ $maybeRequireTower = true ]]; then
-  args+=(--require-tower)
-fi
-
 args+=(
   --ledger "$ledger_dir"
   --rpc-port 8899
@@ -139,11 +134,10 @@ args+=(
   --identity "$identity"
   --vote-account "$vote_account"
   --rpc-faucet-address 127.0.0.1:9900
-  --no-poh-speed-test
   --no-os-network-limits-test
-  --no-wait-for-vote-to-start-leader
   --full-rpc-api
   --allow-private-addr
+  --no-xdp
 )
 default_arg --gossip-port 8001
 default_arg --log -

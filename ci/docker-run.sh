@@ -43,49 +43,17 @@ ARGS=(
 
 if [[ -n $CI ]]; then
   if [[ -n $BUILDKITE ]]; then
-    # I hate buildkite-esque echo is leaking into this generic shell wrapper.
-    # but it's easiest to notify to users, and properly guarded under $BUILDKITE_ env
-    # (2 is chosen for third time's the charm).
-    if [[ $BUILDKITE_RETRY_COUNT -ge 2 ]]; then
-      # Disable sccache to create a clean-room environment to preclude any
-      # sccache-related bugs
-      echo "--- $0 ... (with sccache being DISABLED due to many (${BUILDKITE_RETRY_COUNT}) retries)"
-    else
-      echo "--- $0 ... (with sccache enabled with prefix: $SCCACHE_KEY_PREFIX)"
+    ARGS+=(
+      --env BUILDKITE
+      --env BUILDKITE_AGENT_ACCESS_TOKEN
+      --env BUILDKITE_JOB_ID
+    )
 
-      # sccache
-      ARGS+=(
-        --env "RUSTC_WRAPPER=/usr/local/cargo/bin/sccache"
-      )
-      # local disk storage for sccache (experimental; only used by dcou for now)
-      mkdir -p "$HOME/.cache/sccache-for-docker"
-      CONTAINER_HOME="/"
-      ARGS+=(
-        --volume "$HOME/.cache/sccache-for-docker:$CONTAINER_HOME/.cache/sccache"
-      )
-
-      # s3
-      if [ -n "$AWS_ACCESS_KEY_ID" ]; then
-        ARGS+=(
-          --env AWS_ACCESS_KEY_ID
-          --env AWS_SECRET_ACCESS_KEY
-          --env SCCACHE_BUCKET
-          --env SCCACHE_REGION
-          --env SCCACHE_S3_KEY_PREFIX
-        )
-      fi
-
-      # gcs
-      if [ -n "$SCCACHE_GCS_KEY_PATH" ]; then
-        ARGS+=(
-          --env SCCACHE_GCS_KEY_PATH
-          --volume "$SCCACHE_GCS_KEY_PATH:$SCCACHE_GCS_KEY_PATH"
-          --env SCCACHE_GCS_BUCKET
-          --env SCCACHE_GCS_RW_MODE
-          --env SCCACHE_GCS_KEY_PREFIX
-        )
-      fi
-    fi
+    # Tag by agent/job so post-checkout cleanup only kills its own containers.
+    ARGS+=(
+      --label "buildkite_agent=${BUILDKITE_AGENT_NAME:-unknown}"
+      --label "buildkite_job=${BUILDKITE_JOB_ID:-unknown}"
+    )
 
     # Disable seccomp to allow io_uring operations (https://github.com/moby/moby/pull/46762)
     ARGS+=(--security-opt seccomp=unconfined)
@@ -112,11 +80,6 @@ fi
 
 # Environment variables to propagate into the container
 ARGS+=(
-  --env BUILDKITE
-  --env BUILDKITE_AGENT_ACCESS_TOKEN
-  --env BUILDKITE_JOB_ID
-  --env BUILDKITE_PARALLEL_JOB
-  --env BUILDKITE_PARALLEL_JOB_COUNT
   --env CI
   --env CI_BRANCH
   --env CI_BASE_BRANCH
@@ -126,16 +89,14 @@ ARGS+=(
   --env CI_JOB_ID
   --env CI_PULL_REQUEST
   --env CI_REPO_SLUG
-  --env CRATES_IO_TOKEN
 )
 
 CODECOV_ENVS=
 if [[ ${FETCH_CODECOV_ENVS:-false} == true ]]; then
-	echo "FETCH_CODECOV_ENVS=true, fetching codecov environment variables"
+	echo "FETCH_CODECOV_ENVS=true, gathering codecov environment variables"
 	# ref: https://docs.codecov.io/docs/testing-with-docker#section-codecov-inside-docker
-	# Unfortunately, codecov.io fails sometimes:
-	#   curl: (7) Failed to connect to codecov.io port 443: Connection timed out
-	CODECOV_ENVS=$(CI=true bash <(while ! curl -sS --retry 5 --retry-delay 2 --retry-connrefused --fail https://codecov.io/env; do sleep 10; done))
+	# Vendored copy of https://codecov.io/env; see ci/codecov-env.sh
+	CODECOV_ENVS=$(CI=true bash ci/codecov-env.sh)
 else
 	echo "skipping fetching codecov environment variables. (set FETCH_CODECOV_ENVS to true to enable)"
 fi
