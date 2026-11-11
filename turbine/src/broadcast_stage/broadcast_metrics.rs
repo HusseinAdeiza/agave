@@ -219,6 +219,8 @@ mod test {
                 total_packets: 7,
                 dropped_packets_udp: 8,
                 dropped_packets_xdp: 10,
+                mirrored_packets: 0,
+                dropped_packets_mirrored: 0,
                 is_xdp: false,
             },
             &Some(BroadcastShredBatchInfo {
@@ -248,6 +250,8 @@ mod test {
                 total_packets: 17,
                 dropped_packets_udp: 18,
                 dropped_packets_xdp: 20,
+                mirrored_packets: 0,
+                dropped_packets_mirrored: 0,
                 is_xdp: false,
             },
             &None,
@@ -274,6 +278,8 @@ mod test {
                 total_packets: 1,
                 dropped_packets_udp: 1,
                 dropped_packets_xdp: 1,
+                mirrored_packets: 0,
+                dropped_packets_mirrored: 0,
                 is_xdp: false,
             },
             &Some(BroadcastShredBatchInfo {
